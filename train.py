@@ -1,20 +1,16 @@
 """
-训练脚本 v7.1：SNN 语言模型预训练（Surrogate Gradient + 反向传播）
+训练脚本：SNN 语言模型预训练（Surrogate Gradient + 反向传播）
 
-严格对齐 happy-llm 教程（/home/dgxspark/Desktop/happy-llm/docs/chapter5/code/ddp_pretrain.py），
-训练基础设施照搬教程，只有模型架构是 SNN 创新。
-
-数据加载（对齐教程）：
+数据加载：
 - PretrainDataset: byte-offset 随机访问 JSONL，bos_token 前缀，固定 max_length
 - loss_mask: 忽略 padding 位置的 loss
-- Loss 计算: out.last_loss * loss_mask（与教程完全一致）
 
-训练算法（v7.1: 反向传播，替代 v5 的 SPSA 零阶优化）：
-- Adam 优化器（对齐教程）
-- Warmup + Cosine LR 调度（对齐教程 get_lr()）
-- GradScaler + autocast 混合精度（对齐教程）
-- 梯度累积 accumulation_steps（对齐教程）
-- 梯度裁剪 clip_grad_norm_（对齐教程）
+训练算法：
+- Adam 优化器
+- Warmup + Cosine LR 调度
+- GradScaler + autocast 混合精度
+- 梯度累积 accumulation_steps
+- 梯度裁剪 clip_grad_norm_
 
 用法：
     conda activate SNN
@@ -298,7 +294,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
 
 if __name__ == "__main__":
     # ==================== 命令行参数解析 ====================
-    parser = argparse.ArgumentParser(description="SNN Language Model Pretraining v7.1 (Backprop)")
+    parser = argparse.ArgumentParser(description="SNN Language Model Pretraining (Backprop)")
 
     # SNN 模型参数（创新部分）
     parser.add_argument('--vocab_size', type=int, default=6144, help='词表大小')
@@ -401,7 +397,7 @@ if __name__ == "__main__":
     iter_per_epoch = len(train_loader)
 
     Logger(f"\n{'='*60}")
-    Logger(f"SNN Language Model Pretraining v7.1 (Backprop + Surrogate Gradient)")
+    Logger(f"SNN Language Model Pretraining (Backprop + Surrogate Gradient)")
     Logger(f"  Vocab:       {args.vocab_size}")
     Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}")
     Logger(f"  Data:        {args.data_path}")

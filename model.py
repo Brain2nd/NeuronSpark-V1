@@ -1,21 +1,19 @@
 """
-SNNLanguageModel v8.0: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
+SNNLanguageModel: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
 
 架构（三段式）：
   model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
   model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，全膜电位 + 动态 K 聚合
   model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
 
-v8.0 核心变更：
+核心设计：
   1. 全膜电位：所有神经元输出 V_post 而非 spike
-  2. 动态 K（对标 Mamba Δ）：PonderNet 自适应停止，不同 token 不同有效步数
+  2. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
      - 每层每子层学习 halt_proj(D→1)，从 SNN 输出逐步计算停止概率
      - 几何分布权重加权聚合，替代 uniform mean
      - ponder_cost 正则化鼓励早停
-  3. fp16 编解码移除
-  4. embedding 梯度双通道
 
-数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
+数学原理见 SNN_SELECTIVE_STATE_SPACE.md。
 """
 
 import math
@@ -46,7 +44,7 @@ class SNNModelOutput:
 
 class SNNLanguageModel(nn.Module):
     """
-    从零训练的 SNN 隐状态空间语言模型（v7: parallel scan）。
+    从零训练的 SNN 隐状态空间语言模型（parallel scan）。
 
     Args:
         vocab_size: 词表大小（默认 6144，自训练 BPE）
@@ -287,7 +285,7 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（v8.0: 全膜电位 + 动态 K）。
+        前向传播（全膜电位 + 动态 K）。
 
         encode → h_seq               # 输入（embed repeat K 次，可微分）
         snn_forward → h_out, pc      # SNN 核心（全膜电位 + 动态 K 聚合）
@@ -390,7 +388,6 @@ class SNNLanguageModel(nn.Module):
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
         按功能分组的可训练参数。
-        v8.0: 新增 halt_projs（动态 K 停止投影）。
         """
         groups = {
             'embedding': [self.embed_tokens.weight],
@@ -405,7 +402,7 @@ class SNNLanguageModel(nn.Module):
             'input_neurons': [],
             # 动态 K: 停止投影
             'halt_projs': [],
-            # SNNBlock 参数（v7: 无 W_V）
+            # SNNBlock 参数
             'W_in': [],
             'W_beta': [],
             'W_alpha': [],

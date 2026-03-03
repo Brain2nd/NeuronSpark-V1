@@ -1,10 +1,5 @@
 """
-SNNBlock v7: 完整的 SNN 隐状态空间 Block（并行化版本）
-
-v6 → v7 变更：
-  - 移除 W^(V) (W_beta_V, W_alpha_V, W_th_V)，使 β/α/V_th 仅依赖 spike_in
-  - 新增 forward_parallel: 使用 parallel scan 处理全序列
-  - 保留 single_step_forward 用于调试
+SNNBlock: 完整的 SNN 隐状态空间 Block（并行化版本）
 
 结构（每个 SNN 时间步）：
   spike_in {0,1}^D
@@ -19,7 +14,7 @@ v6 → v7 变更：
 
   W_out · V_post[t] ⊙ gate + I_skip → 连续输出 ∈ R^D
 
-数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
+数学原理见 SNN_SELECTIVE_STATE_SPACE.md。
 """
 
 import math
@@ -48,7 +43,7 @@ def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_m
 
 class SNNBlock(base.MemoryModule):
     """
-    单个 SNN Block（v7：并行化，无 W^(V)）。
+    单个 SNN Block（并行化）。
 
     Args:
         D: 可见维度（Block 间通信的维度）
@@ -78,7 +73,7 @@ class SNNBlock(base.MemoryModule):
         self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')
         self.W_skip = layer.Linear(D, D, bias=False, step_mode='s')
 
-        # ====== v7: W^(V) 已移除（见文档第 7.2 节） ======
+        # ====== β/α/V_th 仅依赖 spike_in（无 W^(V)·V 项） ======
 
         # ====== 调制偏置（结构化初始化） ======
         self.b_beta = nn.Parameter(torch.empty(DN))
@@ -98,9 +93,9 @@ class SNNBlock(base.MemoryModule):
         self._initialize_parameters()
 
     def _initialize_parameters(self):
-        """功能引导初始化（v7：无 W^(V)）。详细推导见文档 5.8.10。"""
+        """功能引导初始化。"""
         D, N = self.D, self.N
-        K_ref = 16  # v7: K=16
+        K_ref = 16
 
         # 目标 β 分布：多时间尺度 [0.80, 0.99]
         beta_values = torch.linspace(0.80, 0.99, N)
@@ -212,7 +207,7 @@ class SNNBlock(base.MemoryModule):
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """
-        单步前向传播（v7：无 W^(V)，用于调试/兼容）。
+        单步前向传播（用于调试/兼容）。
 
         Args:
             spike_in: 二值脉冲输入, shape (batch, D), 值域 {0, 1}
@@ -229,7 +224,7 @@ class SNNBlock(base.MemoryModule):
 
         I_t = self.W_in(spike_in)
 
-        # v7: β 调制仅依赖 spike_in（无 W^(V)·V 项）
+        # β 调制仅依赖 spike_in
         beta = torch.sigmoid(self.W_beta_x(spike_in) + self.b_beta)
         alpha = F.softplus(self.W_alpha_x(spike_in) + self.b_alpha)
         v_th = self.v_th_min + torch.abs(self.W_th_x(spike_in) + self.b_th)

@@ -94,7 +94,7 @@ class SNNFFN(base.MemoryModule):
         """
         并行前向传播：使用 parallel scan 处理全序列。
 
-        v7.4 优化：
+        优化：
           - gate_proj + up_proj 合并为单次 matmul（2 launch → 1）
           - gate + up PLIF scan: row-param kernel（无需 expand+contiguous beta/v_th）
           - u_merged: 向量缩放替代 cat（1次 broadcast multiply 替代 2次 scale + 1次 cat）

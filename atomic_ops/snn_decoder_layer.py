@@ -4,7 +4,7 @@ SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚
   RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → 残差
   RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → 残差
 
-v8.0 动态 K（对标 Mamba Δ 选择性机制）：
+动态 K：
   - K 是最大步数（K_max），不是固定步数。不同 token 有效步数 ∈ [1, K_max]。
   - 每个 token 的 K 帧 SNN 输出，学习自适应停止概率 p_halt
   - PonderNet 几何分布加权：λ_k = p_k · ∏_{j<k}(1-p_j)，归一化后加权聚合
@@ -24,8 +24,8 @@ v8.0 动态 K（对标 Mamba Δ 选择性机制）：
     但计算量和显存线性增长。K_max=32 允许 token 使用 1~32 步。
     PonderNet 的 ponder_cost 正则化确保简单 token 不浪费步数。
 
-v7.6 变更：K 帧层间聚合
-  - SNN 子层输出 K 帧连续值（V_post 经投影），mean 聚合为 1 per token
+K 帧层间聚合：
+  - SNN 子层输出 K 帧连续值（V_post 经投影），PonderNet 加权聚合为 1 per token
   - 聚合后经 out_proj 投影，广播回 K 帧做残差
   - 使 β 的时间动力学通过 K 帧聚合梯度有效传播
 

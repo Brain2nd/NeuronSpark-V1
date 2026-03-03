@@ -1,5 +1,5 @@
 """
-Parallel Scan 工具函数：SNN 线性递推的高效并行求解（v7.4: Row-param PLIF kernel）
+Parallel Scan 工具函数：SNN 线性递推的高效并行求解
 
 实现三层后端：
   1. Fused PLIF kernel（默认，CUDA + Sigmoid surrogate）：
@@ -18,24 +18,7 @@ PLIF 神经元动力学：
   s[k] = Θ(V_pre[k] - v_th[k])
   V_post[k] = V_pre[k] - v_th[k] * s[k]
 
-v7.3 → v7.4 变更：
-  - 新增 row-param PLIF kernel：beta/v_th 恒定时加载到寄存器，省去 expand+contiguous
-    · 前向：每步只读 u（beta/v_th 在寄存器中），内存读取减少 2/3
-    · 反向：grad_beta/grad_v_th 在寄存器中累加（K 步归约），无需 per-step 存储
-    · plif_fixed_param_forward 自动分发（scalar beta/v_th → row-param）
-    · 新增公开接口 plif_rowparam_forward
-  - plif_parallel_forward: 不变（per-element beta/v_th 场景）
-
-v7.2 → v7.3 变更：
-  - plif_parallel_forward: Fused PLIF kernel 替换 3-phase approach
-  - 保留 v7.2 的 Triton linear_recurrence 用于非 PLIF 场景
-  - 保留 3-phase fallback 用于 CPU/非 Sigmoid surrogate
-
-v7.1 → v7.2 变更：
-  - linear_recurrence: Triton fused kernel 替换 Hillis-Steele（CUDA）
-  - plif_fixed_param_forward: expand 后 .contiguous()
-
-数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
+数学原理见 SNN_SELECTIVE_STATE_SPACE.md。
 """
 
 import os
@@ -792,7 +775,7 @@ def plif_fixed_param_forward(
     ParametricLIFNode 方程: V[k] = beta * V[k-1] + (1-beta) * x[k]
     其中 beta = 1/(1+exp(w)), 可为 scalar tensor（保持梯度流向 w）。
 
-    v7.4: scalar/0-dim beta 和 v_th 使用 row-param 内核（无需 expand 到 (K, *shape)）。
+    scalar/0-dim beta 和 v_th 使用 row-param 内核（无需 expand 到 (K, *shape)）。
 
     Args:
         beta: 衰减率 — scalar float、0-dim tensor 或 (K, *shape) tensor

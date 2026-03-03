@@ -260,7 +260,7 @@ def wrap_model_fsdp(model, args, local_rank):
 # ============================================================
 
 def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, args,
-                iter_per_epoch, tokens_seen, rank, world_size):
+                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None):
     """训练一个 epoch（FSDP SFT 版本）。"""
     sampler.set_epoch(epoch)
     start_time = time.time()
@@ -299,6 +299,26 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
             raw_model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+
+            # Dashboard: optimizer.step() 后、zero_grad() 前（梯度仍可用）
+            if dashboard:
+                global_step = epoch * iter_per_epoch + step
+                if step % args.log_interval == 0:
+                    batch_loss_db = loss.item() * args.accumulation_steps
+                    spend_time_db = time.time() - start_time
+                    dashboard.log_step(global_step, {
+                        'loss': batch_loss_db,
+                        'ppl': math.exp(min(batch_loss_db, 20.0)),
+                        'lr': lr,
+                        'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
+                        'tokens_seen': tokens_seen,
+                        'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                        'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
+                        'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
+                    }, raw_model, log_params=True)
+                if (step + 1) % args.save_interval == 0:
+                    dashboard.log_save_point(global_step, raw_model)
+
             optimizer.zero_grad(set_to_none=True)
 
         valid_tokens = loss_mask_flat.sum()
@@ -382,6 +402,10 @@ if __name__ == "__main__":
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
 
+    # TensorBoard 看板（不传则禁用，零开销）
+    parser.add_argument('--dashboard_dir', type=str, default=None,
+                        help="TensorBoard 日志目录，例如 runs/sft")
+
     args = parser.parse_args()
 
     # ==================== 分布式初始化 ====================
@@ -415,6 +439,13 @@ if __name__ == "__main__":
 
     # 保存原始模型引用
     raw_model = model
+
+    # TensorBoard 看板（FSDP 包装前初始化，use_orig_params=True 保证引用有效）
+    if args.dashboard_dir:
+        from dashboard import SNNDashboard
+        dashboard = SNNDashboard(args.dashboard_dir, raw_model, rank)
+    else:
+        dashboard = None
 
     # FSDP 包装
     model, device = wrap_model_fsdp(model, args, local_rank)
@@ -482,7 +513,7 @@ if __name__ == "__main__":
         model.train()
         tokens_seen = train_epoch(
             epoch, model, raw_model, train_loader, sampler, optimizer, ctx, args,
-            iter_per_epoch, tokens_seen, rank, world_size,
+            iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
         )
 
     # 最终保存
@@ -491,5 +522,8 @@ if __name__ == "__main__":
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
     save_checkpoint_fsdp(args.save_dir, model, optimizer,
                          args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen, rank)
+
+    if dashboard:
+        dashboard.close()
 
     cleanup_distributed()

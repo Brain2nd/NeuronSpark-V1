@@ -24,6 +24,7 @@ from spikingjelly.activation_based import base, layer, surrogate
 
 from .plif_node import PLIFNode
 from .parallel_scan import plif_rowparam_forward
+from . import spike_current_activation
 
 
 class SNNFFN(base.MemoryModule):
@@ -145,9 +146,10 @@ class SNNFFN(base.MemoryModule):
             surrogate_function=surr,
         )
 
-        # 用 V_post（膜电位）作为激活值，非 spike
-        gate_v = V_post_merged[:, :, :D_ff]
-        up_v = V_post_merged[:, :, D_ff:]
+        # 脉冲电流作为激活值
+        sc_merged = spike_current_activation(spike_merged, v_th_row.unsqueeze(0))
+        gate_v = sc_merged[:, :, :D_ff]
+        up_v = sc_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
@@ -169,13 +171,13 @@ class SNNFFN(base.MemoryModule):
         Returns:
             continuous_out: 连续输出, shape (batch, D)
         """
-        # 门控路径 — V_post 膜电位激活
-        _ = self.gate_neuron(self.gate_proj(spike_in))
-        gate_v = self.gate_neuron.v  # V_post
+        # 门控路径 — 脉冲电流激活
+        gate_spike = self.gate_neuron(self.gate_proj(spike_in))
+        gate_v = spike_current_activation(gate_spike, self.gate_neuron.v_th)
 
-        # 值路径 — V_post 膜电位激活
-        _ = self.up_neuron(self.up_proj(spike_in))
-        up_v = self.up_neuron.v  # V_post
+        # 值路径 — 脉冲电流激活
+        up_spike = self.up_neuron(self.up_proj(spike_in))
+        up_v = spike_current_activation(up_spike, self.up_neuron.v_th)
 
         # 连续门控（对标 SwiGLU）
         gated = gate_v * up_v

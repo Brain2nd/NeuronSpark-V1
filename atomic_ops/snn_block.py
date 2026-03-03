@@ -25,6 +25,7 @@ from spikingjelly.activation_based import base, layer, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .parallel_scan import plif_parallel_forward
+from . import spike_current_activation
 
 
 # ====== Fused modulation activations (torch.compile) ======
@@ -194,12 +195,10 @@ class SNNBlock(base.MemoryModule):
         # 更新隐神经元状态（保存末步供下次调用）
         self.hidden_neuron.v = V_post_hidden[-1].detach()
 
-        # ====== Phase 4: 输出投影（V_post → W_out: 连续梯度直通 β）======
-        # 用 V_post（膜电压）代替 spike 作为 W_out 输入，消除 surrogate 梯度瓶颈：
-        #   spike 路径: ∂spike/∂β = surrogate'(V-v_th) · V_prev ≈ 0（大部分时刻）
-        #   V_post 路径: ∂V_post/∂β = V_prev（无 surrogate 阻断，每步都有梯度）
-        v_flat = V_post_hidden.reshape(TK * batch, DN)
-        I_out_all = F.linear(v_flat, self.W_out.weight).reshape(TK, batch, D)
+        # ====== Phase 4: 输出投影（spike_current → W_out）======
+        sc_hidden = spike_current_activation(s_hidden, v_th_all)
+        sc_flat = sc_hidden.reshape(TK * batch, DN)
+        I_out_all = F.linear(sc_flat, self.W_out.weight).reshape(TK, batch, D)
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
         # output_neuron 已移除：连续值由层级 K 帧聚合处理
@@ -234,9 +233,9 @@ class SNNBlock(base.MemoryModule):
 
         s_hidden = self.hidden_neuron(I_t, beta, alpha, v_th)
 
-        # 用 V_post（膜电压）做输出投影，与 forward_parallel 一致
-        V_post = self.hidden_neuron.v  # 发放+重置后的膜电位
-        I_out = self.W_out(V_post)
+        # 脉冲电流做输出投影，与 forward_parallel 一致
+        sc = spike_current_activation(s_hidden, v_th)
+        I_out = self.W_out(sc)
         I_total = I_out * gate + I_skip
 
         return I_total  # 连续值

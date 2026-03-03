@@ -1,3 +1,13 @@
+import torch
+
+
+def spike_current_activation(spike, v_th, eps=1e-6):
+    """脉冲电流激活：前向 = V_th * spike（稀疏），反向梯度稠密。"""
+    sc = v_th * spike
+    dense = sc + eps * (1.0 - spike)
+    return dense + (sc - dense).detach()
+
+
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
 from .lateral_inhibition import LateralInhibition

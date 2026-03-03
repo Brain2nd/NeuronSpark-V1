@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from spikingjelly.activation_based import functional, surrogate
 from torch.utils.checkpoint import checkpoint
 
-from atomic_ops import SNNDecoderLayer
+from atomic_ops import SNNDecoderLayer, spike_current_activation
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
@@ -153,13 +153,13 @@ class SNNLanguageModel(nn.Module):
         return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
-        """输出 PLIF 神经元的 parallel scan 前向：连续 h → V_post 膜电位。
+        """输出 PLIF 神经元的 parallel scan 前向：连续 h → 脉冲电流。
 
         Args:
             h: (TK, batch, D) 连续值（SNN 最后一层输出）
 
         Returns:
-            V_post: (TK, batch, D) 膜电位（连续激活值）
+            spike_current: (TK, batch, D) 脉冲电流（V_th * spike，稀疏激活值）
         """
         TK, batch, D = h.shape
 
@@ -179,7 +179,7 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        return V_post  # 膜电位作为激活值
+        return spike_current_activation(spike, v_th_row.unsqueeze(0))  # 脉冲电流作为激活值
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

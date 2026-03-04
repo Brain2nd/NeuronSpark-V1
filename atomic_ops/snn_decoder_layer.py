@@ -50,12 +50,11 @@ from .parallel_scan import plif_rowparam_forward
 from . import spike_current_activation
 
 
-# ====== Fused halt weight computation (torch.compile) ======
-# 7-8 个独立 element-wise kernel → 单 fused kernel
-# sigmoid + clamp + log1p + cumsum + exp + normalize
-# 首次调用触发 JIT 编译（~秒级），后续调用走缓存
+# ====== Fused halt weight computation ======
+# sigmoid + clamp + log1p + cumsum + exp + normalize 融合为单函数。
+# 注意：不使用 @torch.compile，因其会绕过 gradient checkpoint 的
+# pack/unpack hooks，导致每层泄漏 ~1 GB 显存。
 
-@torch.compile(backend='inductor', fullgraph=True)
 def _fused_geometric_halt(halt_logits):
     """融合计算 PonderNet 几何分布停止权重。
 
@@ -201,7 +200,7 @@ class SNNDecoderLayer(base.MemoryModule):
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
-        PonderNet 式自适应 K 帧聚合（动态 K 核心，torch.compile 融合优化）。
+        PonderNet 式自适应 K 帧聚合（动态 K 核心）。
 
         每步计算停止概率 p_k，用几何分布权重加权聚合，
         使不同 token 有不同的有效步数。
@@ -284,8 +283,9 @@ class SNNDecoderLayer(base.MemoryModule):
         del combined_block
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
 
-        # 广播回 TK：每 token 的残差复制 K 份
-        h = h + res_block.repeat_interleave(K, dim=0)
+        # 广播回 TK：view-based 广播避免显存复制
+        # res_block: (seq_len, batch, D) → (seq_len, 1, batch, D) → broadcast (seq_len, K, batch, D) → (TK, batch, D)
+        h = h + res_block.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
         del res_block
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → 动态K聚合 → out_proj → 残差
@@ -301,7 +301,7 @@ class SNNDecoderLayer(base.MemoryModule):
         del combined_ffn
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
-        h = h + res_ffn.repeat_interleave(K, dim=0)
+        h = h + res_ffn.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
         del res_ffn
 
         ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均

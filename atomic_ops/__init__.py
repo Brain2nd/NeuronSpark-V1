@@ -4,22 +4,23 @@ import torch
 class _SpikeCurrentFn(torch.autograd.Function):
     """融合脉冲电流激活：前向 = v_th * spike，反向梯度走稠密路径。
 
-    原版用 detach 技巧创建 ~5 个中间 tensor（sc, dense, sc-dense 等），
-    每个与输入同形状，在 DN=8192 时每个 ~1 GiB（bf16），严重浪费显存。
-    本版仅保存 spike 和 v_th 两个 tensor，节省 ~60% 激活显存。
+    显存优化: spike ∈ {0,1} 存为 uint8（1 字节/元素），
+    backward 时 cast 回计算 dtype，节省 50% spike 显存。
     """
 
     @staticmethod
     def forward(ctx, spike, v_th, eps):
-        ctx.save_for_backward(spike, v_th)
+        # spike ∈ {0,1}: 存为 uint8 节省 50% 显存
+        ctx.save_for_backward(spike.to(torch.uint8), v_th)
         ctx.eps = eps
+        ctx._spike_dtype = spike.dtype
         return v_th * spike
 
     @staticmethod
     def backward(ctx, grad_output):
-        spike, v_th = ctx.saved_tensors
+        spike_u8, v_th = ctx.saved_tensors
+        spike = spike_u8.to(ctx._spike_dtype)  # uint8 → 计算 dtype
         eps = ctx.eps
-        # 原版 dense = v_th*spike + eps*(1-spike)，梯度走 dense 路径：
         # ∂dense/∂spike = v_th - eps
         grad_spike = grad_output * (v_th - eps)
         # ∂dense/∂v_th = spike

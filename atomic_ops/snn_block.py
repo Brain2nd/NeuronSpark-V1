@@ -28,6 +28,19 @@ from .parallel_scan import plif_parallel_forward
 from . import spike_current_activation
 
 
+# ====== Fused alpha*I activation (torch.compile) ======
+# softplus + mul 融合为 1 kernel，避免 alpha 中间张量被 autograd 单独保存。
+# beta 和 v_th 各只有 1 个 element-wise op（sigmoid / abs），
+# 用表达式级临时张量即可，无需 compile。
+
+@torch.compile(backend='inductor', fullgraph=True)
+def _fused_alpha_u(raw_alpha, b_alpha, I_all):
+    """融合 u = softplus(α+b) × I: inductor 只保存 raw_alpha 和 I_all，
+    反向时重算 alpha，节省 1 个 DN 张量。"""
+    alpha = F.softplus(raw_alpha + b_alpha)
+    return alpha * I_all
+
+
 class SNNBlock(base.MemoryModule):
     """
     单个 SNN Block（并行化）。
@@ -141,10 +154,6 @@ class SNNBlock(base.MemoryModule):
         """
         并行前向传播：使用 parallel scan 处理全序列。
 
-        显存优化：逐个计算 DN 投影 + 表达式级临时张量自动释放。
-        sigmoid_/add_ 安全原地；abs/mul 用 non-inplace 避免 autograd 防御性拷贝。
-        峰值 DN 张量同时 ≤ 4 个（beta + v_th + alpha + I_all → del 后 3 个）。
-
         Args:
             spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
 
@@ -161,32 +170,27 @@ class SNNBlock(base.MemoryModule):
         )
         I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
-        # ====== Phase 2: DN-sized 投影（表达式级临时张量） ======
-        # 逐个计算，利用 Python 引用计数自动释放中间张量。
-        # 注意：abs_() 和 mul_() 会触发 autograd 防御性拷贝，反而增加显存，
-        # 因此 V_th 和 u 用表达式级临时张量（non-inplace）。
-        # sigmoid_() 安全（backward 仅需 output=self），add_() 安全（backward 无需保存）。
+        # ====== Phase 2: DN-sized 逐个投影 + 立即激活 ======
+        # 逐个计算避免 4 个 raw DN 张量同时存在，峰值从 7×DN 降至 5×DN。
+        # beta/v_th 各仅 1 个 element-wise op，用表达式级临时张量（Python 引用计数自动释放）。
+        # alpha*I 有 softplus+mul 两步，用 torch.compile 融合避免 alpha 被 autograd 单独保存。
 
-        # β: project → add bias → sigmoid（add_ 和 sigmoid_ 安全）
-        beta_all = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
-        beta_all.add_(self.b_beta).sigmoid_()  # (TK, batch, DN)
-
-        # V_th: 表达式级临时张量，abs() non-inplace 避免防御性拷贝
+        # β: sigmoid(linear + bias) — 中间 linear 输出在表达式求值后释放
+        beta_all = torch.sigmoid(
+            F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN) + self.b_beta
+        )
+        # V_th: |linear + bias| + min — 同上，AbsBackward 仅保存 abs 输入（1 DN）
         v_th_all = self.v_th_min + torch.abs(
             F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN) + self.b_th
-        )  # linear output + bias 为临时张量，abs 后自动释放
-
-        # α → u: softplus(α) * I，non-inplace 乘法避免防御性拷贝
-        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN) + self.b_alpha
+        )
+        # α·I: compile 融合 softplus+mul → inductor 只保存 raw_alpha 和 I_all
+        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
         I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
         del flat  # 释放 (TK*batch, D)
-        alpha = F.softplus(raw_alpha)
-        del raw_alpha  # 释放 (TK, batch, DN)
-        u_hidden = alpha * I_all  # non-inplace: 新张量，alpha/I_all 可安全释放
-        del alpha, I_all  # 释放 2×(TK, batch, DN)
-        # 此时 DN 张量: beta_all + v_th_all + u_hidden = 3 个
+        u_hidden = _fused_alpha_u(raw_alpha, self.b_alpha, I_all)
+        del raw_alpha, I_all  # 释放 2 个 (TK, batch, DN)
 
-        # ====== Phase 3: PLIF parallel scan ======
+        # 获取隐神经元初始状态
         v_init_hidden = self.hidden_neuron.v
         if isinstance(v_init_hidden, float):
             v_init_hidden = torch.zeros(batch, DN, device=spike_in_seq.device, dtype=spike_in_seq.dtype)
@@ -195,7 +199,7 @@ class SNNBlock(base.MemoryModule):
             beta_all, u_hidden, v_th_all, v_init_hidden, max_iter=3,
             surrogate_function=self.hidden_neuron.surrogate_function,
         )
-        del beta_all, u_hidden  # Triton PLIF ctx 不保存 u，可安全释放
+        del beta_all, u_hidden  # Triton PLIF ctx 不保存 u，可安全释放 ~2 GiB
 
         # 更新隐神经元状态（保存末步供下次调用）
         self.hidden_neuron.v = V_post_hidden[-1].detach()
@@ -209,6 +213,7 @@ class SNNBlock(base.MemoryModule):
         del sc_hidden, sc_flat
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
+        # output_neuron 已移除：连续值由层级 K 帧聚合处理
         return I_total_all  # (TK, batch, D), 连续值
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:

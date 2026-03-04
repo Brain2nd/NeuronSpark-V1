@@ -50,11 +50,12 @@ from .parallel_scan import plif_rowparam_forward
 from . import spike_current_activation
 
 
-# ====== Fused halt weight computation ======
-# sigmoid + clamp + log1p + cumsum + exp + normalize 融合为单函数。
-# 注意：不使用 @torch.compile，因其会绕过 gradient checkpoint 的
-# pack/unpack hooks，导致每层泄漏 ~1 GB 显存。
+# ====== Fused halt weight computation (torch.compile) ======
+# 7-8 个独立 element-wise kernel → 单 fused kernel
+# sigmoid + clamp + log1p + cumsum + exp + normalize
+# 首次调用触发 JIT 编译（~秒级），后续调用走缓存
 
+@torch.compile(backend='inductor', fullgraph=True)
 def _fused_geometric_halt(halt_logits):
     """融合计算 PonderNet 几何分布停止权重。
 

@@ -301,23 +301,28 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
             optimizer.step()
 
             # Dashboard: optimizer.step() 后、zero_grad() 前（梯度仍可用）
-            if dashboard:
-                global_step = epoch * iter_per_epoch + step
-                if step % args.log_interval == 0:
-                    batch_loss_db = loss.item() * args.accumulation_steps
-                    spend_time_db = time.time() - start_time
-                    dashboard.log_step(global_step, {
-                        'loss': batch_loss_db,
-                        'ppl': math.exp(min(batch_loss_db, 20.0)),
-                        'lr': lr,
-                        'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
-                        'tokens_seen': tokens_seen,
-                        'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
-                        'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
-                        'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
-                    }, raw_model, log_params=True)
-                if (step + 1) % args.save_interval == 0:
-                    dashboard.log_save_point(global_step, raw_model)
+            # summon_full_params 是集合操作，所有 rank 必须参与；仅 rank 0 写日志
+            need_log = step % args.log_interval == 0
+            need_save = (step + 1) % args.save_interval == 0
+            if need_log or need_save:
+                with FSDP.summon_full_params(model, writeback=False, rank0_only=True):
+                    if dashboard:
+                        global_step = epoch * iter_per_epoch + step
+                        if need_log:
+                            batch_loss_db = loss.item() * args.accumulation_steps
+                            spend_time_db = time.time() - start_time
+                            dashboard.log_step(global_step, {
+                                'loss': batch_loss_db,
+                                'ppl': math.exp(min(batch_loss_db, 20.0)),
+                                'lr': lr,
+                                'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
+                                'tokens_seen': tokens_seen,
+                                'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                                'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
+                                'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
+                            }, raw_model, log_params=True)
+                        if need_save:
+                            dashboard.log_save_point(global_step, raw_model)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -449,10 +454,6 @@ if __name__ == "__main__":
 
     # FSDP 包装
     model, device = wrap_model_fsdp(model, args, local_rank)
-
-    # FSDP 包装后设置，使 dashboard 能用 summon_full_params 获取完整参数
-    if dashboard:
-        dashboard.set_fsdp_model(model)
 
     # ==================== 数据 ====================
     train_ds = SFTDataset(args.sft_data_path, tokenizer, max_length=args.max_length)

@@ -211,6 +211,9 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                 loss = torch.sum(loss * loss_mask_float) / mask_sum
             else:
                 loss = loss.mean()  # fallback
+            # 动态 K: ponder cost 正则化
+            if out.ponder_cost is not None and args.ponder_weight > 0:
+                loss = loss + args.ponder_weight * out.ponder_cost / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -290,6 +293,8 @@ if __name__ == "__main__":
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--warmup_iters', type=int, default=100)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
+    parser.add_argument('--ponder_weight', type=float, default=0.01,
+                        help='动态 K ponder cost 正则化权重')
 
     # 日志和保存
     parser.add_argument("--log_interval", type=int, default=100)

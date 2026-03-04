@@ -250,8 +250,9 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             if is_main_process(rank):
                 model.eval()
                 global_step = epoch * iter_per_epoch + step + 1
+                cur_loss = loss.item() * args.accumulation_steps
                 save_checkpoint(args.save_dir, model, optimizer, scaler,
-                                global_step, epoch, batch_loss, tokens_seen)
+                                global_step, epoch, cur_loss, tokens_seen)
                 model.train()
             if world_size > 1:
                 dist.barrier()

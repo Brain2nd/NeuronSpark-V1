@@ -232,8 +232,9 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         if (step + 1) % args.save_interval == 0:
             model.eval()
             global_step = epoch * iter_per_epoch + step + 1
+            cur_loss = loss.item() * args.accumulation_steps
             save_checkpoint(args.save_dir, model, optimizer, scaler,
-                            global_step, epoch, batch_loss, tokens_seen)
+                            global_step, epoch, cur_loss, tokens_seen)
             model.train()
 
     return tokens_seen

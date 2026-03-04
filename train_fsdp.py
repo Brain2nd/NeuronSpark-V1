@@ -356,12 +356,13 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_cur, mem_peak, world_size))
 
-        # 定期保存
-        if (step + 1) % args.save_interval == 0:
+        # 定期保存（仅在梯度累积边界步，确保 optimizer 已更新）
+        if is_boundary and (step + 1) % args.save_interval == 0:
             model.eval()
             global_step = epoch * iter_per_epoch + step + 1
+            cur_loss = loss.item() * args.accumulation_steps
             save_checkpoint_fsdp(args.save_dir, model, optimizer,
-                                 global_step, epoch, batch_loss, tokens_seen, rank)
+                                 global_step, epoch, cur_loss, tokens_seen, rank)
             model.train()
 
     return tokens_seen

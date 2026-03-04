@@ -201,13 +201,18 @@ class SNNDecoderLayer(base.MemoryModule):
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
-        PonderNet 式自适应 K 帧聚合（动态 K 核心）。
+        PonderNet 式自适应 K 帧聚合（动态 K 核心，torch.compile 融合优化）。
 
         每步计算停止概率 p_k，用几何分布权重加权聚合，
         使不同 token 有不同的有效步数。
 
         优化: _fused_geometric_halt 将 sigmoid+log1p+cumsum+exp+normalize
         融合为单 inductor kernel（参见 snn_block._fused_modulation 同一模式）。
+
+        显存优化: ponder_cost 用 detached frames 计算停止权重，
+        避免 halt_proj(frames) 的 MmBackward 保留整个 frames 张量。
+        checkpoint 返回 (h, ponder_cost) 时，ponder_cost 的计算图不再引用 frames，
+        使 del frames_block 能真正释放 (seq_len, K, batch, D) 的显存。
 
         数学:
           p_k = σ(halt_proj(frame_k))                 — 停止概率
@@ -228,10 +233,13 @@ class SNNDecoderLayer(base.MemoryModule):
         seq_len, K, batch, D = frames.shape
 
         # ====== 1. halt_proj matmul（cuBLAS）+ 融合几何权重（inductor） ======
-        halt_logits = halt_proj(frames).squeeze(-1)    # (seq_len, K, batch)
-        halt_weights = _fused_geometric_halt(halt_logits)  # (seq_len, K, batch), 归一化
+        # 用 detached frames 计算 halt_weights，切断 ponder_cost → frames 的图引用链。
+        # halt_proj.weight 仍通过 ponder_cost 获得梯度（detach 只断 frames 的图，不断权重的图）。
+        halt_logits = halt_proj(frames.detach()).squeeze(-1)  # (seq_len, K, batch)
+        halt_weights = _fused_geometric_halt(halt_logits)     # (seq_len, K, batch), 归一化
 
-        # ====== 2. 加权聚合 ======
+        # ====== 2. 加权聚合（frames 的梯度从这里流回） ======
+        # halt_weights 来自 detached 路径，对 frames 而言等价于常数权重
         # (seq_len, K, batch, 1) × (seq_len, K, batch, D) → sum → (seq_len, batch, D)
         aggregated = (frames * halt_weights.unsqueeze(-1)).sum(dim=1)
 
@@ -284,8 +292,8 @@ class SNNDecoderLayer(base.MemoryModule):
         del combined_block
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
 
-        # 广播回 TK：view-based 广播避免显存复制
-        # res_block: (seq_len, batch, D) → (seq_len, 1, batch, D) → broadcast (seq_len, K, batch, D) → (TK, batch, D)
+        # 广播回 TK：view-based 零拷贝广播（避免 repeat_interleave 的显存复制）
+        # res_block: (seq_len, batch, D) → (seq_len, 1, batch, D) → expand → (TK, batch, D)
         h = h + res_block.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
         del res_block
 

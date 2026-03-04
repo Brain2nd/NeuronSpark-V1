@@ -28,17 +28,18 @@ from .parallel_scan import plif_parallel_forward
 from . import spike_current_activation
 
 
-# ====== Fused alpha*I activation (torch.compile) ======
-# softplus + mul 融合为 1 kernel，避免 alpha 中间张量被 autograd 单独保存。
-# beta 和 v_th 各只有 1 个 element-wise op（sigmoid / abs），
-# 用表达式级临时张量即可，无需 compile。
+# ====== Fused modulation activations (torch.compile) ======
+# Fuse sigmoid + softplus + abs + alpha*I into single kernel.
+# 7-8 separate element-wise kernels → 1 fused kernel, ~4x speedup on DN-sized tensors.
+# First call triggers JIT compilation (~seconds); cached for subsequent calls.
 
 @torch.compile(backend='inductor', fullgraph=True)
-def _fused_alpha_u(raw_alpha, b_alpha, I_all):
-    """融合 u = softplus(α+b) × I: inductor 只保存 raw_alpha 和 I_all，
-    反向时重算 alpha，节省 1 个 DN 张量。"""
+def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_min, I_all):
+    beta = torch.sigmoid(raw_beta + b_beta)
     alpha = F.softplus(raw_alpha + b_alpha)
-    return alpha * I_all
+    v_th = v_th_min + torch.abs(raw_th + b_th)
+    u = alpha * I_all
+    return beta, u, v_th
 
 
 class SNNBlock(base.MemoryModule):
@@ -163,32 +164,33 @@ class SNNBlock(base.MemoryModule):
         TK, batch, D = spike_in_seq.shape
         DN = self.D * self.N
 
-        # ====== Phase 1: D-sized 投影（小张量，先算）======
+        # ====== Phase 1: 合并投影（6 次 F.linear → 2 次）======
+        # 参照 snn_ffn 的 gate+up 合并 matmul 模式，减少 cuBLAS kernel launch
         flat = spike_in_seq.reshape(TK * batch, D)
-        gate_all = torch.sigmoid(
-            F.linear(flat, self.W_gate.weight).reshape(TK, batch, D)
-        )
-        I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
-        # ====== Phase 2: DN-sized 逐个投影 + 立即激活 ======
-        # 逐个计算避免 4 个 raw DN 张量同时存在，峰值从 7×DN 降至 5×DN。
-        # beta/v_th 各仅 1 个 element-wise op，用表达式级临时张量（Python 引用计数自动释放）。
-        # alpha*I 有 softplus+mul 两步，用 torch.compile 融合避免 alpha 被 autograd 单独保存。
+        # 4 个 DN 投影合并为 1 次 matmul
+        W_4dn = torch.cat([self.W_in.weight, self.W_beta_x.weight,
+                           self.W_alpha_x.weight, self.W_th_x.weight], dim=0)
+        proj_4dn = F.linear(flat, W_4dn).reshape(TK * batch, 4, DN)
+        I_all = proj_4dn[:, 0, :].reshape(TK, batch, DN)
+        raw_beta = proj_4dn[:, 1, :].reshape(TK, batch, DN)
+        raw_alpha = proj_4dn[:, 2, :].reshape(TK, batch, DN)
+        raw_th = proj_4dn[:, 3, :].reshape(TK, batch, DN)
+        del proj_4dn
 
-        # β: sigmoid(linear + bias) — 中间 linear 输出在表达式求值后释放
-        beta_all = torch.sigmoid(
-            F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN) + self.b_beta
+        # 2 个 D 投影合并为 1 次 matmul
+        W_gs = torch.cat([self.W_gate.weight, self.W_skip.weight], dim=0)
+        proj_gs = F.linear(flat, W_gs).reshape(TK, batch, 2 * D)
+        gate_all = torch.sigmoid(proj_gs[:, :, :D])
+        I_skip_all = proj_gs[:, :, D:]
+        del flat, proj_gs  # 释放投影输入
+
+        # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
+        beta_all, u_hidden, v_th_all = _fused_modulation(
+            raw_beta, self.b_beta, raw_alpha, self.b_alpha,
+            raw_th, self.b_th, self.v_th_min, I_all,
         )
-        # V_th: |linear + bias| + min — 同上，AbsBackward 仅保存 abs 输入（1 DN）
-        v_th_all = self.v_th_min + torch.abs(
-            F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN) + self.b_th
-        )
-        # α·I: compile 融合 softplus+mul → inductor 只保存 raw_alpha 和 I_all
-        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
-        I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
-        del flat  # 释放 (TK*batch, D)
-        u_hidden = _fused_alpha_u(raw_alpha, self.b_alpha, I_all)
-        del raw_alpha, I_all  # 释放 2 个 (TK, batch, DN)
+        del raw_beta, raw_alpha, raw_th, I_all  # 释放 4 个 (TK, batch, DN) 中间张量
 
         # 获取隐神经元初始状态
         v_init_hidden = self.hidden_neuron.v

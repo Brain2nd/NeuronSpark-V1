@@ -114,6 +114,7 @@ class SNNFFN(base.MemoryModule):
         W_gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
         I_gate_up = F.linear(flat, W_gate_up).reshape(TK, batch, 2 * D_ff)
         I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
+        del flat  # 释放 (TK*batch, D) 投影输入
 
         # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======
         beta_gate = self.gate_neuron.beta  # (D_ff,)
@@ -134,10 +135,10 @@ class SNNFFN(base.MemoryModule):
         # v_init_merged: (batch, 2*D_ff)
         v_init_gate = self.gate_neuron.v
         if isinstance(v_init_gate, float):
-            v_init_gate = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_gate = torch.zeros(batch, D_ff, device=spike_in_seq.device, dtype=spike_in_seq.dtype)
         v_init_up = self.up_neuron.v
         if isinstance(v_init_up, float):
-            v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_up = torch.zeros(batch, D_ff, device=spike_in_seq.device, dtype=spike_in_seq.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
         # Row-param PLIF scan: beta/v_th 从寄存器读取，不占显存带宽
@@ -145,16 +146,20 @@ class SNNFFN(base.MemoryModule):
             beta_row, u_merged, v_th_row, v_init_merged,
             surrogate_function=surr,
         )
+        del u_merged, v_init_merged  # Triton PLIF ctx 不保存 u，可安全释放 ~0.8 GiB
 
         # 脉冲电流作为激活值
         sc_merged = spike_current_activation(spike_merged, v_th_row.unsqueeze(0))
+        del spike_merged
         gate_v = sc_merged[:, :, :D_ff]
         up_v = sc_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
+        del V_post_merged
 
         # ====== Phase 3: 连续门控（V_post × V_post，对标 SwiGLU）+ 降维 ======
         gated = gate_v * up_v  # (TK, batch, D_ff)
+        del sc_merged, gate_v, up_v
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 

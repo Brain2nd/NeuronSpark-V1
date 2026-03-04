@@ -193,8 +193,10 @@ class SNNDecoderLayer(base.MemoryModule):
             beta_row, u, v_th_row, v_init,
             surrogate_function=input_neuron.surrogate_function,
         )
+        del u  # Triton PLIF ctx 不保存 u，可安全释放
 
         input_neuron.v = V_post[-1].detach()
+        del V_post
         return spike_current_activation(spike, v_th_row.unsqueeze(0))  # 脉冲电流作为激活值
 
     def _adaptive_aggregate(self, frames, halt_proj):
@@ -271,26 +273,36 @@ class SNNDecoderLayer(base.MemoryModule):
         # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → 动态K聚合 → out_proj → 残差
         v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
         cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
+        del v_in
 
         # 动态 K 帧聚合（PonderNet）: (TK, batch, D) → (seq_len, K, batch, D) → 加权 → (seq_len, batch, D)
         frames_block = cont_block.view(seq_len, K, batch, D)
+        del cont_block
         combined_block, pc_block, ek_block = self._adaptive_aggregate(frames_block, self.block_halt)
+        del frames_block
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
+        del combined_block
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
 
         # 广播回 TK：每 token 的残差复制 K 份
         h = h + res_block.repeat_interleave(K, dim=0)
+        del res_block
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → 动态K聚合 → out_proj → 残差
         v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
+        del v_in2
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
+        del cont_ffn
         combined_ffn, pc_ffn, ek_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        del frames_ffn
         res_ffn = self.ffn_out_proj(combined_ffn)
+        del combined_ffn
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
         h = h + res_ffn.repeat_interleave(K, dim=0)
+        del res_ffn
 
         ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均
 

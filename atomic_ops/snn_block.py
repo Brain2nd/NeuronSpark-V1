@@ -175,30 +175,36 @@ class SNNBlock(base.MemoryModule):
             F.linear(flat, self.W_gate.weight).reshape(TK, batch, D)
         )
         I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
+        del flat  # 释放 (TK*batch, D) 投影输入
 
         # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
         beta_all, u_hidden, v_th_all = _fused_modulation(
             raw_beta, self.b_beta, raw_alpha, self.b_alpha,
             raw_th, self.b_th, self.v_th_min, I_all,
         )
+        del raw_beta, raw_alpha, raw_th, I_all  # 释放 4 个 (TK, batch, DN) 中间张量
 
         # 获取隐神经元初始状态
         v_init_hidden = self.hidden_neuron.v
         if isinstance(v_init_hidden, float):
-            v_init_hidden = torch.zeros(batch, DN, device=flat.device, dtype=flat.dtype)
+            v_init_hidden = torch.zeros(batch, DN, device=spike_in_seq.device, dtype=spike_in_seq.dtype)
 
         s_hidden, V_post_hidden, _ = plif_parallel_forward(
             beta_all, u_hidden, v_th_all, v_init_hidden, max_iter=3,
             surrogate_function=self.hidden_neuron.surrogate_function,
         )
+        del beta_all, u_hidden  # Triton PLIF ctx 不保存 u，可安全释放 ~2 GiB
 
         # 更新隐神经元状态（保存末步供下次调用）
         self.hidden_neuron.v = V_post_hidden[-1].detach()
+        del V_post_hidden
 
         # ====== Phase 4: 输出投影（spike_current → W_out）======
         sc_hidden = spike_current_activation(s_hidden, v_th_all)
+        del s_hidden, v_th_all
         sc_flat = sc_hidden.reshape(TK * batch, DN)
         I_out_all = F.linear(sc_flat, self.W_out.weight).reshape(TK, batch, D)
+        del sc_hidden, sc_flat
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
         # output_neuron 已移除：连续值由层级 K 帧聚合处理

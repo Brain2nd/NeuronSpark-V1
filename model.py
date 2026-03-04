@@ -177,8 +177,10 @@ class SNNLanguageModel(nn.Module):
             beta_row, u, v_th_row, v_init,
             surrogate_function=self.output_neuron.surrogate_function,
         )
+        del u  # Triton PLIF ctx 不保存 u，可安全释放
 
         self.output_neuron.v = V_post[-1].detach()
+        del V_post
         return spike_current_activation(spike, v_th_row.unsqueeze(0))  # 脉冲电流作为激活值
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:

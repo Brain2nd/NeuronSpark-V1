@@ -399,7 +399,7 @@ if __name__ == "__main__":
 
     # 日志和保存
     parser.add_argument("--log_interval", type=int, default=100)
-    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--save_interval", type=int, default=500)
 
     # 数据
     parser.add_argument("--data_path", type=str,

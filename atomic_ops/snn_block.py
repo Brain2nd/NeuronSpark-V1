@@ -141,9 +141,9 @@ class SNNBlock(base.MemoryModule):
         """
         并行前向传播：使用 parallel scan 处理全序列。
 
-        显存优化：逐个计算 DN 投影并立即原地激活（sigmoid_/abs_/mul_），
-        避免同时存在 4 input + 4 output 共 8 个 (TK, batch, DN) 张量。
-        峰值从 8×DN 降至 ~4×DN。
+        显存优化：逐个计算 DN 投影 + 表达式级临时张量自动释放。
+        sigmoid_/add_ 安全原地；abs/mul 用 non-inplace 避免 autograd 防御性拷贝。
+        峰值 DN 张量同时 ≤ 4 个（beta + v_th + alpha + I_all → del 后 3 个）。
 
         Args:
             spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
@@ -161,27 +161,29 @@ class SNNBlock(base.MemoryModule):
         )
         I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
-        # ====== Phase 2: DN-sized 投影 + 原地激活 ======
-        # 逐个计算，立即变换，避免 4 个 raw + 4 个 output 同时存在
+        # ====== Phase 2: DN-sized 投影（表达式级临时张量） ======
+        # 逐个计算，利用 Python 引用计数自动释放中间张量。
+        # 注意：abs_() 和 mul_() 会触发 autograd 防御性拷贝，反而增加显存，
+        # 因此 V_th 和 u 用表达式级临时张量（non-inplace）。
+        # sigmoid_() 安全（backward 仅需 output=self），add_() 安全（backward 无需保存）。
 
-        # β: project → add bias → sigmoid（原地）
+        # β: project → add bias → sigmoid（add_ 和 sigmoid_ 安全）
         beta_all = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
-        beta_all.add_(self.b_beta).sigmoid_()  # (TK, batch, DN), 原地
+        beta_all.add_(self.b_beta).sigmoid_()  # (TK, batch, DN)
 
-        # V_th: project → add bias → abs → add min（原地）
-        v_th_all = F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN)
-        v_th_all.add_(self.b_th).abs_().add_(self.v_th_min)  # (TK, batch, DN), 原地
+        # V_th: 表达式级临时张量，abs() non-inplace 避免防御性拷贝
+        v_th_all = self.v_th_min + torch.abs(
+            F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN) + self.b_th
+        )  # linear output + bias 为临时张量，abs 后自动释放
 
-        # α → u: project α → softplus → 乘入 I_all（原地）
-        # 关键：alpha 临时张量立即乘入 I_all 后释放，避免同时 4 个 DN
-        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
-        raw_alpha.add_(self.b_alpha)
-        u_hidden = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
+        # α → u: softplus(α) * I，non-inplace 乘法避免防御性拷贝
+        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN) + self.b_alpha
+        I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
         del flat  # 释放 (TK*batch, D)
         alpha = F.softplus(raw_alpha)
         del raw_alpha  # 释放 (TK, batch, DN)
-        u_hidden.mul_(alpha)  # 原地: I_all → u = α·I
-        del alpha  # 释放 (TK, batch, DN)
+        u_hidden = alpha * I_all  # non-inplace: 新张量，alpha/I_all 可安全释放
+        del alpha, I_all  # 释放 2×(TK, batch, DN)
         # 此时 DN 张量: beta_all + v_th_all + u_hidden = 3 个
 
         # ====== Phase 3: PLIF parallel scan ======

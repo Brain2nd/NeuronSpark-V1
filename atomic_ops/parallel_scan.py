@@ -390,8 +390,6 @@ if _HAS_TRITON:
 
         For neurons with constant beta/v_th across K steps (ParametricLIFNode).
         Eliminates expand+contiguous for beta/v_th tensors, reduces memory I/O by ~40%.
-
-        显存优化: spike 存为 uint8，节省 50% spike 显存。
         """
 
         _BLOCK = 128
@@ -420,9 +418,7 @@ if _HAS_TRITON:
             )
 
             if any(ctx.needs_input_grad[:4]):
-                # spike ∈ {0,1}: 存为 uint8 节省 50% 显存
-                ctx.save_for_backward(beta_row_c, v_th_row_c, v_init_c, V_post, spike.to(torch.uint8))
-                ctx._spike_dtype = spike.dtype
+                ctx.save_for_backward(beta_row_c, v_th_row_c, v_init_c, V_post, spike)
             ctx.K = K
             ctx.num_cols = num_cols
             ctx.alpha = alpha
@@ -431,14 +427,13 @@ if _HAS_TRITON:
 
         @staticmethod
         def backward(ctx, grad_spike, grad_V_post):
-            beta_row, v_th_row, v_init, V_post, spike_u8 = ctx.saved_tensors
-            spike = spike_u8.to(ctx._spike_dtype)  # uint8 → 计算 dtype
+            beta_row, v_th_row, v_init, V_post, spike = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
             alpha = ctx.alpha
 
             if grad_spike is None:
-                grad_spike = torch.zeros_like(V_post)
+                grad_spike = torch.zeros_like(spike)
             if grad_V_post is None:
                 grad_V_post = torch.zeros_like(V_post)
 
@@ -469,9 +464,6 @@ if _HAS_TRITON:
         Single-pass sequential scan replaces the 3-phase approach:
           Phase 1 (linear scan) + Phase 2 (spike iteration) + Phase 3 (correction)
           → 1 fused kernel with inline spike detection + soft reset
-
-        显存优化: spike ∈ {0,1} 存为 uint8（1 字节/元素），
-        backward 时 cast 回计算 dtype，节省 50% spike 显存。
 
         Advantages:
           - 1 kernel launch (vs 3-4 launches + ~10 element-wise ops)
@@ -506,9 +498,7 @@ if _HAS_TRITON:
             )
 
             if any(ctx.needs_input_grad[:4]):
-                # spike ∈ {0,1}: 存为 uint8 节省 50% 显存（bf16=2B → uint8=1B）
-                ctx.save_for_backward(beta_c, v_th_c, v_init_c, V_post, spike.to(torch.uint8))
-                ctx._spike_dtype = spike.dtype
+                ctx.save_for_backward(beta_c, v_th_c, v_init_c, V_post, spike)
             ctx.K = K
             ctx.num_cols = num_cols
             ctx.alpha = alpha
@@ -517,14 +507,13 @@ if _HAS_TRITON:
 
         @staticmethod
         def backward(ctx, grad_spike, grad_V_post):
-            beta, v_th, v_init, V_post, spike_u8 = ctx.saved_tensors
-            spike = spike_u8.to(ctx._spike_dtype)  # uint8 → 计算 dtype
+            beta, v_th, v_init, V_post, spike = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
             alpha = ctx.alpha
 
             if grad_spike is None:
-                grad_spike = torch.zeros_like(V_post)
+                grad_spike = torch.zeros_like(spike)
             if grad_V_post is None:
                 grad_V_post = torch.zeros_like(V_post)
 

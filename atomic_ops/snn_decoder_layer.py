@@ -240,6 +240,15 @@ class SNNDecoderLayer(base.MemoryModule):
 
         return aggregated, ponder_cost, expected_k.detach()
 
+    def forward(self, h):
+        """前向传播入口（FSDP 兼容）。
+
+        FSDP 通过 __call__ 触发参数聚合钩子，必须由此方法作为入口，
+        而非直接调用 forward_parallel（会绕过 FSDP 钩子导致参数未聚合）。
+        单卡/DDP 训练及推理可直接调用 forward_parallel。
+        """
+        return self.forward_parallel(h)
+
     def forward_parallel(self, h):
         """
         并行前向传播：连续残差流 + 动态 K 帧聚合。

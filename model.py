@@ -140,7 +140,7 @@ class SNNLanguageModel(nn.Module):
 
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
-            return layer_mod.forward_parallel(x)  # returns (h, ponder_cost)
+            return layer_mod(x)  # 通过 __call__ 触发 FSDP 参数聚合钩子
 
         for layer_module in self.layers:
             h, pc = checkpoint(

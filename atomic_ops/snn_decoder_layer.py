@@ -63,7 +63,10 @@ def _fused_geometric_halt(halt_logits):
 
     数学: p_k = σ(logit_k), S_k = ∏_{j<k}(1-p_j), λ_k = p_k·S_k, λ̂_k = λ_k/Σλ
     """
-    p_halt = torch.sigmoid(halt_logits).clamp(min=1e-7, max=1.0 - 1e-7)
+    # bf16 尾数仅 7 位，sigmoid(6.3+) 舍入为 1.0 → log1p(-1.0) = -inf → NaN
+    # clamp logits 到 [-6, 6]：sigmoid(6) = 0.99609375 bf16 安全
+    halt_logits = halt_logits.clamp(-6.0, 6.0)
+    p_halt = torch.sigmoid(halt_logits)
     log_1_minus_p = torch.log1p(-p_halt)               # (seq_len, K, batch)
     # Exclusive cumsum: log_survive[:, k, :] = Σ_{j<k} log(1-p_j)
     # 避免 torch.cat: 用 cumsum([:, :-1]) 填充 [:, 1:]

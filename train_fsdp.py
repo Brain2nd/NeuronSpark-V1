@@ -289,6 +289,9 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 loss = out.last_loss / args.accumulation_steps
                 loss_mask_flat = loss_mask.view(-1)
                 loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
+                # 动态 K: ponder cost 正则化（鼓励用更少步数处理简单 token）
+                if out.ponder_cost is not None and args.ponder_weight > 0:
+                    loss = loss + args.ponder_weight * out.ponder_cost / args.accumulation_steps
 
             # 反向传播（bf16 不需要 GradScaler）
             loss.backward()
@@ -341,11 +344,15 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
             tps = tokens_seen / spend_time if spend_time > 0 else 0
             mem_cur = torch.cuda.memory_allocated() / 1e9
             mem_peak = torch.cuda.max_memory_allocated() / 1e9
+            ponder_str = ""
+            if out.ponder_cost is not None:
+                pc_val = out.ponder_cost.item()
+                ponder_str = f" pc:{pc_val:.2f}"
             print(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} '
+                'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f}{} '
                 'epoch_Time:{}min | Mem {:.1f}/{:.1f}GB | GPUs:{} [FSDP]'.format(
                     epoch + 1, args.epochs, step, iter_per_epoch,
-                    batch_loss, batch_ppl, lr, tps,
+                    batch_loss, batch_ppl, lr, tps, ponder_str,
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_cur, mem_peak, world_size))
 
@@ -391,6 +398,8 @@ if __name__ == "__main__":
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--warmup_iters', type=int, default=0)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
+    parser.add_argument('--ponder_weight', type=float, default=0.01,
+                        help='动态 K ponder cost 正则化权重')
 
     # FSDP 参数
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',

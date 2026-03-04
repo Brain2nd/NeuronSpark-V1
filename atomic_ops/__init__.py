@@ -23,9 +23,9 @@ class _SpikeCurrentFn(torch.autograd.Function):
         eps = ctx.eps
         # ∂dense/∂spike = v_th - eps
         grad_spike = grad_output * (v_th - eps)
-        # ∂sc/∂v_th = -spike（与 PLIF soft-reset ∂V_post/∂V_th = -spike 一致：
-        # 增大 V_th 应降低输出，使梯度推动 V_th 下降以增加发放率）
-        grad_v_th = -grad_output * spike
+        # ∂sc/∂v_th = +spike：spike=1 时 output=V_th，增大 V_th 直接增大输出
+        # spike=0 时 grad=0 无影响；阈值调节由 surrogate gradient 经 spike 路径处理
+        grad_v_th = grad_output * spike
         # v_th 可能有 broadcast（如 shape (1, batch, D) 对 (TK, batch, D)），需 reduce
         if grad_v_th.shape != v_th.shape:
             reduce_dims = tuple(

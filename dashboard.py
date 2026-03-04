@@ -187,7 +187,7 @@ class SNNDashboard:
                 w.add_scalar(f"neuron_dynamics/{tag}/std", val.std().item(), step)
 
     def _log_dynamic_k(self, step, model):
-        """记录每层 PonderNet E[K] 的极值范围。"""
+        """记录每层 PonderNet E[K] 的极值范围 + halt 参数统计。"""
         w = self._writer
         for i, layer_module in enumerate(model.layers):
             ek_min = getattr(layer_module, '_ek_min', None)
@@ -195,6 +195,15 @@ class SNNDashboard:
             if ek_min is not None:
                 w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
                 w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
+
+            # halt 参数监控：权重 norm + 偏置值（诊断 halt 爆炸）
+            with torch.no_grad():
+                for name, halt in [('block_halt', layer_module.block_halt),
+                                   ('ffn_halt', layer_module.ffn_halt)]:
+                    w.add_scalar(f"halt/layer_{i:02d}/{name}/weight_norm",
+                                 halt.weight.data.norm().item(), step)
+                    w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
+                                 halt.bias.data.item(), step)
 
     # ====== 重量日志（每 save_interval 步） ======
 

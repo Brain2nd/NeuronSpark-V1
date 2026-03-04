@@ -26,6 +26,7 @@ SNNDashboard: TensorBoard 训练看板
 
 import torch
 import torch.nn.functional as F
+from contextlib import nullcontext
 
 
 class SNNDashboard:
@@ -35,9 +36,10 @@ class SNNDashboard:
         log_dir: TensorBoard 日志目录，None 时完全禁用（零开销）
         model: FSDP 包装前的原始模型（raw_model）
         rank: 分布式 rank，仅 rank 0 启用记录
+        fsdp_model: FSDP 包装后的模型（可选，用于 summon_full_params 获取完整参数）
     """
 
-    def __init__(self, log_dir, model, rank=0):
+    def __init__(self, log_dir, model, rank=0, fsdp_model=None):
         self._enabled = (log_dir is not None) and (rank == 0)
         if not self._enabled:
             return
@@ -47,8 +49,21 @@ class SNNDashboard:
         self._writer = SummaryWriter(log_dir=log_dir)
         self._registry = self._build_registry(model)
         self._neuron_semantics = self._build_neuron_semantics(model)
+        self._fsdp_model = fsdp_model
 
     # ====== 公开方法 ======
+
+    def set_fsdp_model(self, fsdp_model):
+        """FSDP 包装完成后设置，用于 summon_full_params 获取完整参数。"""
+        if self._enabled:
+            self._fsdp_model = fsdp_model
+
+    def _summon_ctx(self):
+        """获取 FSDP summon_full_params 上下文（无 FSDP 时为 nullcontext）。"""
+        if self._fsdp_model is not None:
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+            return FSDP.summon_full_params(self._fsdp_model, writeback=False, rank0_only=True)
+        return nullcontext()
 
     def log_step(self, step, metrics_dict, model, log_params=True):
         """每 log_interval 步调用：训练标量 + 参数监控 + 神经元动力学。"""
@@ -58,8 +73,9 @@ class SNNDashboard:
         self._log_training_scalars(step, metrics_dict)
 
         if log_params:
-            self._log_param_norms(step, metrics_dict.get('lr', 1e-4))
-            self._log_neuron_dynamics(step)
+            with self._summon_ctx():
+                self._log_param_norms(step, metrics_dict.get('lr', 1e-4))
+                self._log_neuron_dynamics(step)
             self._log_dynamic_k(step, model)
 
     def log_save_point(self, step, model):
@@ -67,8 +83,9 @@ class SNNDashboard:
         if not self._enabled:
             return
 
-        self._log_histograms(step)
-        self._log_compensation_factors(step, model)
+        with self._summon_ctx():
+            self._log_histograms(step)
+            self._log_compensation_factors(step, model)
 
     def close(self):
         """关闭 TensorBoard writer，刷新缓冲。"""

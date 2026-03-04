@@ -450,6 +450,10 @@ if __name__ == "__main__":
     # FSDP 包装
     model, device = wrap_model_fsdp(model, args, local_rank)
 
+    # FSDP 包装后设置，使 dashboard 能用 summon_full_params 获取完整参数
+    if dashboard:
+        dashboard.set_fsdp_model(model)
+
     # ==================== 数据 ====================
     train_ds = SFTDataset(args.sft_data_path, tokenizer, max_length=args.max_length)
     sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=rank, shuffle=True)

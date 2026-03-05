@@ -212,6 +212,7 @@ def init_model(args, local_rank, rank):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
+        ek_floor=args.ek_floor,
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -292,6 +293,9 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 # 动态 K: ponder cost 正则化（鼓励用更少步数处理简单 token）
                 if out.ponder_cost is not None and args.ponder_weight > 0:
                     loss = loss + args.ponder_weight * out.ponder_cost / args.accumulation_steps
+                # E[K] 下界惩罚（遏制 PonderNet 坍缩: 深层 E[K] → 1 的死亡螺旋）
+                if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
+                    loss = loss + args.ek_floor_weight * out.ek_floor_cost / args.accumulation_steps
 
             # 反向传播（bf16 不需要 GradScaler）
             loss.backward()
@@ -397,10 +401,16 @@ if __name__ == "__main__":
     parser.add_argument('--learning_rate', type=float, default=2e-4)
     parser.add_argument('--accumulation_steps', type=int, default=8)
     parser.add_argument('--grad_clip', type=float, default=1.0)
-    parser.add_argument('--warmup_iters', type=int, default=0)
+    parser.add_argument('--warmup_iters', type=int, default=500)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
+    parser.add_argument('--weight_decay', type=float, default=0.1,
+                        help='投影权重 weight decay（遏制 W_beta_x 等权重爆炸）')
     parser.add_argument('--ponder_weight', type=float, default=0.01,
                         help='动态 K ponder cost 正则化权重')
+    parser.add_argument('--ek_floor', type=float, default=4.0,
+                        help='E[K] 下界: 低于此值时产生惩罚（遏制 PonderNet 坍缩）')
+    parser.add_argument('--ek_floor_weight', type=float, default=0.1,
+                        help='E[K] 下界惩罚权重')
 
     # FSDP 参数
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
@@ -445,11 +455,18 @@ if __name__ == "__main__":
     model, tokenizer = init_model(args, local_rank, rank)
 
     # 获取参数分组（FSDP 包装前，保持对原始参数的引用）
+    # 三组: decay（投影权重，加 weight decay 遏制权重爆炸）
+    #       no_decay（归一化/halt/embedding，不加 weight decay）
+    #       neuron（神经元参数，10× lr，不加 weight decay）
     _pg = model.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
+    _no_decay_keys = {'rms_norms', 'norm', 'halt_projs', 'embedding'}
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
-    other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
+    no_decay_params = [p for k in _no_decay_keys if k in _pg for p in _pg[k]]
+    decay_params = [p for k, ps in _pg.items()
+                    if k not in _neuron_keys and k not in _no_decay_keys
+                    for p in ps]
 
     # 保存原始模型引用（用于 compensate_modulation_gradients）
     raw_model = model
@@ -479,11 +496,14 @@ if __name__ == "__main__":
         persistent_workers=True if args.num_workers > 0 else False,
     )
 
-    # ==================== 优化器（use_orig_params=True 保证参数引用有效）====================
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+    # ==================== 优化器（AdamW: weight decay 遏制权重爆炸）====================
+    optimizer = optim.AdamW([
+        {'params': decay_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
+         'weight_decay': args.weight_decay},
+        {'params': no_decay_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
+         'weight_decay': 0.0},
         {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
+         'lr_mult': float(args.neuron_lr_mult), 'weight_decay': 0.0},
     ])
 
     # 恢复 checkpoint
@@ -511,6 +531,8 @@ if __name__ == "__main__":
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})", rank)
     Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)", rank)
     Logger(f"  Grad clip:   {args.grad_clip}", rank)
+    Logger(f"  Weight decay:{args.weight_decay} (投影权重)", rank)
+    Logger(f"  E[K] floor:  {args.ek_floor} (weight={args.ek_floor_weight})", rank)
     Logger(f"  Precision:   bfloat16 (FSDP MixedPrecision)", rank)
     Logger(f"  Sharding:    {args.sharding_strategy}", rank)
     Logger(f"  no_sync:     accumulation_steps={args.accumulation_steps} (消除 {args.accumulation_steps-1} 次冗余通信)", rank)

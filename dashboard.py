@@ -205,6 +205,13 @@ class SNNDashboard:
                     w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
                                  halt.bias.data.item(), step)
 
+            # SubLN Post-RMSNorm gain 监控（诊断深层梯度均衡）
+            with torch.no_grad():
+                w.add_scalar(f"post_norm/layer_{i:02d}/block_gain_mean",
+                             layer_module.block_post_norm.weight.data.mean().item(), step)
+                w.add_scalar(f"post_norm/layer_{i:02d}/ffn_gain_mean",
+                             layer_module.ffn_post_norm.weight.data.mean().item(), step)
+
     # ====== 重量日志（每 save_interval 步） ======
 
     def _log_histograms(self, step):

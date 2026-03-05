@@ -40,6 +40,7 @@ class SNNModelOutput:
     last_loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
+    ek_floor_cost: Optional[torch.Tensor] = None  # E[K] 下界惩罚
 
 
 class SNNLanguageModel(nn.Module):
@@ -66,6 +67,7 @@ class SNNLanguageModel(nn.Module):
         num_layers: int = 20,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
+        ek_floor: float = 0.0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -99,6 +101,7 @@ class SNNLanguageModel(nn.Module):
                 K=K,
                 num_layers=num_layers,
                 layer_idx=i,
+                ek_floor=ek_floor,
             )
             for i in range(num_layers)
         ])
@@ -126,31 +129,35 @@ class SNNLanguageModel(nn.Module):
         return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
 
     def snn_forward(self, spike_seq: torch.Tensor):
-        """SNN 核心：spike_seq → (h_out, ponder_cost)。
+        """SNN 核心：spike_seq → (h_out, ponder_cost, ek_floor_cost)。
 
         纯 SNN 层计算，带梯度检查点。
-        每层返回 (h, ponder_cost)，ponder_cost 作为 checkpoint 输出保留梯度图。
+        每层返回 (h, ponder_cost, ek_floor_cost)，作为 checkpoint 输出保留梯度图。
 
         Returns:
             h: (seq_len*K, batch, D), 连续值
             total_ponder_cost: scalar, 所有层平均期望步数
+            total_ek_floor_cost: scalar, 所有层 E[K] 下界惩罚均值
         """
         h = spike_seq
         ponder_costs = []
+        ek_floor_costs = []
 
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
             return layer_mod(x)  # 通过 __call__ 触发 FSDP 参数聚合钩子
 
         for layer_module in self.layers:
-            h, pc = checkpoint(
+            h, pc, efc = checkpoint(
                 _layer_forward, layer_module, h,
                 use_reentrant=False,
             )
             ponder_costs.append(pc)
+            ek_floor_costs.append(efc)
 
         total_ponder_cost = sum(ponder_costs) / len(ponder_costs)
-        return h, total_ponder_cost
+        total_ek_floor_cost = sum(ek_floor_costs) / len(ek_floor_costs)
+        return h, total_ponder_cost, total_ek_floor_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
         """输出 PLIF 神经元的 parallel scan 前向：连续 h → 脉冲电流。
@@ -237,7 +244,7 @@ class SNNLanguageModel(nn.Module):
         h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
         h = h_seq
         for layer_module in self.layers:
-            h, _ = layer_module.forward_parallel(h)  # 推理忽略 ponder_cost
+            h, _, _ = layer_module.forward_parallel(h)  # 推理忽略 ponder_cost
         # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
 
         logits = self.decode(h, prompt_len)
@@ -257,7 +264,7 @@ class SNNLanguageModel(nn.Module):
             # K 帧通过 SNN — 不 reset，神经元 .v 跨 token 连续传递
             h = frames
             for layer_module in self.layers:
-                h, _ = layer_module.forward_parallel(h)
+                h, _, _ = layer_module.forward_parallel(h)
 
             logits = self.decode(h, 1)
 
@@ -307,7 +314,7 @@ class SNNLanguageModel(nn.Module):
 
         # 三段式
         spike_seq = self.encode(token_ids)            # 输入边界
-        h_out, ponder_cost = self.snn_forward(spike_seq)  # SNN 核心 + ponder cost
+        h_out, ponder_cost, ek_floor_cost = self.snn_forward(spike_seq)  # SNN 核心
         logits = self.decode(h_out, seq_len)          # 输出边界
 
         if target_ids is not None:
@@ -320,29 +327,28 @@ class SNNLanguageModel(nn.Module):
             return SNNModelOutput(
                 last_loss=self.last_loss,
                 ponder_cost=ponder_cost,
+                ek_floor_cost=ek_floor_cost,
             )
 
-        return SNNModelOutput(logits=logits, ponder_cost=ponder_cost)
+        return SNNModelOutput(logits=logits, ponder_cost=ponder_cost,
+                              ek_floor_cost=ek_floor_cost)
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
         """
-        Natural Gradient 补偿（两阶段）。
+        Natural Gradient 补偿: sigmoid/softplus 饱和补偿。
 
-        Phase 1: Sigmoid/softplus 饱和补偿
           β = sigmoid(b_beta), sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）梯度衰减 100x。
           补偿: grad /= activation'(b)，等价于在 β/α 空间做梯度下降。
 
-        Phase 2: 层间梯度均衡
-          残差链反向传播每层放大 ~1.17×，20 层累积 ~20× L0/L19 比。
-          深层选择性参数（b_beta/b_alpha/b_th）梯度被压制，无法有效学习。
-          修复: 将每层调制参数梯度 norm 归一化到所有层的几何均值。
+        注意: 原 Phase 2（层间梯度均衡）已移除。几何均值归一化会将所有层的
+        b_beta/b_alpha/b_th 梯度强制相同，破坏层间梯度多样性。
+        层间梯度差异由 SubLN Post-RMSNorm 自然平衡。
 
-        调用时机: scaler.unscale_(optimizer) 之后、clip_grad_norm_ 之前。
+        调用时机: optimizer.step() 之前、clip_grad_norm_ 之前。
 
         Args:
             max_comp: 补偿因子上限（防止极端值导致不稳定）
         """
-        # ====== Phase 1: Sigmoid/softplus 饱和补偿 ======
         for layer_module in self.layers:
             block = layer_module.snn_block
 
@@ -361,31 +367,6 @@ class SNNLanguageModel(nn.Module):
                     block.b_alpha.grad.div_(softplus_deriv)
 
             # b_th: |·| 导数为 ±1，无衰减，不需要补偿
-
-        # ====== Phase 2: 层间梯度均衡 ======
-        # 残差链 h = h + sublayer(h) 的反向路径 ∂h_{l+1}/∂h_l = I + ∂sublayer/∂h_l
-        # 每层放大 ~1.17×, 20 层累积 ~20× → L0 梯度远大于 L19
-        # 用几何均值归一化每层调制参数梯度 norm，消除残差放大效应
-        with torch.no_grad():
-            for param_name in ['b_beta', 'b_alpha', 'b_th']:
-                norms = []
-                params_list = []
-                for layer_module in self.layers:
-                    p = getattr(layer_module.snn_block, param_name)
-                    if p.grad is not None:
-                        n = p.grad.norm().item()
-                        if n > 1e-12:
-                            norms.append(n)
-                            params_list.append(p)
-
-                if len(norms) >= 2:
-                    # 几何均值: exp(mean(log(norms))) — 对数尺度均衡，不受极端值影响
-                    log_mean = sum(math.log(n) for n in norms) / len(norms)
-                    geo_mean = math.exp(log_mean)
-                    for p, n in zip(params_list, norms):
-                        scale = geo_mean / n
-                        scale = max(min(scale, max_comp), 1.0 / max_comp)
-                        p.grad.mul_(scale)
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
@@ -442,6 +423,8 @@ class SNNLanguageModel(nn.Module):
             groups['rms_norms'].extend([
                 layer_module.block_norm.weight,
                 layer_module.ffn_norm.weight,
+                layer_module.block_post_norm.weight,
+                layer_module.ffn_post_norm.weight,
             ])
 
             # 动态 K: 停止投影参数

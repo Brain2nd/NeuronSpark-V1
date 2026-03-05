@@ -1,8 +1,8 @@
 """
 SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚合）
 
-  RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → 残差
-  RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → 残差
+  RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → PostNorm → 残差
+  RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → PostNorm → 残差
 
 动态 K：
   - K 是最大步数（K_max），不是固定步数。不同 token 有效步数 ∈ [1, K_max]。
@@ -98,6 +98,7 @@ class SNNDecoderLayer(base.MemoryModule):
         K: 每 token 的 SNN 时间步数
         num_layers: 总层数（用于残差输出缩放 + SNNFFN down_proj 缩放）
         layer_idx: 当前层索引
+        ek_floor: E[K] 下界，低于此值时产生可微分惩罚（防止 PonderNet 坍缩）
     """
 
     def __init__(
@@ -110,10 +111,12 @@ class SNNDecoderLayer(base.MemoryModule):
         K: int = 16,
         num_layers: int = 1,
         layer_idx: int = 0,
+        ek_floor: float = 0.0,
     ):
         super().__init__()
         self.D = D
         self.K = K
+        self.ek_floor = ek_floor
 
         self.snn_block = SNNBlock(
             D=D, N=N, v_th_min=v_th_min,
@@ -153,8 +156,11 @@ class SNNDecoderLayer(base.MemoryModule):
         self.block_halt = nn.Linear(D, 1, bias=True)
         self.ffn_halt = nn.Linear(D, 1, bias=True)
 
-        # 残差输出缩放初始化（GPT-2 style: σ = 0.02 / √(2·num_layers)）
-        std = 0.02 / math.sqrt(2 * num_layers)
+        # 输出投影初始化（不再使用 GPT-2 style 1/sqrt(2L) 缩放）
+        # 因已使用 SubLN Post-RMSNorm 进行自动增益控制，缩放由 RMSNorm 的 gain 负责。
+        # 如果在此处使用极小初始化，会导致输入 RMSNorm 的 var 极小，
+        # 从而在反向传播时带来极大的 1/RMS 梯度放大乘子，导致严重的层间梯度指数爆发。
+        std = 0.02
         nn.init.normal_(self.block_out_proj.weight, std=std)
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
 
@@ -164,6 +170,17 @@ class SNNDecoderLayer(base.MemoryModule):
             nn.init.xavier_uniform_(halt.weight)
             halt.weight.data.mul_(0.01)
             nn.init.constant_(halt.bias, -3.5)
+
+        # SubLN Post-RMSNorm：子层输出归一化，防止深层梯度消失
+        # 原理：Pre-LN 仅归一化子层输入，输出 ‖W_out‖ 增长会放大反向梯度，
+        # 浅层正反馈加速 → 深层梯度饥饿。Post-RMSNorm 将 J_k ∝ gain/RMS(f_l)，
+        # ‖W_out‖ 增长被 RMS(f_l) 增长抵消，自动增益控制。
+        # gain 初始化: (2·num_layers)^{-1/2}，使 ‖h_L‖² ≈ 2‖h_0‖²
+        self.block_post_norm = RMSNorm(D)
+        self.ffn_post_norm = RMSNorm(D)
+        post_norm_gain = (2 * num_layers) ** -0.5
+        self.block_post_norm.weight.data.fill_(post_norm_gain)
+        self.ffn_post_norm.weight.data.fill_(post_norm_gain)
 
     def _input_neuron_parallel(self, input_neuron, x):
         """
@@ -242,7 +259,13 @@ class SNNDecoderLayer(base.MemoryModule):
         expected_k = (halt_weights * steps[None, :, None]).sum(dim=1)  # (seq_len, batch)
         ponder_cost = expected_k.mean()               # scalar
 
-        return aggregated, ponder_cost, expected_k.detach()
+        # ====== 4. E[K] floor: 可微分下界惩罚（遏制 PonderNet 坍缩） ======
+        # 当 E[K] < floor 时产生二次惩罚，梯度流回 halt 参数使其降低停止概率
+        ek_floor_cost = torch.zeros(1, device=frames.device, dtype=frames.dtype).squeeze()
+        if self.ek_floor > 1.0:
+            ek_floor_cost = F.relu(self.ek_floor - expected_k).pow(2).mean()
+
+        return aggregated, ponder_cost, expected_k.detach(), ek_floor_cost
 
     def forward(self, h):
         """前向传播入口（FSDP 兼容）。
@@ -250,6 +273,11 @@ class SNNDecoderLayer(base.MemoryModule):
         FSDP 通过 __call__ 触发参数聚合钩子，必须由此方法作为入口，
         而非直接调用 forward_parallel（会绕过 FSDP 钩子导致参数未聚合）。
         单卡/DDP 训练及推理可直接调用 forward_parallel。
+
+        Returns:
+            h: (TK, batch, D) — 连续值输出
+            ponder_cost: scalar — 两个子层的平均期望步数
+            ek_floor_cost: scalar — E[K] 下界惩罚（PonderNet 坍缩遏制）
         """
         return self.forward_parallel(h)
 
@@ -280,11 +308,11 @@ class SNNDecoderLayer(base.MemoryModule):
         # 动态 K 帧聚合（PonderNet）: (TK, batch, D) → (seq_len, K, batch, D) → 加权 → (seq_len, batch, D)
         frames_block = cont_block.view(seq_len, K, batch, D)
         del cont_block
-        combined_block, pc_block, ek_block = self._adaptive_aggregate(frames_block, self.block_halt)
+        combined_block, pc_block, ek_block, efc_block = self._adaptive_aggregate(frames_block, self.block_halt)
         del frames_block
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
         del combined_block
-        res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
+        res_block = self.block_post_norm(res_block)  # SubLN: 自动增益控制
 
         # 广播回 TK：view-based 广播避免显存复制
         # res_block: (seq_len, batch, D) → (seq_len, 1, batch, D) → broadcast (seq_len, K, batch, D) → (TK, batch, D)
@@ -298,16 +326,17 @@ class SNNDecoderLayer(base.MemoryModule):
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
         del cont_ffn
-        combined_ffn, pc_ffn, ek_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        combined_ffn, pc_ffn, ek_ffn, efc_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
         del frames_ffn
         res_ffn = self.ffn_out_proj(combined_ffn)
         del combined_ffn
-        res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
+        res_ffn = self.ffn_post_norm(res_ffn)  # SubLN: 自动增益控制
 
         h = h + res_ffn.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
         del res_ffn
 
         ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均
+        ek_floor_cost = (efc_block + efc_ffn) / 2.0  # E[K] 下界惩罚
 
         # 存储 per-token E[K] 范围（诊断用，不影响计算图）
         # ek_block/ek_ffn: (seq_len, batch), detached
@@ -316,7 +345,7 @@ class SNNDecoderLayer(base.MemoryModule):
             self._ek_min = all_ek.min().item()
             self._ek_max = all_ek.max().item()
 
-        return h, ponder_cost
+        return h, ponder_cost, ek_floor_cost
 
     def single_step_forward(self, h):
         """
@@ -338,13 +367,14 @@ class SNNDecoderLayer(base.MemoryModule):
         v_in = spike_current_activation(spike1, self.input_neuron1.v_th)  # 脉冲电流
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
-        h = h + res_block - res_block.mean(dim=-1, keepdim=True)
+        h = h + self.block_post_norm(res_block)
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode(spike_current) → SNNFFN → out_proj → 残差
         spike2 = self.input_neuron2(self.ffn_norm(h))
         v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)  # 脉冲电流
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
-        h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
+        h = h + self.ffn_post_norm(res_ffn)
 
-        return h, torch.tensor(0.0, device=h.device)
+        _zero = torch.tensor(0.0, device=h.device)
+        return h, _zero, _zero

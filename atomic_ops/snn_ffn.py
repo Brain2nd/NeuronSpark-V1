@@ -89,7 +89,7 @@ class SNNFFN(base.MemoryModule):
             nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
 
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-        self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
+        # self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))  # 移除：SubLN ffn_post_norm 已处理层级缩放
 
     def forward_parallel(self, spike_in_seq: torch.Tensor) -> torch.Tensor:
         """

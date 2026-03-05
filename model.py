@@ -30,6 +30,7 @@ from atomic_ops import SNNDecoderLayer, spike_current_activation
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
+from atomic_ops.snn_decoder_layer import _mpd_alpha
 # fp16_encode/fp16_decode 已移除: 全膜电位架构不需要 spike 编解码
 from atomic_ops.lateral_inhibition import LateralInhibition
 
@@ -41,6 +42,7 @@ class SNNModelOutput:
     logits: Optional[torch.Tensor] = None
     ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
     ek_floor_cost: Optional[torch.Tensor] = None  # E[K] 下界惩罚
+    snvr_cost: Optional[torch.Tensor] = None  # 层间权重谱范数方差正则化
 
 
 class SNNLanguageModel(nn.Module):
@@ -169,6 +171,13 @@ class SNNLanguageModel(nn.Module):
             spike_current: (TK, batch, D) 脉冲电流（V_th * spike，稀疏激活值）
         """
         TK, batch, D = h.shape
+
+        # MPD-AGL: 输出神经元 surrogate alpha 自适应（前置 output_norm）
+        with torch.no_grad():
+            go = self.output_norm.weight.data.abs().mean().item()
+            bo = self.output_neuron.beta.mean().item()
+            vo = self.output_neuron.v_th.abs().mean().item()
+            self.output_neuron.surrogate_function.alpha = _mpd_alpha(bo, vo, go)
 
         beta = self.output_neuron.beta  # (D,)
         u = (1.0 - beta) * h  # PLIF: u = (1-β) · x
@@ -317,6 +326,9 @@ class SNNLanguageModel(nn.Module):
         h_out, ponder_cost, ek_floor_cost = self.snn_forward(spike_seq)  # SNN 核心
         logits = self.decode(h_out, seq_len)          # 输出边界
 
+        # SNVR: 层间权重范数方差正则化（可微分，梯度流回权重）
+        snvr_cost = self._compute_snvr_cost()
+
         if target_ids is not None:
             logits_flat = logits.reshape(-1, self.vocab_size)
             targets_flat = target_ids.reshape(-1)
@@ -328,10 +340,44 @@ class SNNLanguageModel(nn.Module):
                 last_loss=self.last_loss,
                 ponder_cost=ponder_cost,
                 ek_floor_cost=ek_floor_cost,
+                snvr_cost=snvr_cost,
             )
 
         return SNNModelOutput(logits=logits, ponder_cost=ponder_cost,
-                              ek_floor_cost=ek_floor_cost)
+                              ek_floor_cost=ek_floor_cost, snvr_cost=snvr_cost)
+
+    def _compute_snvr_cost(self) -> torch.Tensor:
+        """Spectral Norm Variance Regularization: 惩罚同类权重跨层 Frobenius 范数方差。
+
+        Jacobian 谱范数与权重范数正相关。若各层同类权重范数不一致
+        (浅层大、深层小)，∏‖J_k‖ 必然指数发散 → 梯度消失/爆炸。
+        惩罚范数方差 → 迫使各层 ‖J_k‖ 趋近统一 → 梯度流保持。
+
+        Returns:
+            scalar — 所有权重类型的范数方差之和
+        """
+        norms_by_type = {}
+        for layer_module in self.layers:
+            block = layer_module.snn_block
+            ffn = layer_module.snn_ffn
+            for name, param in [
+                ('W_in', block.W_in.weight),
+                ('W_out', block.W_out.weight),
+                ('W_gate', block.W_gate.weight),
+                ('W_skip', block.W_skip.weight),
+                ('ffn_gate', ffn.gate_proj.weight),
+                ('ffn_down', ffn.down_proj.weight),
+                ('out_proj', layer_module.block_out_proj.weight),
+                ('ffn_out_proj', layer_module.ffn_out_proj.weight),
+            ]:
+                norms_by_type.setdefault(name, []).append(param.norm())
+
+        total_var = torch.zeros(1, device=self.layers[0].block_out_proj.weight.device,
+                                dtype=torch.float32).squeeze()
+        for norms in norms_by_type.values():
+            stacked = torch.stack(norms)
+            total_var = total_var + stacked.var()
+        return total_var
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
         """

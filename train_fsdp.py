@@ -296,6 +296,9 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 # E[K] 下界惩罚（遏制 PonderNet 坍缩: 深层 E[K] → 1 的死亡螺旋）
                 if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
                     loss = loss + args.ek_floor_weight * out.ek_floor_cost / args.accumulation_steps
+                # SNVR: 层间权重范数方差正则化（遏制 Jacobian 谱范数发散）
+                if out.snvr_cost is not None and args.snvr_weight > 0:
+                    loss = loss + args.snvr_weight * out.snvr_cost / args.accumulation_steps
 
             # 反向传播（bf16 不需要 GradScaler）
             loss.backward()
@@ -411,6 +414,8 @@ if __name__ == "__main__":
                         help='E[K] 下界: 低于此值时产生惩罚（遏制 PonderNet 坍缩）')
     parser.add_argument('--ek_floor_weight', type=float, default=0.1,
                         help='E[K] 下界惩罚权重')
+    parser.add_argument('--snvr_weight', type=float, default=0.01,
+                        help='SNVR 层间权重范数方差正则化权重')
 
     # FSDP 参数
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',

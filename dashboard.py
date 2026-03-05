@@ -212,6 +212,15 @@ class SNNDashboard:
                 w.add_scalar(f"post_norm/layer_{i:02d}/ffn_gain_mean",
                              layer_module.ffn_post_norm.weight.data.mean().item(), step)
 
+            # MPD-AGL 自适应 surrogate alpha 监控
+            for attr, tag in [('_alpha_input1', 'input1'),
+                              ('_alpha_hidden', 'hidden'),
+                              ('_alpha_input2', 'input2'),
+                              ('_alpha_ffn', 'ffn')]:
+                val = getattr(layer_module, attr, None)
+                if val is not None:
+                    w.add_scalar(f"mpd_alpha/layer_{i:02d}/{tag}", val, step)
+
     # ====== 重量日志（每 save_interval 步） ======
 
     def _log_histograms(self, step):

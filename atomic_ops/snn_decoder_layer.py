@@ -55,6 +55,24 @@ from . import spike_current_activation
 # 注意：不使用 @torch.compile，因其会绕过 gradient checkpoint 的
 # pack/unpack hooks，导致每层泄漏 ~1 GB 显存。
 
+def _mpd_alpha(beta_mean: float, vth_mean: float, gamma_mean: float = 1.0) -> float:
+    """MPD-AGL 自适应 surrogate gradient 宽度 (IJCAI 2025)。
+
+    surrogate gradient sg(x) = α·σ(αx)·(1-σ(αx)) 的有效区间 ≈ 2.2/α。
+    若膜电位分布偏离此区间，大部分神经元 sg ≈ 0 → 梯度消失。
+
+    公式: α = C / (√(1+β²) × γ × V_th)
+      - β 增大（强积分）→ 膜电位分布更宽 → α 减小，扩大有效区间
+      - γ 增大（输入 scale 增大）→ 膜电位偏移更大 → α 减小
+      - V_th 增大（阈值更高）→ V_pre 分布离阈值更远 → α 减小
+    C 校准使初始条件 (β=0.5, γ=1.0, V_th=0.5) → α=4.0。
+    """
+    C = 4.0 * math.sqrt(1.25) * 0.5  # ≈ 2.236
+    width = math.sqrt(1.0 + beta_mean ** 2) * gamma_mean * max(vth_mean, 0.01)
+    alpha = C / max(width, 1e-6)
+    return max(1.0, min(alpha, 16.0))
+
+
 def _fused_geometric_halt(halt_logits):
     """融合计算 PonderNet 几何分布停止权重。
 
@@ -156,11 +174,8 @@ class SNNDecoderLayer(base.MemoryModule):
         self.block_halt = nn.Linear(D, 1, bias=True)
         self.ffn_halt = nn.Linear(D, 1, bias=True)
 
-        # 输出投影初始化（不再使用 GPT-2 style 1/sqrt(2L) 缩放）
-        # 因已使用 SubLN Post-RMSNorm 进行自动增益控制，缩放由 RMSNorm 的 gain 负责。
-        # 如果在此处使用极小初始化，会导致输入 RMSNorm 的 var 极小，
-        # 从而在反向传播时带来极大的 1/RMS 梯度放大乘子，导致严重的层间梯度指数爆发。
-        std = 0.02
+        # 残差输出缩放初始化（GPT-2 style: σ = 0.02 / √(2·num_layers)）
+        std = 0.02 / math.sqrt(2 * num_layers)
         nn.init.normal_(self.block_out_proj.weight, std=std)
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
 
@@ -299,6 +314,39 @@ class SNNDecoderLayer(base.MemoryModule):
         TK, batch, D = h.shape
         K = self.K
         seq_len = TK // K
+
+        # ====== MPD-AGL: 自适应 surrogate gradient 宽度 ======
+        # 根据每层当前参数动态调整 alpha，使 surrogate 有效区间匹配膜电位分布
+        with torch.no_grad():
+            # 子层 1: input_neuron1 (after block_norm) + SNNBlock hidden_neuron
+            g1 = self.block_norm.weight.data.abs().mean().item()
+            b1 = self.input_neuron1.beta.mean().item()
+            v1 = self.input_neuron1.v_th.abs().mean().item()
+            self.input_neuron1.surrogate_function.alpha = _mpd_alpha(b1, v1, g1)
+
+            bh = torch.sigmoid(self.snn_block.b_beta.data).mean().item()
+            vh = (self.snn_block.b_th.data.abs() + self.snn_block.v_th_min).mean().item()
+            self.snn_block.hidden_neuron.surrogate_function.alpha = _mpd_alpha(bh, vh)
+
+            # 子层 2: input_neuron2 (after ffn_norm) + SNNFFN neurons
+            g2 = self.ffn_norm.weight.data.abs().mean().item()
+            b2 = self.input_neuron2.beta.mean().item()
+            v2 = self.input_neuron2.v_th.abs().mean().item()
+            self.input_neuron2.surrogate_function.alpha = _mpd_alpha(b2, v2, g2)
+
+            # SNNFFN: gate+up 合并 scan，使用 gate_neuron 的 surrogate
+            bg = self.snn_ffn.gate_neuron.beta.mean().item()
+            vg = self.snn_ffn.gate_neuron.v_th.abs().mean().item()
+            bu = self.snn_ffn.up_neuron.beta.mean().item()
+            vu = self.snn_ffn.up_neuron.v_th.abs().mean().item()
+            self.snn_ffn.gate_neuron.surrogate_function.alpha = (
+                _mpd_alpha(bg, vg) + _mpd_alpha(bu, vu)) / 2.0
+
+            # 存储诊断值
+            self._alpha_input1 = self.input_neuron1.surrogate_function.alpha
+            self._alpha_hidden = self.snn_block.hidden_neuron.surrogate_function.alpha
+            self._alpha_input2 = self.input_neuron2.surrogate_function.alpha
+            self._alpha_ffn = self.snn_ffn.gate_neuron.surrogate_function.alpha
 
         # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → 动态K聚合 → out_proj → 残差
         v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))

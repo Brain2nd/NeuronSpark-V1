@@ -19,6 +19,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from spikingjelly.activation_based import base, surrogate
 
 
@@ -47,6 +48,10 @@ class PLIFNode(base.MemoryModule):
         #    tau=2.0 时 w=0, β ∈ ~[0.38, 0.62]
         init_w = -math.log(init_tau - 1.0)
         self.w = nn.Parameter(torch.empty(dim).normal_(init_w, 0.5))
+        # w_alpha: 控制 α=softplus(w_alpha)，解耦积分强度
+        #   初始: α ≈ 1-β，保持与原 PLIF 动力学一致
+        init_w_alpha = math.log(math.exp(1.0 / init_tau) - 1.0)  # softplus⁻¹(1/τ)
+        self.w_alpha = nn.Parameter(torch.empty(dim).normal_(init_w_alpha, 0.3))
         # v_th: 发放阈值，U[0.5x, 1.5x] 均匀分布产生维度间多样性
         self.v_th = nn.Parameter(torch.empty(dim).uniform_(
             v_threshold * 0.5, v_threshold * 1.5,
@@ -59,6 +64,11 @@ class PLIFNode(base.MemoryModule):
     def beta(self):
         """D 维衰减率 β = sigmoid(w)，值域 (0, 1)。"""
         return torch.sigmoid(self.w)
+
+    @property
+    def alpha(self):
+        """D 维积分强度 α = softplus(w_alpha)，值域 (0, +∞)。"""
+        return F.softplus(self.w_alpha)
 
     def forward(self, x):
         """
@@ -75,7 +85,7 @@ class PLIFNode(base.MemoryModule):
         if isinstance(self.v, float):
             self.v = torch.zeros_like(x)
         beta = self.beta
-        self.v = beta * self.v + (1.0 - beta) * x
+        self.v = beta * self.v + self.alpha * x
         spike = self.surrogate_function(self.v - self.v_th)
         self.v = self.v - spike * self.v_th  # soft reset
         return spike

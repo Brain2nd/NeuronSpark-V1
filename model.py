@@ -180,7 +180,7 @@ class SNNLanguageModel(nn.Module):
             self.output_neuron.surrogate_function.alpha = _mpd_alpha(bo, vo, go)
 
         beta = self.output_neuron.beta  # (D,)
-        u = (1.0 - beta) * h  # PLIF: u = (1-β) · x
+        u = self.output_neuron.alpha * h  # PLIF: u = α · x（解耦积分强度）
 
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
@@ -423,7 +423,7 @@ class SNNLanguageModel(nn.Module):
             'norm': [self.norm.gain],
             'decode': list(self.decode_proj.parameters()),
             # 输出神经元
-            'output_neuron': [self.output_neuron.w, self.output_neuron.v_th],
+            'output_neuron': [self.output_neuron.w, self.output_neuron.w_alpha, self.output_neuron.v_th],
             # RMSNorm（Pre-LN 分支归一化）
             'rms_norms': [self.output_norm.weight],
             # 残差流组件
@@ -462,8 +462,10 @@ class SNNLanguageModel(nn.Module):
             ])
             groups['input_neurons'].extend([
                 layer_module.input_neuron1.w,
+                layer_module.input_neuron1.w_alpha,
                 layer_module.input_neuron1.v_th,
                 layer_module.input_neuron2.w,
+                layer_module.input_neuron2.w_alpha,
                 layer_module.input_neuron2.v_th,
             ])
             groups['rms_norms'].extend([
@@ -495,8 +497,8 @@ class SNNLanguageModel(nn.Module):
             groups['ffn_down_proj'].append(ffn.down_proj.weight)
             groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
             groups['ffn_neurons'].extend([
-                ffn.gate_neuron.w, ffn.gate_neuron.v_th,
-                ffn.up_neuron.w, ffn.up_neuron.v_th,
+                ffn.gate_neuron.w, ffn.gate_neuron.w_alpha, ffn.gate_neuron.v_th,
+                ffn.up_neuron.w, ffn.up_neuron.w_alpha, ffn.up_neuron.v_th,
             ])
 
         return groups

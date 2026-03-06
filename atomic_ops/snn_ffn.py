@@ -121,8 +121,10 @@ class SNNFFN(base.MemoryModule):
         beta_up = self.up_neuron.beta      # (D_ff,)
         surr = self.gate_neuron.surrogate_function
 
-        # u_merged: 向量缩放（D_ff 维 β 直接 cat，无需 expand）
-        scale_row = torch.cat([1.0 - beta_gate, 1.0 - beta_up])  # (2*D_ff,)
+        # u_merged: 向量缩放（D_ff 维 α 直接 cat，无需 expand）
+        alpha_gate = self.gate_neuron.alpha  # (D_ff,)
+        alpha_up = self.up_neuron.alpha      # (D_ff,)
+        scale_row = torch.cat([alpha_gate, alpha_up])  # (2*D_ff,)
         u_merged = I_gate_up * scale_row  # (TK, batch, 2*D_ff), broadcast
 
         # beta_row / v_th_row: (batch, 2*D_ff) — D_ff 维可学习参数

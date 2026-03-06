@@ -262,7 +262,8 @@ def wrap_model_fsdp(model, args, local_rank):
 # ============================================================
 
 def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, args,
-                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None):
+                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None,
+                accum_step=0):
     """训练一个 epoch（FSDP 版本，含 no_sync 梯度累积）。"""
     sampler.set_epoch(epoch)
     start_time = time.time()
@@ -311,18 +312,21 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
+            accum_step += 1
+
             # Dashboard: optimizer.step() 后、zero_grad() 前（梯度仍可用）
-            # summon_full_params 是集合操作，所有 rank 必须参与；仅 rank 0 写日志
-            need_log = step % args.log_interval == 0
-            need_save = (step + 1) % args.save_interval == 0
+            # 用 accum_step（optimizer 步数）而非 dataloader step 判断频率，
+            # 因为 boundary step ≡ accum_steps-1 (mod accum_steps)，
+            # 与 log_interval 整除时条件永远无法满足
+            need_log = accum_step % args.log_interval == 0
+            need_save = accum_step % args.save_interval == 0
             if need_log or need_save:
                 with FSDP.summon_full_params(model, writeback=False, rank0_only=True):
                     if dashboard:
-                        global_step = epoch * iter_per_epoch + step
                         if need_log:
                             batch_loss_db = loss.item() * args.accumulation_steps
                             spend_time_db = time.time() - start_time
-                            dashboard.log_step(global_step, {
+                            dashboard.log_step(accum_step, {
                                 'loss': batch_loss_db,
                                 'ppl': math.exp(min(batch_loss_db, 20.0)),
                                 'lr': lr,
@@ -333,7 +337,7 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                                 'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
                             }, raw_model, log_params=True)
                         if need_save:
-                            dashboard.log_save_point(global_step, raw_model)
+                            dashboard.log_save_point(accum_step, raw_model)
 
             optimizer.zero_grad(set_to_none=True)
 
@@ -364,15 +368,14 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                     mem_cur, mem_peak, world_size))
 
         # 定期保存（仅在梯度累积边界步，确保 optimizer 已更新）
-        if is_boundary and (step + 1) % args.save_interval == 0:
+        if is_boundary and accum_step % args.save_interval == 0:
             model.eval()
-            global_step = epoch * iter_per_epoch + step + 1
             cur_loss = loss.item() * args.accumulation_steps
             save_checkpoint_fsdp(args.save_dir, model, optimizer,
-                                 global_step, epoch, cur_loss, tokens_seen, rank)
+                                 accum_step, epoch, cur_loss, tokens_seen, rank)
             model.train()
 
-    return tokens_seen
+    return tokens_seen, accum_step
 
 
 # ============================================================
@@ -547,11 +550,13 @@ if __name__ == "__main__":
     Logger(f"{'='*60}\n", rank)
 
     # ==================== 训练 ====================
+    accum_step = 0
     for epoch in range(start_epoch, args.epochs):
         model.train()
-        tokens_seen = train_epoch(
+        tokens_seen, accum_step = train_epoch(
             epoch, model, raw_model, train_loader, sampler, optimizer, ctx, args,
             iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
+            accum_step=accum_step,
         )
 
     # 最终保存

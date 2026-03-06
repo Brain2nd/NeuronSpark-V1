@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import functional, surrogate
+from spikingjelly.activation_based import surrogate
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer, spike_current_activation
@@ -110,6 +110,29 @@ class SNNLanguageModel(nn.Module):
 
         self._init_weights()
 
+    def _reset_neurons(self):
+        """直接重置所有神经元膜电位，替代 functional.reset_net。
+
+        functional.reset_net 遍历模块树，遇到 FSDP wrapper 时无法识别
+        MemoryModule 子类，产生大量 WARNING 且可能触发不一致的 FSDP 通信。
+        直接赋值 v=0. 绕过模块树遍历，FSDP 安全。
+        """
+        for layer_module in self.layers:
+            layer_module.input_neuron1.v = 0.
+            layer_module.input_neuron2.v = 0.
+            layer_module.snn_block.hidden_neuron.v = 0.
+            layer_module.snn_ffn.gate_neuron.v = 0.
+            layer_module.snn_ffn.up_neuron.v = 0.
+        self.output_neuron.v = 0.
+
+    def _reset_layer_neurons(self, layer_module):
+        """重置单个层的所有神经元膜电位。"""
+        layer_module.input_neuron1.v = 0.
+        layer_module.input_neuron2.v = 0.
+        layer_module.snn_block.hidden_neuron.v = 0.
+        layer_module.snn_ffn.gate_neuron.v = 0.
+        layer_module.snn_ffn.up_neuron.v = 0.
+
     def _init_weights(self):
         """初始化所有可训练权重（从零训练）。"""
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
@@ -146,7 +169,7 @@ class SNNLanguageModel(nn.Module):
         ek_floor_costs = []
 
         def _layer_forward(layer_mod, x):
-            functional.reset_net(layer_mod)
+            self._reset_layer_neurons(layer_mod)
             return layer_mod(x)  # 通过 __call__ 触发 FSDP 参数聚合钩子
 
         for layer_module in self.layers:
@@ -244,10 +267,8 @@ class SNNLanguageModel(nn.Module):
         """
         batch, prompt_len = prompt_ids.shape
 
-        # 重置所有神经元（新序列的初始条件 V=0）
-        for layer_module in self.layers:
-            functional.reset_net(layer_module)
-        functional.reset_net(self.output_neuron)
+        # 重置所有神经元（新序列的初始条件 V=0，直接赋值，FSDP 安全）
+        self._reset_neurons()
 
         # ====== Prefill: parallel 处理整个 prompt ======
         h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
@@ -316,10 +337,8 @@ class SNNLanguageModel(nn.Module):
         """
         batch, seq_len = token_ids.shape
 
-        # 重置所有神经元状态
-        for layer_module in self.layers:
-            functional.reset_net(layer_module)
-        functional.reset_net(self.output_neuron)
+        # 重置所有神经元状态（直接赋值，FSDP 安全）
+        self._reset_neurons()
 
         # 三段式
         spike_seq = self.encode(token_ids)            # 输入边界

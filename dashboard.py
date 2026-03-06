@@ -144,19 +144,19 @@ class SNNDashboard:
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
-            # 输入神经元: PLIFNode.w → sigmoid → beta, w_alpha → softplus → alpha
+            # 输入神经元: PLIFNode.w → sigmoid → beta, w_gain → 1+0.5·tanh → gain
             semantics.append(
                 (f"{prefix}/input1_beta", layer_module.input_neuron1.w,
                  torch.sigmoid, "beta"))
             semantics.append(
-                (f"{prefix}/input1_alpha", layer_module.input_neuron1.w_alpha,
-                 F.softplus, "alpha"))
+                (f"{prefix}/input1_gain", layer_module.input_neuron1.w_gain,
+                 lambda x: 1.0 + 0.5 * torch.tanh(x), "gain"))
             semantics.append(
                 (f"{prefix}/input2_beta", layer_module.input_neuron2.w,
                  torch.sigmoid, "beta"))
             semantics.append(
-                (f"{prefix}/input2_alpha", layer_module.input_neuron2.w_alpha,
-                 F.softplus, "alpha"))
+                (f"{prefix}/input2_gain", layer_module.input_neuron2.w_gain,
+                 lambda x: 1.0 + 0.5 * torch.tanh(x), "gain"))
 
             # SNNBlock 调制偏置
             semantics.append(
@@ -170,27 +170,27 @@ class SNNDashboard:
                 (f"{prefix}/block_vth_t", block.b_th,
                  lambda x, m=v_th_min: m + torch.abs(x), "V_th(t)"))
 
-            # FFN 神经元: PLIFNode.w → sigmoid → beta, w_alpha → softplus → alpha
+            # FFN 神经元: PLIFNode.w → sigmoid → beta, w_gain → 1+0.5·tanh → gain
             semantics.append(
                 (f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w,
                  torch.sigmoid, "beta"))
             semantics.append(
-                (f"{prefix}/ffn_gate_alpha", ffn.gate_neuron.w_alpha,
-                 F.softplus, "alpha"))
+                (f"{prefix}/ffn_gate_gain", ffn.gate_neuron.w_gain,
+                 lambda x: 1.0 + 0.5 * torch.tanh(x), "gain"))
             semantics.append(
                 (f"{prefix}/ffn_up_beta", ffn.up_neuron.w,
                  torch.sigmoid, "beta"))
             semantics.append(
-                (f"{prefix}/ffn_up_alpha", ffn.up_neuron.w_alpha,
-                 F.softplus, "alpha"))
+                (f"{prefix}/ffn_up_gain", ffn.up_neuron.w_gain,
+                 lambda x: 1.0 + 0.5 * torch.tanh(x), "gain"))
 
         # 输出神经元
         semantics.append(
             ("global/output_beta", model.output_neuron.w,
              torch.sigmoid, "beta"))
         semantics.append(
-            ("global/output_alpha", model.output_neuron.w_alpha,
-             F.softplus, "alpha"))
+            ("global/output_gain", model.output_neuron.w_gain,
+             lambda x: 1.0 + 0.5 * torch.tanh(x), "gain"))
 
         return semantics
 

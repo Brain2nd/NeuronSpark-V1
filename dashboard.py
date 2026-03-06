@@ -7,14 +7,19 @@ SNNDashboard: TensorBoard 训练看板
   - log_step()       每 log_interval 步：训练标量 + 参数 norm + 神经元动力学 + PonderNet E[K]
   - log_save_point() 每 save_interval 步：权重/梯度直方图 + 调制补偿因子
 
-调用时机：optimizer.step() 之后、optimizer.zero_grad() 之前（梯度仍可用）。
+FSDP 梯度处理：
+  多卡 FSDP 下 summon_full_params 只聚合参数，不聚合梯度。
+  因此必须在 optimizer.step() 之前调用 cache_grad_norms()，此时梯度有效。
+  各 rank 持有梯度分片，通过 all_reduce(sum of squares) 还原完整 grad_norm。
 
 用法：
     dashboard = SNNDashboard(log_dir='runs/pretrain', model=raw_model, rank=rank)
 
     # 边界步（log_interval）
+    dashboard.cache_grad_norms(model)        # step 前：缓存梯度（所有 rank 参与）
     optimizer.step()
-    dashboard.log_step(global_step, metrics_dict, raw_model, log_params=True)
+    with FSDP.summon_full_params(...):       # step 后：聚合参数
+        dashboard.log_step(global_step, metrics_dict, raw_model, log_params=True)
     optimizer.zero_grad(set_to_none=True)
 
     # 保存点（save_interval）
@@ -26,6 +31,7 @@ SNNDashboard: TensorBoard 训练看板
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 
 
 class SNNDashboard:
@@ -42,6 +48,8 @@ class SNNDashboard:
 
     def __init__(self, log_dir, model, rank=0):
         self._enabled = (log_dir is not None) and (rank == 0)
+        self._rank = rank
+        self._grad_cache = {}  # name → grad_norm（跨 rank 聚合后）
         if not self._enabled:
             return
 
@@ -52,6 +60,30 @@ class SNNDashboard:
         self._neuron_semantics = self._build_neuron_semantics(model)
 
     # ====== 公开方法 ======
+
+    def cache_grad_norms(self, model):
+        """在 optimizer.step() 之前调用：缓存所有参数的梯度范数。
+
+        多卡 FSDP 下每个 rank 持有梯度分片，通过 all_reduce 还原完整 grad_norm。
+        此方法是集合操作（all_reduce），所有 rank 必须同时调用。
+
+        注意：FSDP 包装后 named_parameters() 会插入 _fsdp_wrapped_module 前缀，
+        此处自动剥离以匹配 registry（FSDP 包装前构建）的键名。
+        """
+        use_dist = dist.is_initialized() and dist.get_world_size() > 1
+        cache = {}
+
+        for name, param in model.named_parameters():
+            if not param.requires_grad or param.grad is None:
+                continue
+            local_sq = param.grad.data.norm().square()
+            if use_dist:
+                dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
+            # 剥离 FSDP 插入的 _fsdp_wrapped_module 前缀
+            clean_name = name.replace("._fsdp_wrapped_module", "")
+            cache[clean_name] = local_sq.sqrt().item()
+
+        self._grad_cache = cache
 
     def log_step(self, step, metrics_dict, model, log_params=True):
         """每 log_interval 步调用：训练标量 + 参数监控 + 神经元动力学。"""
@@ -112,13 +144,19 @@ class SNNDashboard:
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
-            # 输入神经元: PLIFNode.w → sigmoid → beta
+            # 输入神经元: PLIFNode.w → sigmoid → beta, w_alpha → softplus → alpha
             semantics.append(
                 (f"{prefix}/input1_beta", layer_module.input_neuron1.w,
                  torch.sigmoid, "beta"))
             semantics.append(
+                (f"{prefix}/input1_alpha", layer_module.input_neuron1.w_alpha,
+                 F.softplus, "alpha"))
+            semantics.append(
                 (f"{prefix}/input2_beta", layer_module.input_neuron2.w,
                  torch.sigmoid, "beta"))
+            semantics.append(
+                (f"{prefix}/input2_alpha", layer_module.input_neuron2.w_alpha,
+                 F.softplus, "alpha"))
 
             # SNNBlock 调制偏置
             semantics.append(
@@ -132,27 +170,37 @@ class SNNDashboard:
                 (f"{prefix}/block_vth_t", block.b_th,
                  lambda x, m=v_th_min: m + torch.abs(x), "V_th(t)"))
 
-            # FFN 神经元: PLIFNode.w → sigmoid → beta
+            # FFN 神经元: PLIFNode.w → sigmoid → beta, w_alpha → softplus → alpha
             semantics.append(
                 (f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w,
                  torch.sigmoid, "beta"))
             semantics.append(
+                (f"{prefix}/ffn_gate_alpha", ffn.gate_neuron.w_alpha,
+                 F.softplus, "alpha"))
+            semantics.append(
                 (f"{prefix}/ffn_up_beta", ffn.up_neuron.w,
                  torch.sigmoid, "beta"))
+            semantics.append(
+                (f"{prefix}/ffn_up_alpha", ffn.up_neuron.w_alpha,
+                 F.softplus, "alpha"))
 
         # 输出神经元
         semantics.append(
             ("global/output_beta", model.output_neuron.w,
              torch.sigmoid, "beta"))
+        semantics.append(
+            ("global/output_alpha", model.output_neuron.w_alpha,
+             F.softplus, "alpha"))
 
         return semantics
 
     # ====== 轻量日志（每 log_interval 步） ======
 
     def _log_training_scalars(self, step, metrics):
-        """记录训练标量：loss, ppl, lr, tps, tokens_seen, ponder_cost, memory。"""
+        """记录训练标量：loss, ppl, lr, tps, tokens_seen, ponder_cost, snvr/ek_floor, memory。"""
         w = self._writer
-        for key in ('loss', 'ppl', 'lr', 'tps', 'tokens_seen', 'ponder_cost'):
+        for key in ('loss', 'ppl', 'lr', 'tps', 'tokens_seen',
+                     'ponder_cost', 'snvr_cost', 'ek_floor_cost'):
             if key in metrics:
                 w.add_scalar(f"train/{key}", metrics[key], step)
         if 'memory_current_gb' in metrics:
@@ -161,8 +209,17 @@ class SNNDashboard:
             w.add_scalar("train/memory/peak_gb", metrics['memory_peak_gb'], step)
 
     def _log_param_norms(self, step, lr):
-        """记录每个参数的 weight_norm, grad_norm, update_ratio。"""
+        """记录每个参数的 weight_norm, grad_norm, update_ratio + 层间梯度比。
+
+        grad_norm 优先使用 cache_grad_norms() 缓存的值（FSDP 多卡精确值），
+        fallback 到 param.grad.norm()（单卡或未调用 cache 时）。
+        """
         w = self._writer
+        cache = self._grad_cache
+
+        # 收集每层梯度范数，用于计算层间梯度比
+        layer_grad_sums = {}  # layer_idx → total grad_norm²
+
         for name, (tag, param) in self._registry.items():
             if not param.requires_grad:
                 continue
@@ -170,12 +227,31 @@ class SNNDashboard:
             weight_norm = param.data.norm().item()
             w.add_scalar(f"params/{tag}/weight_norm", weight_norm, step)
 
-            if param.grad is not None:
+            # 优先用缓存的梯度范数（FSDP 安全），fallback 到 live grad
+            grad_norm = cache.get(name, None)
+            if grad_norm is None and param.grad is not None:
                 grad_norm = param.grad.norm().item()
+
+            if grad_norm is not None:
                 w.add_scalar(f"params/{tag}/grad_norm", grad_norm, step)
-                # update_ratio ≈ lr·‖grad‖ / ‖weight‖（Adam 实际步长不同，但趋势一致）
                 update_ratio = (lr * grad_norm) / (weight_norm + 1e-8)
                 w.add_scalar(f"params/{tag}/update_ratio", update_ratio, step)
+
+                # 按层累积梯度范数²
+                parts = name.split('.')
+                if parts[0] == 'layers' and parts[1].isdigit():
+                    idx = int(parts[1])
+                    layer_grad_sums[idx] = layer_grad_sums.get(idx, 0.0) + grad_norm ** 2
+
+        # 层间梯度比：max/min（诊断深层梯度均衡）
+        if len(layer_grad_sums) >= 2:
+            layer_norms = {k: v ** 0.5 for k, v in layer_grad_sums.items()}
+            max_gn = max(layer_norms.values())
+            min_gn = min(layer_norms.values())
+            grad_ratio = max_gn / (min_gn + 1e-12)
+            w.add_scalar("grad_health/layer_grad_ratio", grad_ratio, step)
+            w.add_scalar("grad_health/layer_grad_max", max_gn, step)
+            w.add_scalar("grad_health/layer_grad_min", min_gn, step)
 
     def _log_neuron_dynamics(self, step):
         """记录神经元参数的语义值（sigmoid/softplus 变换后）。"""
@@ -224,7 +300,11 @@ class SNNDashboard:
     # ====== 重量日志（每 save_interval 步） ======
 
     def _log_histograms(self, step):
-        """记录所有参数权重/梯度分布（直方图）。"""
+        """记录所有参数权重分布（直方图）。
+
+        注意：FSDP 多卡下 summon_full_params 不聚合梯度，
+        梯度直方图仅在 grad 可用时记录（单卡或 grad 未被释放时）。
+        """
         w = self._writer
         for name, (tag, param) in self._registry.items():
             if not param.requires_grad:

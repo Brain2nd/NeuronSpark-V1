@@ -179,7 +179,11 @@ def load_checkpoint_fsdp(path, model, optimizer, device, rank):
 
     with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
         if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
+            missing, unexpected = model.load_state_dict(ckpt['model_state_dict'], strict=False)
+            if missing:
+                Logger(f"  New params (random init): {missing}", rank)
+            if unexpected:
+                Logger(f"  Unexpected keys (ignored): {unexpected}", rank)
 
     if 'optimizer_state' in ckpt:
         try:

@@ -63,26 +63,32 @@ def load_model(checkpoint_path, device):
 
 
 def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,
-                    temperature=0.8, top_k=50, device='cuda'):
+                    temperature=0.8, top_k=50, device='cuda',
+                    speculative=False, K_draft=4, lookahead=5):
     """预训练模型文本续写。"""
     text = f"{tokenizer.bos_token}{prompt}"
     input_ids = tokenizer(text, return_tensors='pt')['input_ids'].to(device)
 
+    gen_fn = model.generate_speculative if speculative else model.generate
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    if speculative:
+        gen_kwargs.update(K_draft=K_draft, lookahead=lookahead)
+
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        output_ids = gen_fn(input_ids, **gen_kwargs)
 
     generated_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return generated_text
 
 
 def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
-               temperature=0.8, top_k=50, device='cuda'):
+               temperature=0.8, top_k=50, device='cuda',
+               speculative=False, K_draft=4, lookahead=5):
     """SFT 模型对话生成。"""
     messages = [
         {"role": "system", "content": "你是一个AI助手"},
@@ -93,14 +99,18 @@ def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
     )
     input_ids = tokenizer(text, return_tensors='pt')['input_ids'].to(device)
 
+    gen_fn = model.generate_speculative if speculative else model.generate
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+    if speculative:
+        gen_kwargs.update(K_draft=K_draft, lookahead=lookahead)
+
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        output_ids = model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+        output_ids = gen_fn(input_ids, **gen_kwargs)
 
     full_text = tokenizer.decode(output_ids[0], skip_special_tokens=False)
     # 提取 assistant 回复部分
@@ -153,6 +163,9 @@ def interactive_mode(model, tokenizer, args):
             temperature=args.temperature,
             top_k=args.top_k,
             device=args.device,
+            speculative=args.speculative,
+            K_draft=args.K_draft,
+            lookahead=args.lookahead,
         )
         print(f"\n{response}\n")
 
@@ -185,6 +198,9 @@ def run_pretrain_test(model, tokenizer, args):
             temperature=args.temperature,
             top_k=args.top_k,
             device=args.device,
+            speculative=args.speculative,
+            K_draft=args.K_draft,
+            lookahead=args.lookahead,
         )
         print(f"\n[{i}/{len(PRETRAIN_TEST_PROMPTS)}] Prompt: {prompt}")
         print(f"Output: {response}")
@@ -203,6 +219,9 @@ def run_sft_test(model, tokenizer, args):
             temperature=args.temperature,
             top_k=args.top_k,
             device=args.device,
+            speculative=args.speculative,
+            K_draft=args.K_draft,
+            lookahead=args.lookahead,
         )
         print(f"\n[{i}/{len(SFT_TEST_PROMPTS)}] Q: {prompt}")
         print(f"A: {response}")
@@ -228,6 +247,11 @@ if __name__ == "__main__":
     # 交互模式
     parser.add_argument('--interactive', action='store_true', help='交互式生成')
 
+    # 自投机解码
+    parser.add_argument('--speculative', action='store_true', help='启用自投机解码加速')
+    parser.add_argument('--K_draft', type=int, default=4, help='Draft 阶段 SNN 时间步数')
+    parser.add_argument('--lookahead', type=int, default=5, help='每轮 Draft 猜测 token 数')
+
     args = parser.parse_args()
 
     # 加载
@@ -244,6 +268,9 @@ if __name__ == "__main__":
             temperature=args.temperature,
             top_k=args.top_k,
             device=args.device,
+            speculative=args.speculative,
+            K_draft=args.K_draft,
+            lookahead=args.lookahead,
         )
         print(f"\n{response}")
     else:

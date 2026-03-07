@@ -125,6 +125,44 @@ class SNNLanguageModel(nn.Module):
             layer_module.snn_ffn.up_neuron.v = 0.
         self.output_neuron.v = 0.
 
+    def _save_v_states(self):
+        """保存所有神经元膜电位状态（自投机解码用）。
+
+        Returns:
+            dict: 所有神经元 V 状态的克隆副本，~657KB/batch (bf16)
+        """
+        def _clone(v):
+            return v.clone() if isinstance(v, torch.Tensor) else v
+
+        states = {}
+        for i, layer in enumerate(self.layers):
+            states[f'l{i}_in1'] = _clone(layer.input_neuron1.v)
+            states[f'l{i}_in2'] = _clone(layer.input_neuron2.v)
+            states[f'l{i}_hidden'] = _clone(layer.snn_block.hidden_neuron.v)
+            states[f'l{i}_gate'] = _clone(layer.snn_ffn.gate_neuron.v)
+            states[f'l{i}_up'] = _clone(layer.snn_ffn.up_neuron.v)
+        states['output'] = _clone(self.output_neuron.v)
+        return states
+
+    def _restore_v_states(self, states):
+        """恢复所有神经元膜电位状态。"""
+        def _clone(v):
+            return v.clone() if isinstance(v, torch.Tensor) else v
+
+        for i, layer in enumerate(self.layers):
+            layer.input_neuron1.v = _clone(states[f'l{i}_in1'])
+            layer.input_neuron2.v = _clone(states[f'l{i}_in2'])
+            layer.snn_block.hidden_neuron.v = _clone(states[f'l{i}_hidden'])
+            layer.snn_ffn.gate_neuron.v = _clone(states[f'l{i}_gate'])
+            layer.snn_ffn.up_neuron.v = _clone(states[f'l{i}_up'])
+        self.output_neuron.v = _clone(states['output'])
+
+    def _set_K(self, new_K):
+        """切换 SNN 时间步数 K（所有层 + 模型顶层）。"""
+        self.K = new_K
+        for layer in self.layers:
+            layer.K = new_K
+
     def _reset_layer_neurons(self, layer_module):
         """重置单个层的所有神经元膜电位。"""
         layer_module.input_neuron1.v = 0.
@@ -317,6 +355,175 @@ class SNNLanguageModel(nn.Module):
             logits[logits < v[:, [-1]]] = float('-inf')
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
+
+    @torch.no_grad()
+    def generate_speculative(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        eos_token_id: Optional[int] = None,
+        K_draft: int = 4,
+        lookahead: int = 5,
+    ) -> torch.Tensor:
+        """
+        自投机解码：同一模型用低 K 做 Draft，高 K 做 Verify，加速推理。
+
+        原理：
+          1. Draft 阶段: K_draft（默认 4）逐 token 生成 `lookahead` 个候选
+          2. Verify 阶段: K_full（原始 K）一次 forward_parallel 批量验证
+          3. 接受匹配的 token + recovery token，回滚 V 状态到正确位置
+
+        加速来源：
+          - Draft 用 K=4 只需 12.5% 的计算量（K=4 vs K=32）
+          - Verify 批量处理 k+1 tokens（1 次 parallel scan vs k+1 次）
+          - PonderNet E[K] 低的 token 天然适合低 K 预测
+
+        数学保证：
+          - greedy 模式（temperature≤0）: 输出与 AR 完全一致（无损）
+          - sampling 模式: 采用 argmax 比较的保守接受策略
+
+        Args:
+            prompt_ids: (batch, prompt_len)
+            max_new_tokens: 最大生成 token 数
+            temperature: 采样温度
+            top_k: top-k 采样
+            eos_token_id: 停止 token
+            K_draft: Draft 阶段 SNN 时间步数（越小越快，但接受率下降）
+            lookahead: 每轮 Draft 生成的候选 token 数
+
+        Returns:
+            (batch, prompt_len + generated_len) 完整序列
+        """
+        batch, prompt_len = prompt_ids.shape
+        K_full = self.K
+        assert K_draft < K_full, f"K_draft({K_draft}) 必须小于 K_full({K_full})"
+
+        self._reset_neurons()
+
+        # ====== Prefill（K_full） ======
+        h = self.encode(prompt_ids)
+        for layer in self.layers:
+            h, _, _ = layer.forward_parallel(h)
+        logits = self.decode(h, prompt_len)
+        next_token = self._sample(logits[:, -1, :], temperature, top_k)
+        generated = [next_token]
+
+        n_accepted = 0
+        n_drafted = 0
+
+        while len(generated) < max_new_tokens:
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+            k = min(lookahead, max_new_tokens - len(generated))
+            if k <= 0:
+                break
+
+            # ====== 保存 V 状态 ======
+            saved_v = self._save_v_states()
+
+            # ====== Draft: K_draft 逐 token 贪心生成 k 个候选 ======
+            self._set_K(K_draft)
+            draft_tokens = []
+            current = next_token
+            for _ in range(k):
+                h_d = self.encode(current)
+                for layer in self.layers:
+                    h_d, _, _ = layer.forward_parallel(h_d)
+                logits_d = self.decode(h_d, 1)
+                # Draft 始终贪心，最大化接受率
+                tok = logits_d[:, -1, :].argmax(dim=-1, keepdim=True)
+                draft_tokens.append(tok)
+                current = tok
+                if eos_token_id is not None and (tok == eos_token_id).all():
+                    break
+
+            k_actual = len(draft_tokens)
+            n_drafted += k_actual
+
+            # ====== 恢复 V 状态 + 切回 K_full ======
+            self._restore_v_states(saved_v)
+            self._set_K(K_full)
+
+            # ====== Verify: 一次 forward_parallel 处理 k+1 tokens ======
+            # 输入: [next_token, dt_0, dt_1, ..., dt_{k-1}]
+            # 输出 logits: k+1 个位置的 target 分布
+            verify_ids = torch.cat([next_token] + draft_tokens, dim=1)
+            h_v = self.encode(verify_ids)
+            for layer in self.layers:
+                h_v, _, _ = layer.forward_parallel(h_v)
+            verify_logits = self.decode(h_v, k_actual + 1)
+
+            # ====== 接受/拒绝: argmax 比较 ======
+            target_preds = verify_logits[:, :k_actual, :].argmax(dim=-1)  # (batch, k_actual)
+            draft_ids = torch.cat(draft_tokens, dim=1)  # (batch, k_actual)
+            matches = (target_preds == draft_ids)  # (batch, k_actual)
+
+            # 找到第一个不匹配的位置
+            any_mismatch = (~matches).any(dim=1)  # (batch,)
+            first_mismatch = (~matches).float().argmax(dim=1)  # (batch,)
+            n_accept_per_batch = torch.where(
+                any_mismatch, first_mismatch,
+                torch.tensor(k_actual, device=matches.device, dtype=first_mismatch.dtype),
+            )
+            # 保守策略: 取 batch 内最小接受数
+            n_accept = int(n_accept_per_batch.min().item())
+            n_accepted += n_accept
+
+            # ====== 提交已接受的 token + recovery ======
+            accepted = draft_tokens[:n_accept]
+            generated.extend(accepted)
+            recovery = self._sample(verify_logits[:, n_accept, :], temperature, top_k)
+
+            # EOS 检查（在已接受的 token 中）
+            eos_hit = False
+            if eos_token_id is not None:
+                for i, tok in enumerate(accepted):
+                    if (tok == eos_token_id).all():
+                        generated = generated[:len(generated) - len(accepted) + i + 1]
+                        eos_hit = True
+                        break
+            if eos_hit:
+                break
+
+            generated.append(recovery)
+
+            # ====== 重建 V 状态 ======
+            if n_accept == k_actual:
+                # 全部接受: verify 的 V 状态已正确（处理了完整的 k+1 tokens）
+                next_token = recovery
+            else:
+                # 部分接受: 恢复 V_0，重新跑已接受的 tokens 以重建正确 V 状态
+                self._restore_v_states(saved_v)
+                if n_accept > 0:
+                    rebuild_ids = torch.cat([next_token] + accepted, dim=1)
+                else:
+                    rebuild_ids = next_token
+                h_r = self.encode(rebuild_ids)
+                for layer in self.layers:
+                    h_r, _, _ = layer.forward_parallel(h_r)
+                _ = self.decode(h_r, rebuild_ids.shape[1])  # 更新 output_neuron.v
+                next_token = recovery
+
+            if eos_token_id is not None and (recovery == eos_token_id).all():
+                break
+
+        # 截断到 max_new_tokens
+        generated = generated[:max_new_tokens]
+
+        # 统计
+        total = len(generated)
+        if n_drafted > 0:
+            rate = n_accepted / n_drafted
+            print(f"[Speculative] {total} tokens, "
+                  f"接受率 {n_accepted}/{n_drafted}={rate:.1%}, "
+                  f"K_draft={K_draft}, K_full={K_full}, lookahead={lookahead}")
+
+        if not generated:
+            return prompt_ids
+        return torch.cat([prompt_ids, torch.cat(generated, dim=1)], dim=1)
 
     def forward(
         self,

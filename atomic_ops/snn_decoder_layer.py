@@ -214,7 +214,7 @@ class SNNDecoderLayer(base.MemoryModule):
         TK, batch, D = x.shape
 
         beta = input_neuron.beta  # (D,)
-        u = input_neuron.alpha * x  # (D,) broadcast → (TK, batch, D)
+        u = (1.0 - beta) * x  # (D,) broadcast → (TK, batch, D)
 
         v_init = input_neuron.v
         if isinstance(v_init, float):

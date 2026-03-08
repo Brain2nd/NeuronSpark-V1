@@ -1,13 +1,13 @@
 """
-SNNLanguageModel: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
+SNNLanguageModel: SNN 隐状态空间语言模型（脉冲电流激活 + 动态 K）
 
 架构（三段式）：
   model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
-  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，全膜电位 + 动态 K 聚合
-  model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
+  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，脉冲电流 + 动态 K 聚合
+  model.decode(h_out, seq)   → logits          # 输出: output_neuron(spike_current) → K帧mean → proj → logits
 
 核心设计：
-  1. 全膜电位：所有神经元输出 V_post 而非 spike
+  1. 脉冲电流激活：神经元输出 V_th * spike（稀疏），经投影后汇入连续残差流
   2. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
      - 每层每子层学习 halt_proj(D→1)，从 SNN 输出逐步计算停止概率
      - 几何分布权重加权聚合，替代 uniform mean
@@ -31,7 +31,7 @@ from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
 from atomic_ops.snn_decoder_layer import _mpd_alpha
-# fp16_encode/fp16_decode 已移除: 全膜电位架构不需要 spike 编解码
+# fp16_encode/fp16_decode 已移除: 脉冲电流架构不需要 spike 编解码
 from atomic_ops.lateral_inhibition import LateralInhibition
 
 
@@ -191,18 +191,18 @@ class SNNLanguageModel(nn.Module):
         emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
         return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
 
-    def snn_forward(self, spike_seq: torch.Tensor):
-        """SNN 核心：spike_seq → (h_out, ponder_cost, ek_floor_cost)。
+    def snn_forward(self, h_seq: torch.Tensor):
+        """SNN 核心：h_seq → (h_out, ponder_cost, ek_floor_cost)。
 
         纯 SNN 层计算，带梯度检查点。
         每层返回 (h, ponder_cost, ek_floor_cost)，作为 checkpoint 输出保留梯度图。
 
         Returns:
-            h: (seq_len*K, batch, D), 连续值
+            h: (seq_len*K, batch, D), 连续残差流
             total_ponder_cost: scalar, 所有层平均期望步数
             total_ek_floor_cost: scalar, 所有层 E[K] 下界惩罚均值
         """
-        h = spike_seq
+        h = h_seq
         ponder_costs = []
         ek_floor_costs = []
 
@@ -261,15 +261,15 @@ class SNNLanguageModel(nn.Module):
         return spike_current_activation(spike, v_th_row.unsqueeze(0))  # 脉冲电流作为激活值
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。
+        """输出边界：连续 h → 输出神经元(spike_current) → K 帧聚合 → logits。
 
         梯度流: loss → logits → norm → decode_proj → K帧mean
-                → V_post(output_neuron) → h_out → SNN layers
+                → spike_current(output_neuron) → h_out → SNN layers
 
         Returns: (batch, seq_len, vocab_size)
         """
         h_out = self.output_norm(h_out)                    # RMSNorm: 控制 scale
-        v_out = self._output_neuron_parallel(h_out)    # (TK, batch, D), V_post 膜电位
+        v_out = self._output_neuron_parallel(h_out)    # (TK, batch, D), 脉冲电流 V_th*spike
         # K 帧聚合: (TK, batch, D) → (seq_len, K, batch, D) → mean → (seq_len, batch, D)
         decoded = v_out.view(seq_len, self.K, -1, self.D).mean(dim=1)
         decoded = decoded.permute(1, 0, 2)                 # (batch, seq_len, D)
@@ -531,15 +531,15 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（全膜电位 + 动态 K）。
+        前向传播（脉冲电流激活 + 动态 K）。
 
         encode → h_seq               # 输入（embed repeat K 次，可微分）
-        snn_forward → h_out, pc      # SNN 核心（全膜电位 + 动态 K 聚合）
-        decode → logits              # 输出（V_post → K帧mean → proj → logits）
+        snn_forward → h_out, pc      # SNN 核心（脉冲电流 + 动态 K 聚合）
+        decode → logits              # 输出（spike_current → K帧mean → proj → logits）
 
         梯度流:
-          embed_tokens → repeat K → SNN layers(V_post + 动态K)
-            → output_neuron(V_post) → K帧mean → decode_proj → logits(tied head)
+          embed_tokens → repeat K → SNN layers(spike_current + 动态K)
+            → output_neuron(spike_current) → K帧mean → decode_proj → logits(tied head)
           ponder_cost: 动态 K 正则化，鼓励用更少步数处理简单 token
         """
         batch, seq_len = token_ids.shape

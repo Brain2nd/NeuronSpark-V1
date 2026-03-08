@@ -25,7 +25,7 @@ SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚
     PonderNet 的 ponder_cost 正则化确保简单 token 不浪费步数。
 
 K 帧层间聚合：
-  - SNN 子层输出 K 帧连续值（V_post 经投影），PonderNet 加权聚合为 1 per token
+  - SNN 子层输出 K 帧连续值（spike_current 经投影），PonderNet 加权聚合为 1 per token
   - 聚合后经 out_proj 投影，广播回 K 帧做残差
   - 使 β 的时间动力学通过 K 帧聚合梯度有效传播
 
@@ -100,9 +100,9 @@ class SNNDecoderLayer(base.MemoryModule):
     """
     单个 SNN 解码层（连续残差流 + K 帧聚合版本）。
 
-    层间传递连续值 h (TK, batch, D)，通过 PLIF 神经元转换为 spike，
-    输入 SNN 子层处理后，K 帧聚合为 1 per token，经 out_proj 投影，
-    广播回 K 帧做残差连接。
+    层间传递连续值 h (TK, batch, D)，通过 PLIF 神经元产生脉冲电流
+    (V_th * spike)，输入 SNN 子层处理后，K 帧聚合为 1 per token，
+    经 out_proj 投影，广播回 K 帧做残差连接。
 
     K 帧聚合使 β 的时间动力学（控制 K 步内的膜电位演化）产生可微分的
     token 级效应，解决 β 梯度为纯噪声的问题。
@@ -202,14 +202,14 @@ class SNNDecoderLayer(base.MemoryModule):
         输入 PLIF 神经元的 parallel scan 前向传播。
 
         完整 PLIF 动力学: V[t] = β·V[t-1] + (1-β)·x[t], spike = Θ(V-V_th), 软重置。
-        输出脉冲电流 V_th * spike 作为激活值（稀疏，反向梯度稠密）。
+        输出脉冲电流 V_th × spike 作为激活值（稀疏值域 {0, V_th}，反向梯度稠密）。
 
         Args:
             input_neuron: PLIFNode 实例（D 维可学习 β 和 V_th）
             x: (TK, batch, D) — 连续值输入
 
         Returns:
-            spike_current: (TK, batch, D) — 脉冲电流（V_th * spike）
+            spike_current: (TK, batch, D) — 脉冲电流（V_th × spike，值为 0 或 V_th）
         """
         TK, batch, D = x.shape
 
@@ -298,17 +298,17 @@ class SNNDecoderLayer(base.MemoryModule):
 
     def forward_parallel(self, h):
         """
-        并行前向传播：连续残差流 + 动态 K 帧聚合。
+        并行前向传播：连续残差流 + 脉冲电流激活 + 动态 K 帧聚合。
 
-        SNN 子层在 TK 维度处理（K 步时间动力学），输出后用 PonderNet
-        自适应聚合 K 帧（不同 token 有效步数不同），经 out_proj 投影后
-        广播回 TK 做残差。
+        SNN 子层在 TK 维度处理（K 步时间动力学），神经元输出脉冲电流
+        (V_th × spike)，经投影后用 PonderNet 自适应聚合 K 帧
+        （不同 token 有效步数不同），经 out_proj 投影后广播回 TK 做残差。
 
         Args:
-            h: (TK, batch, D) — 连续值输入
+            h: (TK, batch, D) — 连续值输入（残差流）
 
         Returns:
-            h: (TK, batch, D) — 连续值输出
+            h: (TK, batch, D) — 连续值输出（残差流）
             ponder_cost: scalar — 两个子层的平均期望步数（正则化用）
         """
         TK, batch, D = h.shape
@@ -348,7 +348,7 @@ class SNNDecoderLayer(base.MemoryModule):
             self._alpha_input2 = self.input_neuron2.surrogate_function.alpha
             self._alpha_ffn = self.snn_ffn.gate_neuron.surrogate_function.alpha
 
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → 动态K聚合 → out_proj → 残差
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode(spike_current) → SNNBlock → 动态K聚合 → out_proj → 残差
         v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
         cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
         del v_in
@@ -367,7 +367,7 @@ class SNNDecoderLayer(base.MemoryModule):
         h = h + res_block.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
         del res_block
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → 动态K聚合 → out_proj → 残差
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode(spike_current) → SNNFFN → 动态K聚合 → out_proj → 残差
         v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
         del v_in2
@@ -410,16 +410,16 @@ class SNNDecoderLayer(base.MemoryModule):
             h: (batch, D) — 连续值输出
             ponder_cost: scalar — 0.0（单步无 ponder cost）
         """
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode(spike_current) → SNNBlock → out_proj → 残差
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode → spike_current → SNNBlock → out_proj → 残差
         spike1 = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
-        v_in = spike_current_activation(spike1, self.input_neuron1.v_th)  # 脉冲电流
+        v_in = spike_current_activation(spike1, self.input_neuron1.v_th)  # V_th × spike
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
         h = h + self.block_post_norm(res_block)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode(spike_current) → SNNFFN → out_proj → 残差
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode → spike_current → SNNFFN → out_proj → 残差
         spike2 = self.input_neuron2(self.ffn_norm(h))
-        v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)  # 脉冲电流
+        v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)  # V_th × spike
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
         h = h + self.ffn_post_norm(res_ffn)

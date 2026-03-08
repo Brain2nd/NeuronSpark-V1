@@ -5,14 +5,14 @@ SNNFFN: SNN 等价的 Feed-Forward Network
   Qwen3 MLP:  down_proj( SiLU(gate_proj(x)) * up_proj(x) )
   SNN  FFN:   down_proj( gate_V_post * up_V_post ) + skip
 
-膜电位门控（对标 SiLU gating）：
+脉冲电流门控（对标 SiLU gating）：
   gate/up 神经元完整 PLIF 动力学（积分+阈值+重置），
-  输出膜电位 V_post 做连续乘法门控，替代 binary AND 门。
+  输出脉冲电流 V_th × spike 做乘法门控，替代 binary AND 门。
 
 信号流：
-  x → gate_proj → gate_neuron → V_post_gate
-  x → up_proj   → up_neuron   → V_post_up
-                   V_post_gate × V_post_up → gated
+  x → gate_proj → gate_neuron → spike_current_gate (V_th × spike)
+  x → up_proj   → up_neuron   → spike_current_up  (V_th × spike)
+                   sc_gate × sc_up → gated
                    down_proj(gated) + skip_proj(x) → 连续输出
 """
 
@@ -157,7 +157,7 @@ class SNNFFN(base.MemoryModule):
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
         del V_post_merged
 
-        # ====== Phase 3: 连续门控（V_post × V_post，对标 SwiGLU）+ 降维 ======
+        # ====== Phase 3: 脉冲电流门控（sc_gate × sc_up，对标 SwiGLU）+ 降维 ======
         gated = gate_v * up_v  # (TK, batch, D_ff)
         del sc_merged, gate_v, up_v
         gated_flat = gated.reshape(TK * batch, D_ff)
@@ -184,7 +184,7 @@ class SNNFFN(base.MemoryModule):
         up_spike = self.up_neuron(self.up_proj(spike_in))
         up_v = spike_current_activation(up_spike, self.up_neuron.v_th)
 
-        # 连续门控（对标 SwiGLU）
+        # 脉冲电流门控（对标 SwiGLU）
         gated = gate_v * up_v
 
         # 降维 + 残差

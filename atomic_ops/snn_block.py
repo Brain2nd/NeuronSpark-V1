@@ -12,7 +12,7 @@ SNNBlock: 完整的 SNN 隐状态空间 Block（并行化版本）
 
   SelectivePLIF(I, β, α, V_th) → s[t] ∈ {0,1}^{D*N}
 
-  W_out · V_post[t] ⊙ gate + I_skip → 连续输出 ∈ R^D
+  W_out · (V_th·spike)[t] ⊙ gate + I_skip → 连续输出 ∈ R^D
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md。
 """
@@ -149,7 +149,7 @@ class SNNBlock(base.MemoryModule):
             spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
 
         Returns:
-            continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出（V_post 经 W_out 投影）
+            continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出（脉冲电流 V_th×spike 经 W_out 投影）
         """
         TK, batch, D = spike_in_seq.shape
         DN = self.D * self.N

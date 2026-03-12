@@ -384,17 +384,17 @@ if __name__ == "__main__":
 
     # SNN 模型参数
     parser.add_argument('--vocab_size', type=int, default=6144)
-    parser.add_argument('--D', type=int, default=1024)
+    parser.add_argument('--D', type=int, default=640)
     parser.add_argument('--N', type=int, default=8)
     parser.add_argument('--K', type=int, default=32)
     parser.add_argument('--num_layers', type=int, default=20)
-    parser.add_argument('--D_ff', type=int, default=3072)
+    parser.add_argument('--D_ff', type=int, default=1920)
     parser.add_argument('--v_th_min', type=float, default=0.1)
 
     # 训练参数
     parser.add_argument("--out_dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--batch_size", type=int, default=8, help="每卡 batch size")
+    parser.add_argument("--batch_size", type=int, default=4, help="每卡 batch size")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--prefetch_factor", type=int, default=2,
@@ -402,7 +402,7 @@ if __name__ == "__main__":
 
     # 优化参数
     parser.add_argument('--learning_rate', type=float, default=2e-4)
-    parser.add_argument('--accumulation_steps', type=int, default=8)
+    parser.add_argument('--accumulation_steps', type=int, default=1)
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--warmup_iters', type=int, default=500)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
@@ -425,7 +425,7 @@ if __name__ == "__main__":
                         help="FSDP 分片策略")
 
     # 日志和保存
-    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=500)
 
     # 数据

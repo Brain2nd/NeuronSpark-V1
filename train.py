@@ -291,17 +291,17 @@ if __name__ == "__main__":
 
     # SNN 模型参数（创新部分）
     parser.add_argument('--vocab_size', type=int, default=6144, help='词表大小')
-    parser.add_argument('--D', type=int, default=1024, help='隐层维度')
+    parser.add_argument('--D', type=int, default=640, help='隐层维度')
     parser.add_argument('--N', type=int, default=8, help='状态扩展因子')
     parser.add_argument('--K', type=int, default=32, help='每 token 最大 SNN 时间步数（K_max），PonderNet 动态决定有效步数')
     parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
-    parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
+    parser.add_argument('--D_ff', type=int, default=1920, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
 
     # 基础训练参数（对齐教程）
     parser.add_argument("--out_dir", type=str, default="checkpoints", help="模型输出目录")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
-    parser.add_argument("--batch_size", type=int, default=8, help="批次大小（反向传播需更多显存，默认 8）")
+    parser.add_argument("--batch_size", type=int, default=4, help="批次大小（反向传播需更多显存）")
     parser.add_argument("--device", type=str,
                         default="cuda:0" if torch.cuda.is_available() else "cpu",
                         help="训练设备")
@@ -311,15 +311,15 @@ if __name__ == "__main__":
 
     # 训练优化参数（对齐教程）
     parser.add_argument('--learning_rate', type=float, default=2e-4, help='学习率（对齐教程）')
-    parser.add_argument('--accumulation_steps', type=int, default=8, help='梯度累积步数（对齐教程）')
+    parser.add_argument('--accumulation_steps', type=int, default=1, help='梯度累积步数')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值（对齐教程）')
-    parser.add_argument('--warmup_iters', type=int, default=0, help='学习率预热迭代次数（对齐教程）')
+    parser.add_argument('--warmup_iters', type=int, default=500, help='学习率预热迭代次数')
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0, help='神经元参数学习率倍率（相对 base lr）')
     parser.add_argument('--ponder_weight', type=float, default=0.01, help='动态 K ponder cost 正则化权重')
 
     # 日志和保存参数（对齐教程）
-    parser.add_argument("--log_interval", type=int, default=100, help="日志记录间隔")
-    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+    parser.add_argument("--log_interval", type=int, default=10, help="日志记录间隔")
+    parser.add_argument("--save_interval", type=int, default=500, help="模型保存间隔")
 
     # 数据（对齐教程）
     parser.add_argument("--data_path", type=str,

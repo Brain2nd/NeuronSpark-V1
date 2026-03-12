@@ -1,17 +1,16 @@
 """
-SNNLanguageModel: SNN 隐状态空间语言模型（脉冲电流激活 + 动态 K）
+SNNLanguageModel: SNN 隐状态空间语言模型（mHC 多流残差 + 脉冲电流激活 + 动态 K）
 
 架构（三段式）：
-  model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
-  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，脉冲电流 + 动态 K 聚合
-  model.decode(h_out, seq)   → logits          # 输出: output_neuron(spike_current) → K帧mean → proj → logits
+  model.encode(token_ids)    → h_streams          # 输入: embed → n 流扩展
+  model.snn_forward(h_streams) → h_out, pc        # SNN 核心: 20 层，mHC 多流残差 + 动态 K 聚合
+  model.decode(h_out, seq)   → logits             # 输出: n 流聚合 → K 帧 output_neuron → proj → logits
 
 核心设计：
-  1. 脉冲电流激活：神经元输出 V_th * spike（稀疏），经投影后汇入连续残差流
-  2. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
-     - 每层每子层学习 halt_proj(D→1)，从 SNN 输出逐步计算停止概率
-     - 几何分布权重加权聚合，替代 uniform mean
-     - ponder_cost 正则化鼓励早停
+  1. mHC 多流残差: H_res ∈ Birkhoff 多面体，谱范数 ≤ 1，梯度不爆炸的代数保证
+  2. 脉冲电流激活：神经元输出 V_th * spike（稀疏），经投影后汇入 n 流残差
+  3. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
+  4. 层间状态: (seq_len, batch, n, D) — n 流残差（n=4 推荐）
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md。
 """
@@ -42,23 +41,23 @@ class SNNModelOutput:
     logits: Optional[torch.Tensor] = None
     ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
     ek_floor_cost: Optional[torch.Tensor] = None  # E[K] 下界惩罚
-    snvr_cost: Optional[torch.Tensor] = None  # 层间权重谱范数方差正则化
     b_th_reg_cost: Optional[torch.Tensor] = None  # b_th L2 正则化（遏制 V_th 漂移）
 
 
 class SNNLanguageModel(nn.Module):
     """
-    从零训练的 SNN 隐状态空间语言模型（parallel scan）。
+    从零训练的 SNN 隐状态空间语言模型（mHC 多流残差 + parallel scan）。
 
     Args:
         vocab_size: 词表大小（默认 6144，自训练 BPE）
         D: 可见维度
         N: 状态扩展因子
         K: 每 token 最大 SNN 时间步数（K_max）。PonderNet 动态决定有效步数 ∈ [1, K]。
-           K 越大 → 复杂 token 可用更多步数，但计算量和显存线性增长。
         num_layers: SNN 解码层数
         D_ff: FFN 中间层维度
         v_th_min: 动态阈值下限
+        n_hc_streams: mHC 流数量（推荐 4，Birkhoff 多面体约束）
+        sinkhorn_iters: Sinkhorn 迭代次数（20 对 n≤8 足够收敛）
     """
 
     def __init__(
@@ -71,6 +70,8 @@ class SNNLanguageModel(nn.Module):
         D_ff: int = 3072,
         v_th_min: float = 0.1,
         ek_floor: float = 0.0,
+        n_hc_streams: int = 4,
+        sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -79,6 +80,7 @@ class SNNLanguageModel(nn.Module):
         self.K = K
         self.num_layers = num_layers
         self.D_ff = D_ff
+        self.n_hc_streams = n_hc_streams
 
         # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
@@ -105,6 +107,8 @@ class SNNLanguageModel(nn.Module):
                 num_layers=num_layers,
                 layer_idx=i,
                 ek_floor=ek_floor,
+                n_hc_streams=n_hc_streams,
+                sinkhorn_iters=sinkhorn_iters,
             )
             for i in range(num_layers)
         ])
@@ -179,31 +183,34 @@ class SNNLanguageModel(nn.Module):
         nn.init.zeros_(self.decode_proj.bias)
 
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """输入边界：token_ids → 连续值序列。
+        """输入边界：token_ids → n 流残差。
 
-        Embedding lookup，每 token 重复 K 次作为 SNN 时间步输入。
-        梯度可通过 embedding 直接反传。
+        Embedding lookup，扩展到 n 流（所有流初始值相同）。
+        mHC 初始化保证 H_pre @ [emb]*n = emb，等价于标准残差起点。
 
-        Returns: (seq_len*K, batch, D), 连续值
+        Returns: (seq_len, batch, n, D), 连续值 n 流
         """
         emb = self.embed_tokens(token_ids)       # (batch, seq_len, D)
         batch, seq_len, D = emb.shape
-        # 每 token 重复 K 次: (batch, seq_len, D) → (batch, seq_len*K, D) → (TK, batch, D)
-        emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
-        return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
+        n = self.n_hc_streams
+        # 扩展到 n 流: (batch, seq_len, D) → (batch, seq_len, 1, D) → (batch, seq_len, n, D)
+        emb_n = emb.unsqueeze(2).expand(-1, -1, n, -1)
+        # 转置: (batch, seq_len, n, D) → (seq_len, batch, n, D)
+        return emb_n.permute(1, 0, 2, 3).contiguous()
 
-    def snn_forward(self, h_seq: torch.Tensor):
-        """SNN 核心：h_seq → (h_out, ponder_cost, ek_floor_cost)。
+    def snn_forward(self, h_streams: torch.Tensor):
+        """SNN 核心：h_streams → (h_out, ponder_cost, ek_floor_cost)。
 
         纯 SNN 层计算，带梯度检查点。
-        每层返回 (h, ponder_cost, ek_floor_cost)，作为 checkpoint 输出保留梯度图。
+        每层接收/返回 (seq_len, batch, n, D) n 流残差。
+        层内展开到 TK 做 K 帧时间动力学，PonderNet 聚合回 token 级。
 
         Returns:
-            h: (seq_len*K, batch, D), 连续残差流
+            h_streams: (seq_len, batch, n, D), n 流残差
             total_ponder_cost: scalar, 所有层平均期望步数
             total_ek_floor_cost: scalar, 所有层 E[K] 下界惩罚均值
         """
-        h = h_seq
+        h = h_streams
         ponder_costs = []
         ek_floor_costs = []
 
@@ -227,7 +234,7 @@ class SNNLanguageModel(nn.Module):
         """输出 PLIF 神经元的 parallel scan 前向：连续 h → 脉冲电流。
 
         Args:
-            h: (TK, batch, D) 连续值（SNN 最后一层输出）
+            h: (TK, batch, D) 连续值（展开后的 K 帧输入）
 
         Returns:
             spike_current: (TK, batch, D) 脉冲电流（V_th * spike，稀疏激活值）
@@ -261,19 +268,34 @@ class SNNLanguageModel(nn.Module):
         del V_post
         return spike_current_activation(spike, v_th_row.unsqueeze(0))  # 脉冲电流作为激活值
 
-    def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """输出边界：连续 h → 输出神经元(spike_current) → K 帧聚合 → logits。
+    def decode(self, h_streams: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """输出边界：n 流残差 → 聚合 → K 帧 output_neuron(spike_current) → logits。
 
-        梯度流: loss → logits → norm → decode_proj → K帧mean
-                → spike_current(output_neuron) → h_out → SNN layers
+        流程:
+          1. n 流均值聚合 → (seq_len, batch, D)
+          2. 展开到 TK: (seq_len*K, batch, D)
+          3. output_norm → output_neuron(spike_current) → K 帧均值
+          4. decode_proj → LateralInhibition → tied embedding → logits
 
         Returns: (batch, seq_len, vocab_size)
         """
-        h_out = self.output_norm(h_out)                    # RMSNorm: 控制 scale
-        v_out = self._output_neuron_parallel(h_out)    # (TK, batch, D), 脉冲电流 V_th*spike
+        # 1. n 流均值聚合
+        h_collapsed = h_streams.mean(dim=2)  # (seq_len, batch, D)
+
+        # 2. 展开到 TK
+        batch = h_streams.shape[1]
+        TK = seq_len * self.K
+        h_tk = h_collapsed.unsqueeze(1).expand(-1, self.K, -1, -1).reshape(
+            TK, batch, self.D)
+
+        # 3. 输出神经元处理
+        h_tk = self.output_norm(h_tk)                     # RMSNorm: 控制 scale
+        v_out = self._output_neuron_parallel(h_tk)    # (TK, batch, D), 脉冲电流
         # K 帧聚合: (TK, batch, D) → (seq_len, K, batch, D) → mean → (seq_len, batch, D)
-        decoded = v_out.view(seq_len, self.K, -1, self.D).mean(dim=1)
+        decoded = v_out.view(seq_len, self.K, batch, self.D).mean(dim=1)
         decoded = decoded.permute(1, 0, 2)                 # (batch, seq_len, D)
+
+        # 4. 投影 + 侧抑制 + tied head
         h = self.decode_proj(decoded)                      # (batch, seq_len, D)
         h = self.norm(h)                                   # (batch, seq_len, D)
         return F.linear(h, self.embed_tokens.weight)       # (batch, seq_len, vocab)
@@ -310,8 +332,8 @@ class SNNLanguageModel(nn.Module):
         self._reset_neurons()
 
         # ====== Prefill: parallel 处理整个 prompt ======
-        h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
-        h = h_seq
+        h_streams = self.encode(prompt_ids)  # (prompt_len, batch, n, D)
+        h = h_streams
         for layer_module in self.layers:
             h, _, _ = layer_module.forward_parallel(h)  # 推理忽略 ponder_cost
         # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
@@ -327,8 +349,8 @@ class SNNLanguageModel(nn.Module):
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
 
-            # 编码单 token → K 帧连续值（复用 encode）
-            frames = self.encode(next_token)  # (K, batch, D)
+            # 编码单 token → n 流残差
+            frames = self.encode(next_token)  # (1, batch, n, D)
 
             # K 帧通过 SNN — 不 reset，神经元 .v 跨 token 连续传递
             h = frames
@@ -376,22 +398,13 @@ class SNNLanguageModel(nn.Module):
           2. Verify 阶段: K_full（原始 K）一次 forward_parallel 批量验证
           3. 接受匹配的 token + recovery token，回滚 V 状态到正确位置
 
-        加速来源：
-          - Draft 用 K=4 只需 12.5% 的计算量（K=4 vs K=32）
-          - Verify 批量处理 k+1 tokens（1 次 parallel scan vs k+1 次）
-          - PonderNet E[K] 低的 token 天然适合低 K 预测
-
-        数学保证：
-          - greedy 模式（temperature≤0）: 输出与 AR 完全一致（无损）
-          - sampling 模式: 采用 argmax 比较的保守接受策略
-
         Args:
             prompt_ids: (batch, prompt_len)
             max_new_tokens: 最大生成 token 数
             temperature: 采样温度
             top_k: top-k 采样
             eos_token_id: 停止 token
-            K_draft: Draft 阶段 SNN 时间步数（越小越快，但接受率下降）
+            K_draft: Draft 阶段 SNN 时间步数
             lookahead: 每轮 Draft 生成的候选 token 数
 
         Returns:
@@ -449,8 +462,6 @@ class SNNLanguageModel(nn.Module):
             self._set_K(K_full)
 
             # ====== Verify: 一次 forward_parallel 处理 k+1 tokens ======
-            # 输入: [next_token, dt_0, dt_1, ..., dt_{k-1}]
-            # 输出 logits: k+1 个位置的 target 分布
             verify_ids = torch.cat([next_token] + draft_tokens, dim=1)
             h_v = self.encode(verify_ids)
             for layer in self.layers:
@@ -458,18 +469,16 @@ class SNNLanguageModel(nn.Module):
             verify_logits = self.decode(h_v, k_actual + 1)
 
             # ====== 接受/拒绝: argmax 比较 ======
-            target_preds = verify_logits[:, :k_actual, :].argmax(dim=-1)  # (batch, k_actual)
-            draft_ids = torch.cat(draft_tokens, dim=1)  # (batch, k_actual)
-            matches = (target_preds == draft_ids)  # (batch, k_actual)
+            target_preds = verify_logits[:, :k_actual, :].argmax(dim=-1)
+            draft_ids = torch.cat(draft_tokens, dim=1)
+            matches = (target_preds == draft_ids)
 
-            # 找到第一个不匹配的位置
-            any_mismatch = (~matches).any(dim=1)  # (batch,)
-            first_mismatch = (~matches).float().argmax(dim=1)  # (batch,)
+            any_mismatch = (~matches).any(dim=1)
+            first_mismatch = (~matches).float().argmax(dim=1)
             n_accept_per_batch = torch.where(
                 any_mismatch, first_mismatch,
                 torch.tensor(k_actual, device=matches.device, dtype=first_mismatch.dtype),
             )
-            # 保守策略: 取 batch 内最小接受数
             n_accept = int(n_accept_per_batch.min().item())
             n_accepted += n_accept
 
@@ -478,7 +487,7 @@ class SNNLanguageModel(nn.Module):
             generated.extend(accepted)
             recovery = self._sample(verify_logits[:, n_accept, :], temperature, top_k)
 
-            # EOS 检查（在已接受的 token 中）
+            # EOS 检查
             eos_hit = False
             if eos_token_id is not None:
                 for i, tok in enumerate(accepted):
@@ -493,10 +502,8 @@ class SNNLanguageModel(nn.Module):
 
             # ====== 重建 V 状态 ======
             if n_accept == k_actual:
-                # 全部接受: verify 的 V 状态已正确（处理了完整的 k+1 tokens）
                 next_token = recovery
             else:
-                # 部分接受: 恢复 V_0，重新跑已接受的 tokens 以重建正确 V 状态
                 self._restore_v_states(saved_v)
                 if n_accept > 0:
                     rebuild_ids = torch.cat([next_token] + accepted, dim=1)
@@ -505,7 +512,7 @@ class SNNLanguageModel(nn.Module):
                 h_r = self.encode(rebuild_ids)
                 for layer in self.layers:
                     h_r, _, _ = layer.forward_parallel(h_r)
-                _ = self.decode(h_r, rebuild_ids.shape[1])  # 更新 output_neuron.v
+                _ = self.decode(h_r, rebuild_ids.shape[1])
                 next_token = recovery
 
             if eos_token_id is not None and (recovery == eos_token_id).all():
@@ -532,15 +539,15 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（脉冲电流激活 + 动态 K）。
+        前向传播（mHC 多流残差 + 脉冲电流激活 + 动态 K）。
 
-        encode → h_seq               # 输入（embed repeat K 次，可微分）
-        snn_forward → h_out, pc      # SNN 核心（脉冲电流 + 动态 K 聚合）
-        decode → logits              # 输出（spike_current → K帧mean → proj → logits）
+        encode → h_streams             # 输入（embed → n 流扩展）
+        snn_forward → h_out, pc        # SNN 核心（mHC 多流残差 + 动态 K 聚合）
+        decode → logits                # 输出（n 流聚合 → spike_current → K帧mean → proj → logits）
 
         梯度流:
-          embed_tokens → repeat K → SNN layers(spike_current + 动态K)
-            → output_neuron(spike_current) → K帧mean → decode_proj → logits(tied head)
+          embed_tokens → n 流 → SNN layers(mHC + spike_current + 动态K)
+            → n 流聚合 → output_neuron(spike_current) → K帧mean → decode_proj → logits(tied head)
           ponder_cost: 动态 K 正则化，鼓励用更少步数处理简单 token
         """
         batch, seq_len = token_ids.shape
@@ -549,12 +556,10 @@ class SNNLanguageModel(nn.Module):
         self._reset_neurons()
 
         # 三段式
-        spike_seq = self.encode(token_ids)            # 输入边界
-        h_out, ponder_cost, ek_floor_cost = self.snn_forward(spike_seq)  # SNN 核心
-        logits = self.decode(h_out, seq_len)          # 输出边界
+        h_streams = self.encode(token_ids)                    # 输入边界
+        h_out, ponder_cost, ek_floor_cost = self.snn_forward(h_streams)  # SNN 核心
+        logits = self.decode(h_out, seq_len)                  # 输出边界
 
-        # SNVR: 层间权重范数方差正则化（可微分，梯度流回权重）
-        snvr_cost = self._compute_snvr_cost()
         # b_th L2 正则化（遏制 10×LR 下 V_th 漂移）
         b_th_reg_cost = self._compute_b_th_reg_cost()
 
@@ -569,46 +574,12 @@ class SNNLanguageModel(nn.Module):
                 last_loss=self.last_loss,
                 ponder_cost=ponder_cost,
                 ek_floor_cost=ek_floor_cost,
-                snvr_cost=snvr_cost,
                 b_th_reg_cost=b_th_reg_cost,
             )
 
         return SNNModelOutput(logits=logits, ponder_cost=ponder_cost,
-                              ek_floor_cost=ek_floor_cost, snvr_cost=snvr_cost,
+                              ek_floor_cost=ek_floor_cost,
                               b_th_reg_cost=b_th_reg_cost)
-
-    def _compute_snvr_cost(self) -> torch.Tensor:
-        """Spectral Norm Variance Regularization: 惩罚同类权重跨层 Frobenius 范数方差。
-
-        Jacobian 谱范数与权重范数正相关。若各层同类权重范数不一致
-        (浅层大、深层小)，∏‖J_k‖ 必然指数发散 → 梯度消失/爆炸。
-        惩罚范数方差 → 迫使各层 ‖J_k‖ 趋近统一 → 梯度流保持。
-
-        Returns:
-            scalar — 所有权重类型的范数方差之和
-        """
-        norms_by_type = {}
-        for layer_module in self.layers:
-            block = layer_module.snn_block
-            ffn = layer_module.snn_ffn
-            for name, param in [
-                ('W_in', block.W_in.weight),
-                ('W_out', block.W_out.weight),
-                ('W_gate', block.W_gate.weight),
-                ('W_skip', block.W_skip.weight),
-                ('ffn_gate', ffn.gate_proj.weight),
-                ('ffn_down', ffn.down_proj.weight),
-                ('out_proj', layer_module.block_out_proj.weight),
-                ('ffn_out_proj', layer_module.ffn_out_proj.weight),
-            ]:
-                norms_by_type.setdefault(name, []).append(param.norm())
-
-        total_var = torch.zeros(1, device=self.layers[0].block_out_proj.weight.device,
-                                dtype=torch.float32).squeeze()
-        for norms in norms_by_type.values():
-            stacked = torch.stack(norms)
-            total_var = total_var + stacked.var()
-        return total_var
 
     def _compute_b_th_reg_cost(self) -> torch.Tensor:
         """b_th L2 正则化：遏制 V_th 漂移（10×LR + 0 weight_decay 下 b_th 无约束）。
@@ -633,10 +604,6 @@ class SNNLanguageModel(nn.Module):
           β = sigmoid(b_beta), sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）梯度衰减 100x。
           补偿: grad /= activation'(b)，等价于在 β/α 空间做梯度下降。
 
-        注意: 原 Phase 2（层间梯度均衡）已移除。几何均值归一化会将所有层的
-        b_beta/b_alpha/b_th 梯度强制相同，破坏层间梯度多样性。
-        层间梯度差异由 SubLN Post-RMSNorm 自然平衡。
-
         调用时机: optimizer.step() 之前、clip_grad_norm_ 之前。
 
         Args:
@@ -646,7 +613,6 @@ class SNNLanguageModel(nn.Module):
             block = layer_module.snn_block
 
             # b_beta: sigmoid 饱和补偿
-            # sigmoid'(z) = sigmoid(z) · (1 - sigmoid(z)) = β · (1-β)
             if block.b_beta.grad is not None:
                 with torch.no_grad():
                     beta = torch.sigmoid(block.b_beta.data)
@@ -696,6 +662,8 @@ class SNNLanguageModel(nn.Module):
             'ffn_down_proj': [],
             'ffn_skip_proj': [],
             'ffn_neurons': [],
+            # mHC 超连接参数
+            'hc_params': [],
         }
 
         for layer_module in self.layers:
@@ -716,8 +684,6 @@ class SNNLanguageModel(nn.Module):
             groups['rms_norms'].extend([
                 layer_module.block_norm.weight,
                 layer_module.ffn_norm.weight,
-                layer_module.block_post_norm.weight,
-                layer_module.ffn_post_norm.weight,
             ])
 
             # 动态 K: 停止投影参数
@@ -745,5 +711,14 @@ class SNNLanguageModel(nn.Module):
                 ffn.gate_neuron.w, ffn.gate_neuron.v_th,
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
             ])
+
+            # mHC 超连接参数
+            for hc in [layer_module.block_hc, layer_module.ffn_hc]:
+                groups['hc_params'].extend([
+                    hc.norm.weight,
+                    hc.theta_pre, hc.b_pre, hc.alpha_pre,
+                    hc.theta_post, hc.b_post, hc.alpha_post,
+                    hc.theta_res, hc.b_res, hc.alpha_res,
+                ])
 
         return groups

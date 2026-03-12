@@ -1,8 +1,17 @@
 """
-SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚合）
+SNNDecoderLayer: 单个 SNN 解码层（mHC 多流残差 + 动态 K 帧聚合）
 
-  RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → PostNorm → 残差
-  RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → PostNorm → 残差
+  HyperConnection.pre → RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → HyperConnection.post
+  HyperConnection.pre → RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → HyperConnection.post
+
+残差连接:
+  标准残差 x + f(x) 替换为 mHC 多流残差:
+    x_{l+1} = H_res @ x_l + H_post ⊗ f(H_pre @ x_l)
+  H_res 约束在 Birkhoff 多面体（双随机矩阵），谱范数 ≤ 1，
+  代数保证梯度不爆炸，无论网络多深。
+
+层间状态: (seq_len, batch, n, D) — n 流残差（n=4 推荐）。
+层内 SNN: 展开到 (TK, batch, D) 做 K 帧时间动力学，PonderNet 聚合回 token 级。
 
 动态 K：
   - K 是最大步数（K_max），不是固定步数。不同 token 有效步数 ∈ [1, K_max]。
@@ -18,21 +27,6 @@ SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚
     归一化:   λ̂_k = λ_k / Σ_k λ_k                   — 确保权重和为 1
     聚合:     output = Σ_k λ̂_k · frame_k
     代价:     E[K] = Σ_k k · λ̂_k                    — 期望步数
-
-  K_max 设计原则：
-    K_max 越大，模型对复杂 token 的处理能力越强（更多步数可用），
-    但计算量和显存线性增长。K_max=32 允许 token 使用 1~32 步。
-    PonderNet 的 ponder_cost 正则化确保简单 token 不浪费步数。
-
-K 帧层间聚合：
-  - SNN 子层输出 K 帧连续值（spike_current 经投影），PonderNet 加权聚合为 1 per token
-  - 聚合后经 out_proj 投影，广播回 K 帧做残差
-  - 使 β 的时间动力学通过 K 帧聚合梯度有效传播
-
-对标 Qwen3DecoderLayer（Pre-LN 模式完全等价）:
-  Qwen3:  RMSNorm → Attention → residual → RMSNorm → MLP → residual
-  SNN:    RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → residual
-        → RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → residual
 """
 
 import math
@@ -46,6 +40,7 @@ from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
 from .snn_block import SNNBlock
 from .snn_ffn import SNNFFN
+from .hyper_connection import HyperConnection
 from .parallel_scan import plif_rowparam_forward
 from . import spike_current_activation
 
@@ -98,14 +93,14 @@ def _fused_geometric_halt(halt_logits):
 
 class SNNDecoderLayer(base.MemoryModule):
     """
-    单个 SNN 解码层（连续残差流 + K 帧聚合版本）。
+    单个 SNN 解码层（mHC 多流残差 + K 帧聚合版本）。
 
-    层间传递连续值 h (TK, batch, D)，通过 PLIF 神经元产生脉冲电流
-    (V_th * spike)，输入 SNN 子层处理后，K 帧聚合为 1 per token，
-    经 out_proj 投影，广播回 K 帧做残差连接。
+    层间传递 n 流残差 h_streams (seq_len, batch, n, D)。
+    每个子层通过 HyperConnection 聚合 n 流 → 1 维输入，
+    SNN 处理后 PonderNet 聚合 K 帧，再由 HyperConnection 分配回 n 流。
 
-    K 帧聚合使 β 的时间动力学（控制 K 步内的膜电位演化）产生可微分的
-    token 级效应，解决 β 梯度为纯噪声的问题。
+    H_res 的 Birkhoff 多面体约束（谱范数 ≤ 1）代替了原 SubLN PostNorm
+    的自动增益控制，从代数层面保证深层梯度不爆炸。
 
     Args:
         D: 可见维度
@@ -117,6 +112,8 @@ class SNNDecoderLayer(base.MemoryModule):
         num_layers: 总层数（用于残差输出缩放 + SNNFFN down_proj 缩放）
         layer_idx: 当前层索引
         ek_floor: E[K] 下界，低于此值时产生可微分惩罚（防止 PonderNet 坍缩）
+        n_hc_streams: mHC 流数量（推荐 4）
+        sinkhorn_iters: Sinkhorn 迭代次数
     """
 
     def __init__(
@@ -130,11 +127,14 @@ class SNNDecoderLayer(base.MemoryModule):
         num_layers: int = 1,
         layer_idx: int = 0,
         ek_floor: float = 0.0,
+        n_hc_streams: int = 4,
+        sinkhorn_iters: int = 20,
     ):
         super().__init__()
         self.D = D
         self.K = K
         self.ek_floor = ek_floor
+        self.n_hc_streams = n_hc_streams
 
         self.snn_block = SNNBlock(
             D=D, N=N, v_th_min=v_th_min,
@@ -186,20 +186,14 @@ class SNNDecoderLayer(base.MemoryModule):
             halt.weight.data.mul_(0.01)
             nn.init.constant_(halt.bias, -3.5)
 
-        # SubLN Post-RMSNorm：子层输出归一化，防止深层梯度消失
-        # 原理：Pre-LN 仅归一化子层输入，输出 ‖W_out‖ 增长会放大反向梯度，
-        # 浅层正反馈加速 → 深层梯度饥饿。Post-RMSNorm 将 J_k ∝ gain/RMS(f_l)，
-        # ‖W_out‖ 增长被 RMS(f_l) 增长抵消，自动增益控制。
-        # gain 初始化: (2·num_layers)^{-1/2}，使 ‖h_L‖² ≈ 2‖h_0‖²
-        self.block_post_norm = RMSNorm(D)
-        self.ffn_post_norm = RMSNorm(D)
-        post_norm_gain = (2 * num_layers) ** -0.5
-        self.block_post_norm.weight.data.fill_(post_norm_gain)
-        self.ffn_post_norm.weight.data.fill_(post_norm_gain)
-
-        # SubLN gain clamp 范围（防止正反馈失控或 gain 塌缩）
-        self._gain_min = post_norm_gain * 0.25
-        self._gain_max = post_norm_gain * 3.0
+        # ====== mHC 超连接（替代 SubLN PostNorm + gain clamp）======
+        # Birkhoff 多面体约束代替 SubLN 的自动增益控制
+        self.block_hc = HyperConnection(
+            n=n_hc_streams, D=D, sinkhorn_iters=sinkhorn_iters,
+        )
+        self.ffn_hc = HyperConnection(
+            n=n_hc_streams, D=D, sinkhorn_iters=sinkhorn_iters,
+        )
 
     def _input_neuron_parallel(self, input_neuron, x):
         """
@@ -286,43 +280,46 @@ class SNNDecoderLayer(base.MemoryModule):
 
         return aggregated, ponder_cost, expected_k.detach(), ek_floor_cost
 
-    def forward(self, h):
+    def forward(self, h_streams):
         """前向传播入口（FSDP 兼容）。
 
         FSDP 通过 __call__ 触发参数聚合钩子，必须由此方法作为入口，
         而非直接调用 forward_parallel（会绕过 FSDP 钩子导致参数未聚合）。
         单卡/DDP 训练及推理可直接调用 forward_parallel。
 
+        Args:
+            h_streams: (seq_len, batch, n, D) — n 流残差
+
         Returns:
-            h: (TK, batch, D) — 连续值输出
+            h_streams: (seq_len, batch, n, D) — 更新后的 n 流残差
             ponder_cost: scalar — 两个子层的平均期望步数
             ek_floor_cost: scalar — E[K] 下界惩罚（PonderNet 坍缩遏制）
         """
-        return self.forward_parallel(h)
+        return self.forward_parallel(h_streams)
 
-    def forward_parallel(self, h):
+    def forward_parallel(self, h_streams):
         """
-        并行前向传播：连续残差流 + 脉冲电流激活 + 动态 K 帧聚合。
+        并行前向传播：mHC 多流残差 + 脉冲电流激活 + 动态 K 帧聚合。
 
-        SNN 子层在 TK 维度处理（K 步时间动力学），神经元输出脉冲电流
-        (V_th × spike)，经投影后用 PonderNet 自适应聚合 K 帧
-        （不同 token 有效步数不同），经 out_proj 投影后广播回 TK 做残差。
+        流程（每子层）:
+          1. HyperConnection.pre: n 流 → 1 维子层输入
+          2. 展开到 TK: (seq_len, batch, D) → (TK, batch, D)
+          3. RMSNorm → PLIFNode(spike_current) → SNN子层 → (TK, batch, D)
+          4. PonderNet K 帧聚合 → (seq_len, batch, D)
+          5. out_proj 投影
+          6. HyperConnection.post: 残差混合 + 分配 → n 流
 
         Args:
-            h: (TK, batch, D) — 连续值输入（残差流）
+            h_streams: (seq_len, batch, n, D) — n 流残差
 
         Returns:
-            h: (TK, batch, D) — 连续值输出（残差流）
-            ponder_cost: scalar — 两个子层的平均期望步数（正则化用）
+            h_streams: (seq_len, batch, n, D) — 更新后的 n 流残差
+            ponder_cost: scalar — 两个子层的平均期望步数
+            ek_floor_cost: scalar — E[K] 下界惩罚
         """
-        TK, batch, D = h.shape
+        seq_len, batch, n, D = h_streams.shape
         K = self.K
-        seq_len = TK // K
-
-        # ====== SubLN gain clamp: 防止正反馈失控 ======
-        with torch.no_grad():
-            self.block_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
-            self.ffn_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
+        TK = seq_len * K
 
         # ====== MPD-AGL: 自适应 surrogate gradient 宽度 ======
         # 根据每层当前参数动态调整 alpha，使 surrogate 有效区间匹配膜电位分布
@@ -357,85 +354,105 @@ class SNNDecoderLayer(base.MemoryModule):
             self._alpha_input2 = self.input_neuron2.surrogate_function.alpha
             self._alpha_ffn = self.snn_ffn.gate_neuron.surrogate_function.alpha
 
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode(spike_current) → SNNBlock → 动态K聚合 → out_proj → 残差
-        v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
+        # ====== 子层 1: SNNBlock ======
+        # HC pre: n 流 → 1 维子层输入
+        h_pre, cache_block = self.block_hc.pre(h_streams)  # (seq_len, batch, D)
+        # 展开到 TK: (seq_len, batch, D) → (TK, batch, D)
+        h_tk = h_pre.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
+        del h_pre
+
+        # RMSNorm → PLIFNode(spike_current) → SNNBlock
+        v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h_tk))
+        del h_tk
         with torch.no_grad():
             self._fr_input1 = v_in.count_nonzero().item() / max(v_in.numel(), 1)
-        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
+        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D)
         del v_in
 
-        # 动态 K 帧聚合（PonderNet）: (TK, batch, D) → (seq_len, K, batch, D) → 加权 → (seq_len, batch, D)
+        # PonderNet K 帧聚合
         frames_block = cont_block.view(seq_len, K, batch, D)
         del cont_block
-        combined_block, pc_block, ek_block, efc_block = self._adaptive_aggregate(frames_block, self.block_halt)
+        combined_block, pc_block, ek_block, efc_block = self._adaptive_aggregate(
+            frames_block, self.block_halt)
         del frames_block
+
+        # 输出投影
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
         del combined_block
-        res_block = self.block_post_norm(res_block)  # SubLN: 自动增益控制
 
-        # 广播回 TK：view-based 广播避免显存复制
-        # res_block: (seq_len, batch, D) → (seq_len, 1, batch, D) → broadcast (seq_len, K, batch, D) → (TK, batch, D)
-        h = h + res_block.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
+        # HC post: 残差混合 + 分配 → n 流
+        h_streams = self.block_hc.post(h_streams, res_block, cache_block)
         del res_block
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode(spike_current) → SNNFFN → 动态K聚合 → out_proj → 残差
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
+        # ====== 子层 2: SNNFFN ======
+        # HC pre: n 流 → 1 维子层输入
+        h_pre2, cache_ffn = self.ffn_hc.pre(h_streams)  # (seq_len, batch, D)
+        h_tk2 = h_pre2.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
+        del h_pre2
+
+        # RMSNorm → PLIFNode(spike_current) → SNNFFN
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h_tk2))
+        del h_tk2
         with torch.no_grad():
             self._fr_input2 = v_in2.count_nonzero().item() / max(v_in2.numel(), 1)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
         del v_in2
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
         del cont_ffn
-        combined_ffn, pc_ffn, ek_ffn, efc_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        combined_ffn, pc_ffn, ek_ffn, efc_ffn = self._adaptive_aggregate(
+            frames_ffn, self.ffn_halt)
         del frames_ffn
-        res_ffn = self.ffn_out_proj(combined_ffn)
-        del combined_ffn
-        res_ffn = self.ffn_post_norm(res_ffn)  # SubLN: 自动增益控制
 
-        h = h + res_ffn.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
+        res_ffn = self.ffn_out_proj(combined_ffn)  # (seq_len, batch, D)
+        del combined_ffn
+
+        # HC post: 残差混合 + 分配 → n 流
+        h_streams = self.ffn_hc.post(h_streams, res_ffn, cache_ffn)
         del res_ffn
 
         ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均
         ek_floor_cost = (efc_block + efc_ffn) / 2.0  # E[K] 下界惩罚
 
         # 存储 per-token E[K] 范围（诊断用，不影响计算图）
-        # ek_block/ek_ffn: (seq_len, batch), detached
         with torch.no_grad():
             all_ek = torch.cat([ek_block.flatten(), ek_ffn.flatten()])
             self._ek_min = all_ek.min().item()
             self._ek_max = all_ek.max().item()
 
-        return h, ponder_cost, ek_floor_cost
+        return h_streams, ponder_cost, ek_floor_cost
 
-    def single_step_forward(self, h):
+    def single_step_forward(self, h_streams):
         """
-        单步前向传播：连续残差流。
+        单步前向传播：n 流残差。
 
         注意：单步模式无法做动态 K 聚合（每步独立处理）。
         训练和推理均使用 forward_parallel（含动态 K 聚合）。
         此方法仅用于调试。
 
         Args:
-            h: (batch, D) — 连续值输入
+            h_streams: (batch, n, D) — n 流残差
 
         Returns:
-            h: (batch, D) — 连续值输出
+            h_streams: (batch, n, D) — 更新后的 n 流残差
             ponder_cost: scalar — 0.0（单步无 ponder cost）
+            ek_floor_cost: scalar — 0.0
         """
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode → spike_current → SNNBlock → out_proj → 残差
-        spike1 = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
-        v_in = spike_current_activation(spike1, self.input_neuron1.v_th)  # V_th × spike
+        # 子层 1: SNNBlock
+        h_pre, cache_block = self.block_hc.pre(h_streams)  # (batch, D)
+        spike1 = self.input_neuron1(self.block_norm(h_pre))
+        v_in = spike_current_activation(spike1, self.input_neuron1.v_th)
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
-        h = h + self.block_post_norm(res_block)
+        h_streams = self.block_hc.post(h_streams, res_block, cache_block)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode → spike_current → SNNFFN → out_proj → 残差
-        spike2 = self.input_neuron2(self.ffn_norm(h))
-        v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)  # V_th × spike
+        # 子层 2: SNNFFN
+        h_pre2, cache_ffn = self.ffn_hc.pre(h_streams)  # (batch, D)
+        spike2 = self.input_neuron2(self.ffn_norm(h_pre2))
+        v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
-        h = h + self.ffn_post_norm(res_ffn)
+        h_streams = self.ffn_hc.post(h_streams, res_ffn, cache_ffn)
 
-        _zero = torch.tensor(0.0, device=h.device)
-        return h, _zero, _zero
+        _zero = torch.tensor(0.0, device=h_streams.device)
+        return h_streams, _zero, _zero

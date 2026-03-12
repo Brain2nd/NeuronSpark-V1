@@ -149,6 +149,7 @@ def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tok
                 'K': raw_model.K,
                 'num_layers': raw_model.num_layers,
                 'D_ff': raw_model.D_ff,
+                'n_hc_streams': raw_model.n_hc_streams,
             },
         }, path)
         print(f"  → Checkpoint saved: {path}")
@@ -206,6 +207,8 @@ def init_model(args, local_rank, rank):
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
         ek_floor=args.ek_floor,
+        n_hc_streams=args.n_hc_streams,
+        sinkhorn_iters=args.sinkhorn_iters,
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -290,9 +293,6 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 # E[K] 下界惩罚（遏制 PonderNet 坍缩: 深层 E[K] → 1 的死亡螺旋）
                 if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
                     loss = loss + args.ek_floor_weight * out.ek_floor_cost / args.accumulation_steps
-                # SNVR: 层间权重范数方差正则化（遏制 Jacobian 谱范数发散）
-                if out.snvr_cost is not None and args.snvr_weight > 0:
-                    loss = loss + args.snvr_weight * out.snvr_cost / args.accumulation_steps
                 # b_th L2 正则化（遏制 10×LR 下 V_th 漂移 → MPD alpha 崩溃）
                 if out.b_th_reg_cost is not None and args.b_th_reg_weight > 0:
                     loss = loss + args.b_th_reg_weight * out.b_th_reg_cost / args.accumulation_steps
@@ -414,10 +414,12 @@ if __name__ == "__main__":
                         help='E[K] 下界: 低于此值时产生惩罚（遏制 PonderNet 坍缩）')
     parser.add_argument('--ek_floor_weight', type=float, default=0.1,
                         help='E[K] 下界惩罚权重')
-    parser.add_argument('--snvr_weight', type=float, default=0.01,
-                        help='SNVR 层间权重范数方差正则化权重')
     parser.add_argument('--b_th_reg_weight', type=float, default=0.01,
                         help='b_th L2 正则化权重（遏制 V_th 漂移）')
+    parser.add_argument('--n_hc_streams', type=int, default=4,
+                        help='mHC 超连接流数量（Birkhoff 多面体约束）')
+    parser.add_argument('--sinkhorn_iters', type=int, default=20,
+                        help='Sinkhorn-Knopp 迭代次数')
 
     # FSDP 参数
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
@@ -468,7 +470,7 @@ if __name__ == "__main__":
     _pg = model.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
-    _no_decay_keys = {'rms_norms', 'norm', 'halt_projs', 'embedding'}
+    _no_decay_keys = {'rms_norms', 'norm', 'halt_projs', 'embedding', 'hc_params'}
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     no_decay_params = [p for k in _no_decay_keys if k in _pg for p in _pg[k]]
     decay_params = [p for k, ps in _pg.items()
@@ -528,7 +530,7 @@ if __name__ == "__main__":
     Logger(f"\n{'='*60}", rank)
     Logger(f"SNN Language Model Pretraining (FSDP, {world_size} GPUs)", rank)
     Logger(f"  Vocab:       {args.vocab_size}", rank)
-    Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}", rank)
+    Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}, mHC_n={args.n_hc_streams}", rank)
     Logger(f"  Data:        {args.data_path}", rank)
     Logger(f"  Samples:     {len(train_ds):,}", rank)
     Logger(f"  Max length:  {args.max_length}", rank)

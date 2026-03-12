@@ -267,12 +267,23 @@ class SNNDashboard:
                     w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
                                  halt.bias.data.item(), step)
 
-            # SubLN Post-RMSNorm gain 监控（诊断深层梯度均衡）
+            # mHC H_res 对角占优度监控（诊断流混合程度）
             with torch.no_grad():
-                w.add_scalar(f"post_norm/layer_{i:02d}/block_gain_mean",
-                             layer_module.block_post_norm.weight.data.mean().item(), step)
-                w.add_scalar(f"post_norm/layer_{i:02d}/ffn_gain_mean",
-                             layer_module.ffn_post_norm.weight.data.mean().item(), step)
+                for hc_name, hc in [('block_hc', layer_module.block_hc),
+                                     ('ffn_hc', layer_module.ffn_hc)]:
+                    # H_res 的 bias 对角值均值 vs 非对角均值
+                    b_res = hc.b_res.data
+                    n = b_res.shape[0]
+                    diag_mean = b_res.diagonal().mean().item()
+                    off_diag_mask = ~torch.eye(n, dtype=torch.bool, device=b_res.device)
+                    off_diag_mean = b_res[off_diag_mask].mean().item()
+                    w.add_scalar(f"hc_res/layer_{i:02d}/{hc_name}/diag_mean",
+                                 diag_mean, step)
+                    w.add_scalar(f"hc_res/layer_{i:02d}/{hc_name}/offdiag_mean",
+                                 off_diag_mean, step)
+                    # alpha 动态性
+                    w.add_scalar(f"hc_alpha/layer_{i:02d}/{hc_name}/alpha_res",
+                                 hc.alpha_res.data.item(), step)
 
             # MPD-AGL 自适应 surrogate alpha 监控
             for attr, tag in [('_alpha_input1', 'input1'),
@@ -354,17 +365,21 @@ class SNNDashboard:
         """
         w = self._writer
 
-        # ====== 1. SubLN gain 健康度 ======
-        gains = []
+        # ====== 1. mHC H_res 健康度（替代 SubLN gain）======
+        # 监控 H_res bias 对角占优度，衡量流混合程度
+        hc_diag_ratios = []
         for layer_module in model.layers:
-            gains.append(layer_module.block_post_norm.weight.data.mean().item())
-            gains.append(layer_module.ffn_post_norm.weight.data.mean().item())
-        gain_max = max(gains)
-        gain_min = min(gains) if min(gains) > 0 else 1e-8
-        gain_ratio = gain_max / gain_min
-        gain_gini = self._gini(gains)
-        w.add_scalar("health/gain_ratio", gain_ratio, step)
-        w.add_scalar("health/gain_gini", gain_gini, step)
+            for hc in [layer_module.block_hc, layer_module.ffn_hc]:
+                b_res = hc.b_res.data
+                n = b_res.shape[0]
+                diag_val = b_res.diagonal().mean().item()
+                off_mask = ~torch.eye(n, dtype=torch.bool, device=b_res.device)
+                off_val = b_res[off_mask].mean().item()
+                hc_diag_ratios.append(diag_val / (abs(off_val) + 1e-8))
+        gain_ratio = max(hc_diag_ratios) / (min(hc_diag_ratios) + 1e-8) if hc_diag_ratios else 1.0
+        gain_gini = self._gini(hc_diag_ratios) if hc_diag_ratios else 0.0
+        w.add_scalar("health/hc_diag_ratio_spread", gain_ratio, step)
+        w.add_scalar("health/hc_diag_gini", gain_gini, step)
 
         # ====== 2. MPD alpha 健康度 ======
         alphas = []
@@ -425,7 +440,7 @@ class SNNDashboard:
 
         # ====== 5. 综合得分（0~1，1=健康） ======
         # 各维度打分后加权平均
-        s_gain = max(0.0, 1.0 - (gain_ratio - 1.0) / 4.0)  # ratio=1 → 1.0, ratio≥5 → 0.0
+        s_gain = max(0.0, 1.0 - gain_gini * 2.0)  # gini=0 → 1.0, gini≥0.5 → 0.0
         s_mpd = max(0.0, 1.0 - mpd_floor_rate * 2.0)  # 0% floor → 1.0, ≥50% → 0.0
         s_grad = max(0.0, 1.0 - grad_gini * 2.0)  # gini=0 → 1.0, gini≥0.5 → 0.0
         s_fr = max(0.0, 1.0 - (fr_dead + fr_saturated) * 2.0)  # 0% dead/sat → 1.0

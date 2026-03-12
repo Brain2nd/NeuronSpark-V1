@@ -48,6 +48,7 @@ from .lateral_inhibition import LateralInhibition
 from .snn_block import SNNBlock
 from .snn_ffn import SNNFFN
 from .snn_decoder_layer import SNNDecoderLayer
+from .hyper_connection import HyperConnection, sinkhorn_log, sinkhorn_projection
 from .parallel_scan import hillis_steele_scan, linear_recurrence, plif_parallel_forward
 from .fp16_codec import fp16_encode, fp16_decode
 from .rms_norm import RMSNorm

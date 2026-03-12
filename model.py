@@ -663,7 +663,8 @@ class SNNLanguageModel(nn.Module):
             'ffn_skip_proj': [],
             'ffn_neurons': [],
             # mHC 超连接参数
-            'hc_params': [],
+            'hc_theta': [],   # theta 投影权重（需要 weight decay 遏制爆炸）
+            'hc_params': [],  # norm/bias/alpha（不需要 weight decay）
         }
 
         for layer_module in self.layers:
@@ -712,13 +713,16 @@ class SNNLanguageModel(nn.Module):
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
             ])
 
-            # mHC 超连接参数
+            # mHC 超连接参数: theta 需要 weight decay（防止 94,728% 爆炸），其余不需要
             for hc in [layer_module.block_hc, layer_module.ffn_hc]:
+                groups['hc_theta'].extend([
+                    hc.theta_pre, hc.theta_post, hc.theta_res,
+                ])
                 groups['hc_params'].extend([
                     hc.norm.weight,
-                    hc.theta_pre, hc.b_pre, hc.alpha_pre,
-                    hc.theta_post, hc.b_post, hc.alpha_post,
-                    hc.theta_res, hc.b_res, hc.alpha_res,
+                    hc.b_pre, hc.alpha_pre,
+                    hc.b_post, hc.alpha_post,
+                    hc.b_res, hc.alpha_res,
                 ])
 
         return groups

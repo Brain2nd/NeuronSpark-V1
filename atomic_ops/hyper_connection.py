@@ -12,15 +12,20 @@ HyperConnection: 流形约束超连接（DeepSeek mHC, arXiv 2512.24880）
 
 动态 H 矩阵（输入依赖，条件信号 = vec(x_l) 展平 nD 维）:
   c = RMSNorm(vec(x_l))                                    ∈ R^{nD}
-  H_pre  = σ(α_pre · (c @ θ_pre) + b_pre)                 ∈ (0,1)^n
+  H_pre  = softmax(α_pre · (c @ θ_pre) + b_pre) / √(Σw²)  ∈ R^n, 方差保持
   H_post = 2·σ(α_post · (c @ θ_post) + b_post)            ∈ (0,2)^n
   H_res  = Sinkhorn(α_res · (c @ θ_res) + b_res)          ∈ DS^{n×n}
 
-初始化（精确等价标准残差，streams 相同时）:
+SNN 适配（vs 原始 mHC 论文）:
+  - H_pre 用 softmax 替代 sigmoid: 凸组合保证权重和 = 1
+  - 方差重归一化 ÷√(Σw_i²): 防止凸组合压缩方差导致膜电位低于阈值
+  - b_res = 3.5·I: 减小谱间隙（λ₂ ≈ 0.04 vs 原 0.775），防止流快速同质化
+
+初始化:
   θ = 0, α = 0.01
-  b_pre = logit(1/n) → sigmoid = 1/n → H_pre @ x = x
+  b_pre = 0 → softmax(0) = 1/n（均匀聚合）
   b_post ≈ 0 + noise → 2·sigmoid ≈ 1.0 ± 5%（打破流间对称）
-  b_res = I → Sinkhorn(I) 对角占优（streams 相同时乘以行和=1 → 等价 I）
+  b_res = 3.5·I → Sinkhorn 后对角 ≈ 0.92（强流身份保持）
 
 Sinkhorn 梯度:
   直接反传 Sinkhorn 迭代会导致梯度指数衰减（Jacobian 谱半径 < 1）。
@@ -147,9 +152,9 @@ class HyperConnection(nn.Module):
         # 输入归一化（条件信号 = vec(x_l) 展平 nD 维，保留完整流间信息）
         self.norm = RMSNorm(n * D)
 
-        # H_pre: 聚合权重 — 哪些流参与子层输入
+        # H_pre: 聚合权重 — softmax + 方差重归一化（SNN 阈值兼容）
         self.theta_pre = nn.Parameter(torch.zeros(n * D, n))
-        self.b_pre = nn.Parameter(torch.full((n,), -math.log(n - 1)))  # sigmoid → 1/n
+        self.b_pre = nn.Parameter(torch.zeros(n))  # softmax(0) = 1/n
         self.alpha_pre = nn.Parameter(torch.tensor([alpha_init]))
 
         # H_post: 分配权重 — 子层输出如何分配到各流
@@ -159,8 +164,9 @@ class HyperConnection(nn.Module):
         self.alpha_post = nn.Parameter(torch.tensor([alpha_init]))
 
         # H_res: 残差混合矩阵 — 双随机约束，谱范数 ≤ 1
+        # b_res = 3.5·I: 减小谱间隙（λ₂ ≈ 0.04），防止流在 3 层内同质化
         self.theta_res = nn.Parameter(torch.zeros(n * D, n * n))
-        self.b_res = nn.Parameter(torch.eye(n))  # Sinkhorn(I) → 对角占优
+        self.b_res = nn.Parameter(3.5 * torch.eye(n))  # Sinkhorn(3.5I) → 对角 ≈ 0.92
         self.alpha_res = nn.Parameter(torch.tensor([alpha_init]))
 
     def _compute_H(self, x):
@@ -170,7 +176,7 @@ class HyperConnection(nn.Module):
             x: (*, n, D) — n 流输入
 
         Returns:
-            H_pre:  (*, 1, n) — 聚合权重
+            H_pre:  (*, 1, n) — 聚合权重（softmax + 方差重归一化，非凸组合）
             H_post: (*, n)    — 分配权重
             H_res:  (*, n, n) — 双随机混合矩阵
         """
@@ -178,9 +184,14 @@ class HyperConnection(nn.Module):
         x_flat = x.flatten(-2)  # (*, n, D) → (*, nD)
         x_norm = self.norm(x_flat)  # (*, nD)
 
-        # H_pre: σ(·) → (0, 1)^n，聚合各流的相对贡献
+        # H_pre: softmax → 凸组合 + 方差重归一化（SNN 阈值兼容）
+        # sigmoid 使各权重独立 ∈ (0,1)，凸组合 Var 压缩 Σw² 倍 → 膜电位低于阈值
+        # softmax 保证 Σw=1; ÷√(Σw²) 补偿方差压缩: Var(x_pre) = σ²
+        # 初始 w=1/n 时 renorm=√n，被下游 RMSNorm 吸收
         pre_logits = self.alpha_pre * (x_norm @ self.theta_pre) + self.b_pre
-        H_pre = torch.sigmoid(pre_logits).unsqueeze(-2)  # (*, 1, n)
+        H_pre_w = torch.softmax(pre_logits, dim=-1)  # (*, n), Σ=1
+        renorm = torch.rsqrt((H_pre_w * H_pre_w).sum(dim=-1, keepdim=True).clamp(min=1e-8))
+        H_pre = (H_pre_w * renorm).unsqueeze(-2)  # (*, 1, n) 融合方差重归一化
 
         # H_post: 2·σ(·) → (0, 2)^n，子层输出的分配强度
         post_logits = self.alpha_post * (x_norm @ self.theta_post) + self.b_post

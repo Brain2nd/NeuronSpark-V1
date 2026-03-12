@@ -366,19 +366,20 @@ class SNNDashboard:
         w = self._writer
 
         # ====== 1. mHC H_res 健康度（替代 SubLN gain）======
-        # 监控 H_res bias 对角占优度，衡量流混合程度
-        hc_diag_ratios = []
+        # 用 Sinkhorn 投影后的实际 H_res 对角值（而非 raw b_res log 域参数）
+        # raw b_res off-diag 趋近 0 时 ratio 分母 1e-8，对微小扰动极端敏感
+        from atomic_ops.hyper_connection import sinkhorn_log
+        hc_diag_vals = []
         for layer_module in model.layers:
             for hc in [layer_module.block_hc, layer_module.ffn_hc]:
-                b_res = hc.b_res.data
-                n = b_res.shape[0]
-                diag_val = b_res.diagonal().mean().item()
-                off_mask = ~torch.eye(n, dtype=torch.bool, device=b_res.device)
-                off_val = b_res[off_mask].mean().item()
-                hc_diag_ratios.append(diag_val / (abs(off_val) + 1e-8))
-        gain_ratio = max(hc_diag_ratios) / (min(hc_diag_ratios) + 1e-8) if hc_diag_ratios else 1.0
-        gain_gini = self._gini(hc_diag_ratios) if hc_diag_ratios else 0.0
-        w.add_scalar("health/hc_diag_ratio_spread", gain_ratio, step)
+                with torch.no_grad():
+                    H_res = sinkhorn_log(hc.b_res.data.unsqueeze(0),
+                                         num_iters=hc.sinkhorn_iters).squeeze(0)
+                    diag_mean = H_res.diagonal().mean().item()
+                hc_diag_vals.append(diag_mean)
+        gain_gini = self._gini(hc_diag_vals) if hc_diag_vals else 0.0
+        w.add_scalar("health/hc_diag_mean_spread",
+                      max(hc_diag_vals) - min(hc_diag_vals) if hc_diag_vals else 0.0, step)
         w.add_scalar("health/hc_diag_gini", gain_gini, step)
 
         # ====== 2. MPD alpha 健康度 ======

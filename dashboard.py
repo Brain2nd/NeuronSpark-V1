@@ -96,6 +96,7 @@ class SNNDashboard:
             self._log_param_norms(step, metrics_dict.get('lr', 1e-4))
             self._log_neuron_dynamics(step)
             self._log_dynamic_k(step, model)
+            self._log_health(step, model)
 
     def log_save_point(self, step, model):
         """每 save_interval 步调用：直方图 + 补偿因子。"""
@@ -185,7 +186,7 @@ class SNNDashboard:
         """记录训练标量：loss, ppl, lr, tps, tokens_seen, ponder_cost, snvr/ek_floor, memory。"""
         w = self._writer
         for key in ('loss', 'ppl', 'lr', 'tps', 'tokens_seen',
-                     'ponder_cost', 'snvr_cost', 'ek_floor_cost'):
+                     'ponder_cost', 'snvr_cost', 'ek_floor_cost', 'b_th_reg_cost'):
             if key in metrics:
                 w.add_scalar(f"train/{key}", metrics[key], step)
         if 'memory_current_gb' in metrics:
@@ -282,6 +283,19 @@ class SNNDashboard:
                 if val is not None:
                     w.add_scalar(f"mpd_alpha/layer_{i:02d}/{tag}", val, step)
 
+            # 发放率监控
+            for attr, tag in [('_fr_input1', 'input1'), ('_fr_input2', 'input2')]:
+                val = getattr(layer_module, attr, None)
+                if val is not None:
+                    w.add_scalar(f"firing_rate/layer_{i:02d}/{tag}", val, step)
+            fr_hidden = getattr(layer_module.snn_block, '_firing_rate_hidden', None)
+            if fr_hidden is not None:
+                w.add_scalar(f"firing_rate/layer_{i:02d}/hidden", fr_hidden, step)
+            for attr, tag in [('_fr_gate', 'gate'), ('_fr_up', 'up'), ('_fr_gated', 'gated')]:
+                val = getattr(layer_module.snn_ffn, attr, None)
+                if val is not None:
+                    w.add_scalar(f"firing_rate/layer_{i:02d}/{tag}", val, step)
+
     # ====== 重量日志（每 save_interval 步） ======
 
     def _log_histograms(self, step):
@@ -316,3 +330,104 @@ class SNNDashboard:
                 w.add_scalar(
                     f"compensation/layer_{i:02d}/softplus_deriv_mean",
                     softplus_deriv, step)
+
+    # ====== 健康监控（每 log_interval 步） ======
+
+    @staticmethod
+    def _gini(values):
+        """计算 Gini 系数（衡量不均匀度，0=完全均匀，1=完全集中）。"""
+        if len(values) < 2:
+            return 0.0
+        vals = sorted(values)
+        n = len(vals)
+        total = sum(vals)
+        if total < 1e-12:
+            return 0.0
+        cum = sum((i + 1) * v for i, v in enumerate(vals))
+        return (2.0 * cum) / (n * total) - (n + 1) / n
+
+    def _log_health(self, step, model):
+        """综合健康监控：gain/梯度/发放率/MPD alpha 早期预警。
+
+        health/score: 0~1 综合得分（1=健康，<0.5 需要关注）
+        各子项独立记录，方便定位问题根源。
+        """
+        w = self._writer
+
+        # ====== 1. SubLN gain 健康度 ======
+        gains = []
+        for layer_module in model.layers:
+            gains.append(layer_module.block_post_norm.weight.data.mean().item())
+            gains.append(layer_module.ffn_post_norm.weight.data.mean().item())
+        gain_max = max(gains)
+        gain_min = min(gains) if min(gains) > 0 else 1e-8
+        gain_ratio = gain_max / gain_min
+        gain_gini = self._gini(gains)
+        w.add_scalar("health/gain_ratio", gain_ratio, step)
+        w.add_scalar("health/gain_gini", gain_gini, step)
+
+        # ====== 2. MPD alpha 健康度 ======
+        alphas = []
+        for layer_module in model.layers:
+            for attr in ('_alpha_input1', '_alpha_hidden', '_alpha_input2', '_alpha_ffn'):
+                val = getattr(layer_module, attr, None)
+                if val is not None:
+                    alphas.append(val)
+        mpd_floor_rate = sum(1 for a in alphas if a <= 2.01) / max(len(alphas), 1)
+        mpd_alpha_min = min(alphas) if alphas else 0.0
+        w.add_scalar("health/mpd_floor_rate", mpd_floor_rate, step)
+        w.add_scalar("health/mpd_alpha_min", mpd_alpha_min, step)
+
+        # ====== 3. 层间梯度 Gini 系数 ======
+        cache = self._grad_cache
+        layer_grad_sums = {}
+        for name, grad_norm in cache.items():
+            parts = name.split('.')
+            if parts[0] == 'layers' and parts[1].isdigit():
+                idx = int(parts[1])
+                layer_grad_sums[idx] = layer_grad_sums.get(idx, 0.0) + grad_norm ** 2
+        if len(layer_grad_sums) >= 2:
+            layer_norms = [v ** 0.5 for v in layer_grad_sums.values()]
+            grad_gini = self._gini(layer_norms)
+            w.add_scalar("health/grad_gini", grad_gini, step)
+            # 每层梯度份额
+            total_gn = sum(layer_norms)
+            for idx in sorted(layer_grad_sums.keys()):
+                share = (layer_grad_sums[idx] ** 0.5) / (total_gn + 1e-12)
+                w.add_scalar(f"grad_share/layer_{idx:02d}", share, step)
+        else:
+            grad_gini = 0.0
+
+        # ====== 4. 发放率健康度 ======
+        all_frs = []
+        for layer_module in model.layers:
+            for attr in ('_fr_input1', '_fr_input2'):
+                val = getattr(layer_module, attr, None)
+                if val is not None:
+                    all_frs.append(val)
+            val = getattr(layer_module.snn_block, '_firing_rate_hidden', None)
+            if val is not None:
+                all_frs.append(val)
+            for attr in ('_fr_gate', '_fr_up'):
+                val = getattr(layer_module.snn_ffn, attr, None)
+                if val is not None:
+                    all_frs.append(val)
+        if all_frs:
+            fr_dead = sum(1 for f in all_frs if f < 0.001) / len(all_frs)
+            fr_saturated = sum(1 for f in all_frs if f > 0.8) / len(all_frs)
+            w.add_scalar("health/fr_dead_neurons", fr_dead, step)
+            w.add_scalar("health/fr_saturated_neurons", fr_saturated, step)
+            w.add_scalar("health/fr_min", min(all_frs), step)
+            w.add_scalar("health/fr_max", max(all_frs), step)
+        else:
+            fr_dead = 0.0
+            fr_saturated = 0.0
+
+        # ====== 5. 综合得分（0~1，1=健康） ======
+        # 各维度打分后加权平均
+        s_gain = max(0.0, 1.0 - (gain_ratio - 1.0) / 4.0)  # ratio=1 → 1.0, ratio≥5 → 0.0
+        s_mpd = max(0.0, 1.0 - mpd_floor_rate * 2.0)  # 0% floor → 1.0, ≥50% → 0.0
+        s_grad = max(0.0, 1.0 - grad_gini * 2.0)  # gini=0 → 1.0, gini≥0.5 → 0.0
+        s_fr = max(0.0, 1.0 - (fr_dead + fr_saturated) * 2.0)  # 0% dead/sat → 1.0
+        score = 0.3 * s_gain + 0.25 * s_mpd + 0.25 * s_grad + 0.2 * s_fr
+        w.add_scalar("health/score", score, step)

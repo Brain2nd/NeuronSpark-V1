@@ -199,6 +199,10 @@ class SNNBlock(base.MemoryModule):
         self.hidden_neuron.v = V_post_hidden[-1].detach()
         del V_post_hidden
 
+        # 发放率监控（诊断用，不影响计算图）
+        with torch.no_grad():
+            self._firing_rate_hidden = s_hidden.sum().item() / max(s_hidden.numel(), 1)
+
         # ====== Phase 4: 输出投影（spike_current → W_out）======
         sc_hidden = spike_current_activation(s_hidden, v_th_all)
         del s_hidden, v_th_all

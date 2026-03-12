@@ -70,7 +70,7 @@ def _mpd_alpha(beta_mean: float, vth_mean: float, gamma_mean: float = 1.0) -> fl
     C = 4.0 * math.sqrt(1.25) * 0.5  # ≈ 2.236
     width = math.sqrt(1.0 + beta_mean ** 2) * gamma_mean * max(vth_mean, 0.01)
     alpha = C / max(width, 1e-6)
-    return max(1.0, min(alpha, 16.0))
+    return max(2.0, min(alpha, 16.0))
 
 
 def _fused_geometric_halt(halt_logits):
@@ -197,6 +197,10 @@ class SNNDecoderLayer(base.MemoryModule):
         self.block_post_norm.weight.data.fill_(post_norm_gain)
         self.ffn_post_norm.weight.data.fill_(post_norm_gain)
 
+        # SubLN gain clamp 范围（防止正反馈失控或 gain 塌缩）
+        self._gain_min = post_norm_gain * 0.25
+        self._gain_max = post_norm_gain * 3.0
+
     def _input_neuron_parallel(self, input_neuron, x):
         """
         输入 PLIF 神经元的 parallel scan 前向传播。
@@ -315,6 +319,11 @@ class SNNDecoderLayer(base.MemoryModule):
         K = self.K
         seq_len = TK // K
 
+        # ====== SubLN gain clamp: 防止正反馈失控 ======
+        with torch.no_grad():
+            self.block_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
+            self.ffn_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
+
         # ====== MPD-AGL: 自适应 surrogate gradient 宽度 ======
         # 根据每层当前参数动态调整 alpha，使 surrogate 有效区间匹配膜电位分布
         with torch.no_grad():
@@ -350,6 +359,8 @@ class SNNDecoderLayer(base.MemoryModule):
 
         # 子层 1: SNNBlock — RMSNorm → PLIFNode(spike_current) → SNNBlock → 动态K聚合 → out_proj → 残差
         v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
+        with torch.no_grad():
+            self._fr_input1 = v_in.count_nonzero().item() / max(v_in.numel(), 1)
         cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
         del v_in
 
@@ -369,6 +380,8 @@ class SNNDecoderLayer(base.MemoryModule):
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode(spike_current) → SNNFFN → 动态K聚合 → out_proj → 残差
         v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
+        with torch.no_grad():
+            self._fr_input2 = v_in2.count_nonzero().item() / max(v_in2.numel(), 1)
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
         del v_in2
 

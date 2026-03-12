@@ -293,6 +293,9 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 # SNVR: 层间权重范数方差正则化（遏制 Jacobian 谱范数发散）
                 if out.snvr_cost is not None and args.snvr_weight > 0:
                     loss = loss + args.snvr_weight * out.snvr_cost / args.accumulation_steps
+                # b_th L2 正则化（遏制 10×LR 下 V_th 漂移 → MPD alpha 崩溃）
+                if out.b_th_reg_cost is not None and args.b_th_reg_weight > 0:
+                    loss = loss + args.b_th_reg_weight * out.b_th_reg_cost / args.accumulation_steps
 
             # 反向传播（bf16 不需要 GradScaler）
             loss.backward()
@@ -326,6 +329,7 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                                 'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
                                 'tokens_seen': tokens_seen,
                                 'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                                'b_th_reg_cost': out.b_th_reg_cost.item() if out.b_th_reg_cost is not None else 0.0,
                                 'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
                                 'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
                             }, raw_model, log_params=True)
@@ -412,6 +416,8 @@ if __name__ == "__main__":
                         help='E[K] 下界惩罚权重')
     parser.add_argument('--snvr_weight', type=float, default=0.01,
                         help='SNVR 层间权重范数方差正则化权重')
+    parser.add_argument('--b_th_reg_weight', type=float, default=0.01,
+                        help='b_th L2 正则化权重（遏制 V_th 漂移）')
 
     # FSDP 参数
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',

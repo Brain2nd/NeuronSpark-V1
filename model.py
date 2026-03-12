@@ -43,6 +43,7 @@ class SNNModelOutput:
     ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
     ek_floor_cost: Optional[torch.Tensor] = None  # E[K] 下界惩罚
     snvr_cost: Optional[torch.Tensor] = None  # 层间权重谱范数方差正则化
+    b_th_reg_cost: Optional[torch.Tensor] = None  # b_th L2 正则化（遏制 V_th 漂移）
 
 
 class SNNLanguageModel(nn.Module):
@@ -554,6 +555,8 @@ class SNNLanguageModel(nn.Module):
 
         # SNVR: 层间权重范数方差正则化（可微分，梯度流回权重）
         snvr_cost = self._compute_snvr_cost()
+        # b_th L2 正则化（遏制 10×LR 下 V_th 漂移）
+        b_th_reg_cost = self._compute_b_th_reg_cost()
 
         if target_ids is not None:
             logits_flat = logits.reshape(-1, self.vocab_size)
@@ -567,10 +570,12 @@ class SNNLanguageModel(nn.Module):
                 ponder_cost=ponder_cost,
                 ek_floor_cost=ek_floor_cost,
                 snvr_cost=snvr_cost,
+                b_th_reg_cost=b_th_reg_cost,
             )
 
         return SNNModelOutput(logits=logits, ponder_cost=ponder_cost,
-                              ek_floor_cost=ek_floor_cost, snvr_cost=snvr_cost)
+                              ek_floor_cost=ek_floor_cost, snvr_cost=snvr_cost,
+                              b_th_reg_cost=b_th_reg_cost)
 
     def _compute_snvr_cost(self) -> torch.Tensor:
         """Spectral Norm Variance Regularization: 惩罚同类权重跨层 Frobenius 范数方差。
@@ -604,6 +609,22 @@ class SNNLanguageModel(nn.Module):
             stacked = torch.stack(norms)
             total_var = total_var + stacked.var()
         return total_var
+
+    def _compute_b_th_reg_cost(self) -> torch.Tensor:
+        """b_th L2 正则化：遏制 V_th 漂移（10×LR + 0 weight_decay 下 b_th 无约束）。
+
+        b_th 通过 |·|+v_th_min 变换为 V_th(t)。10×LR 加速学习但无 weight decay 约束，
+        导致 b_th 绝对值持续增长 → V_th 漂移 → MPD alpha 崩溃。
+        L2 正则化提供软回复力，防止 b_th 远离初始分布。
+
+        Returns:
+            scalar — 所有层 b_th 的均方均值
+        """
+        total = torch.zeros(1, device=self.layers[0].block_out_proj.weight.device,
+                            dtype=torch.float32).squeeze()
+        for layer_module in self.layers:
+            total = total + layer_module.snn_block.b_th.pow(2).mean()
+        return total / len(self.layers)
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
         """

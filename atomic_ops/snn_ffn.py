@@ -148,6 +148,12 @@ class SNNFFN(base.MemoryModule):
         )
         del u_merged, v_init_merged  # Triton PLIF ctx 不保存 u，可安全释放 ~0.8 GiB
 
+        # 发放率监控（诊断用，不影响计算图）
+        with torch.no_grad():
+            _n_gate = spike_merged[:, :, :D_ff].numel()
+            self._fr_gate = spike_merged[:, :, :D_ff].sum().item() / max(_n_gate, 1)
+            self._fr_up = spike_merged[:, :, D_ff:].sum().item() / max(_n_gate, 1)
+
         # 脉冲电流作为激活值
         sc_merged = spike_current_activation(spike_merged, v_th_row.unsqueeze(0))
         del spike_merged
@@ -159,6 +165,8 @@ class SNNFFN(base.MemoryModule):
 
         # ====== Phase 3: 脉冲电流门控（sc_gate × sc_up，对标 SwiGLU）+ 降维 ======
         gated = gate_v * up_v  # (TK, batch, D_ff)
+        with torch.no_grad():
+            self._fr_gated = gated.count_nonzero().item() / max(gated.numel(), 1)
         del sc_merged, gate_v, up_v
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip

@@ -85,8 +85,7 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 # Checkpoint
 # ============================================================
 
-def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    max_keep=5):
+def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen):
     os.makedirs(save_dir, exist_ok=True)
     raw_model = model.module if isinstance(model, DDP) else model
     path = os.path.join(save_dir, f'ckpt_step{step}.pth')
@@ -108,12 +107,6 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
         },
     }, path)
     print(f"  → Checkpoint saved: {path}")
-
-    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-    while len(ckpts) > max_keep:
-        old = ckpts.pop(0)
-        os.remove(old)
-        print(f"  → Removed old checkpoint: {old}")
 
 
 def load_pretrained(path, model, device, rank):

@@ -89,9 +89,8 @@ def get_lr(it, all):
 # Checkpoint
 # ============================================================
 
-def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    max_keep=5):
-    """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
+def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen):
+    """保存训练状态，每次不覆盖（带步数）。"""
     os.makedirs(save_dir, exist_ok=True)
     raw = model.module if isinstance(model, torch.nn.DataParallel) else model
     path = os.path.join(save_dir, f'ckpt_step{step}.pth')
@@ -113,13 +112,6 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
         },
     }, path)
     Logger(f"  → Checkpoint saved: {path}")
-
-    # 清理旧 checkpoint，仅保留最新 max_keep 个
-    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-    while len(ckpts) > max_keep:
-        old = ckpts.pop(0)
-        os.remove(old)
-        Logger(f"  → Removed old checkpoint: {old}")
 
 
 def load_checkpoint(path, model, optimizer, scaler, device):

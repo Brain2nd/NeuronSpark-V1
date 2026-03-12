@@ -119,7 +119,7 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 # ============================================================
 
 def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tokens_seen,
-                         rank, max_keep=5):
+                         rank):
     """保存 FSDP checkpoint（FULL_STATE_DICT 模式，兼容单卡加载）。"""
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f'ckpt_step{step}.pth')
@@ -152,13 +152,6 @@ def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tok
             },
         }, path)
         print(f"  → Checkpoint saved: {path}")
-
-        # 清理旧 checkpoint，仅保留最新 max_keep 个
-        ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-        while len(ckpts) > max_keep:
-            old = ckpts.pop(0)
-            os.remove(old)
-            print(f"  → Removed old checkpoint: {old}")
 
     dist.barrier()
 

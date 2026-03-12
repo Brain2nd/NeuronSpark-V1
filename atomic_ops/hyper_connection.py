@@ -150,18 +150,18 @@ class HyperConnection(nn.Module):
         # H_pre: 聚合权重 — 哪些流参与子层输入
         self.theta_pre = nn.Parameter(torch.zeros(n * D, n))
         self.b_pre = nn.Parameter(torch.full((n,), -math.log(n - 1)))  # sigmoid → 1/n
-        self.alpha_pre = nn.Parameter(torch.tensor(alpha_init))
+        self.alpha_pre = nn.Parameter(torch.tensor([alpha_init]))
 
         # H_post: 分配权重 — 子层输出如何分配到各流
         # b_post 加小噪声打破流间对称（加速 H_res 梯度涌现）
         self.theta_post = nn.Parameter(torch.zeros(n * D, n))
         self.b_post = nn.Parameter(0.1 * torch.randn(n))  # 2·sigmoid(~0) ≈ 1.0 ± 5%
-        self.alpha_post = nn.Parameter(torch.tensor(alpha_init))
+        self.alpha_post = nn.Parameter(torch.tensor([alpha_init]))
 
         # H_res: 残差混合矩阵 — 双随机约束，谱范数 ≤ 1
         self.theta_res = nn.Parameter(torch.zeros(n * D, n * n))
         self.b_res = nn.Parameter(torch.eye(n))  # Sinkhorn(I) → 对角占优
-        self.alpha_res = nn.Parameter(torch.tensor(alpha_init))
+        self.alpha_res = nn.Parameter(torch.tensor([alpha_init]))
 
     def _compute_H(self, x):
         """从 n 流输入计算三个 H 矩阵（动态，输入依赖）。

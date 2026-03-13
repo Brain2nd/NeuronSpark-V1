@@ -267,6 +267,13 @@ class SNNDashboard:
                     w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
                                  halt.bias.data.item(), step)
 
+            # SubLN PostNorm gain 监控（诊断子层输出幅度控制）
+            with torch.no_grad():
+                w.add_scalar(f"post_norm/layer_{i:02d}/block_gain",
+                             layer_module.block_post_norm.weight.data.mean().item(), step)
+                w.add_scalar(f"post_norm/layer_{i:02d}/ffn_gain",
+                             layer_module.ffn_post_norm.weight.data.mean().item(), step)
+
             # mHC H_res 对角占优度监控（诊断流混合程度）
             with torch.no_grad():
                 for hc_name, hc in [('block_hc', layer_module.block_hc),
@@ -365,9 +372,19 @@ class SNNDashboard:
         """
         w = self._writer
 
-        # ====== 1. mHC H_res 健康度（替代 SubLN gain）======
-        # 用 Sinkhorn 投影后的实际 H_res 对角值（而非 raw b_res log 域参数）
-        # raw b_res off-diag 趋近 0 时 ratio 分母 1e-8，对微小扰动极端敏感
+        # ====== 1. SubLN gain + mHC H_res 健康度 ======
+        # SubLN gain: 子层输出幅度控制均匀度
+        gain_vals = []
+        for layer_module in model.layers:
+            gain_vals.append(layer_module.block_post_norm.weight.data.mean().item())
+            gain_vals.append(layer_module.ffn_post_norm.weight.data.mean().item())
+        gain_gini = self._gini(gain_vals) if gain_vals else 0.0
+        w.add_scalar("health/gain_gini", gain_gini, step)
+        if gain_vals:
+            w.add_scalar("health/gain_ratio",
+                          max(gain_vals) / (min(gain_vals) + 1e-8), step)
+
+        # mHC H_res 对角值均匀度
         from atomic_ops.hyper_connection import sinkhorn_log
         hc_diag_vals = []
         for layer_module in model.layers:
@@ -377,10 +394,10 @@ class SNNDashboard:
                                          num_iters=hc.sinkhorn_iters).squeeze(0)
                     diag_mean = H_res.diagonal().mean().item()
                 hc_diag_vals.append(diag_mean)
-        gain_gini = self._gini(hc_diag_vals) if hc_diag_vals else 0.0
         w.add_scalar("health/hc_diag_mean_spread",
                       max(hc_diag_vals) - min(hc_diag_vals) if hc_diag_vals else 0.0, step)
-        w.add_scalar("health/hc_diag_gini", gain_gini, step)
+        w.add_scalar("health/hc_diag_gini",
+                      self._gini(hc_diag_vals) if hc_diag_vals else 0.0, step)
 
         # ====== 2. MPD alpha 健康度 ======
         alphas = []

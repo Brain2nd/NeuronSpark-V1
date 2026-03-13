@@ -186,8 +186,23 @@ class SNNDecoderLayer(base.MemoryModule):
             halt.weight.data.mul_(0.01)
             nn.init.constant_(halt.bias, -3.5)
 
-        # ====== mHC 超连接（替代 SubLN PostNorm + gain clamp）======
-        # Birkhoff 多面体约束代替 SubLN 的自动增益控制
+        # SubLN Post-RMSNorm：子层输出归一化，控制 f(x) 的幅度
+        # 原理：out_proj 输出 ‖f_l‖ 增长 → Jacobian J_k ∝ gain/RMS(f_l)，
+        # RMS(f_l) 增长自动抵消 ‖W_out‖ 增长 → 自动增益控制
+        # gain 初始化: (2·num_layers)^{-1/2}，使 ‖h_L‖² ≈ 2‖h_0‖²
+        self.block_post_norm = RMSNorm(D)
+        self.ffn_post_norm = RMSNorm(D)
+        post_norm_gain = (2 * num_layers) ** -0.5
+        self.block_post_norm.weight.data.fill_(post_norm_gain)
+        self.ffn_post_norm.weight.data.fill_(post_norm_gain)
+
+        # SubLN gain clamp 范围（防止正反馈失控或 gain 塌缩）
+        self._gain_min = post_norm_gain * 0.25
+        self._gain_max = post_norm_gain * 3.0
+
+        # ====== mHC 超连接（与 SubLN 互补）======
+        # mHC 控制残差混合路径 H_res @ x_l 的谱范数 ≤ 1
+        # SubLN 控制计算路径 f(x) 的输出幅度（归一化后再分配到 n 流）
         self.block_hc = HyperConnection(
             n=n_hc_streams, D=D, sinkhorn_iters=sinkhorn_iters,
         )
@@ -321,6 +336,11 @@ class SNNDecoderLayer(base.MemoryModule):
         K = self.K
         TK = seq_len * K
 
+        # ====== SubLN gain clamp: 防止正反馈失控 ======
+        with torch.no_grad():
+            self.block_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
+            self.ffn_post_norm.weight.data.clamp_(self._gain_min, self._gain_max)
+
         # ====== MPD-AGL: 自适应 surrogate gradient 宽度 ======
         # 根据每层当前参数动态调整 alpha，使 surrogate 有效区间匹配膜电位分布
         with torch.no_grad():
@@ -376,9 +396,10 @@ class SNNDecoderLayer(base.MemoryModule):
             frames_block, self.block_halt)
         del frames_block
 
-        # 输出投影
+        # 输出投影 + SubLN: 归一化 f(x) 的幅度后再分配到 n 流
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
         del combined_block
+        res_block = self.block_post_norm(res_block)  # SubLN: 自动增益控制
 
         # HC post: 残差混合 + 分配 → n 流
         h_streams = self.block_hc.post(h_streams, res_block, cache_block)
@@ -406,6 +427,7 @@ class SNNDecoderLayer(base.MemoryModule):
 
         res_ffn = self.ffn_out_proj(combined_ffn)  # (seq_len, batch, D)
         del combined_ffn
+        res_ffn = self.ffn_post_norm(res_ffn)  # SubLN: 自动增益控制
 
         # HC post: 残差混合 + 分配 → n 流
         h_streams = self.ffn_hc.post(h_streams, res_ffn, cache_ffn)
@@ -444,6 +466,7 @@ class SNNDecoderLayer(base.MemoryModule):
         v_in = spike_current_activation(spike1, self.input_neuron1.v_th)
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
+        res_block = self.block_post_norm(res_block)  # SubLN
         h_streams = self.block_hc.post(h_streams, res_block, cache_block)
 
         # 子层 2: SNNFFN
@@ -452,6 +475,7 @@ class SNNDecoderLayer(base.MemoryModule):
         v_in2 = spike_current_activation(spike2, self.input_neuron2.v_th)
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
+        res_ffn = self.ffn_post_norm(res_ffn)  # SubLN
         h_streams = self.ffn_hc.post(h_streams, res_ffn, cache_ffn)
 
         _zero = torch.tensor(0.0, device=h_streams.device)

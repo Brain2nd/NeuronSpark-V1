@@ -293,6 +293,9 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                 # E[K] 下界惩罚（遏制 PonderNet 坍缩: 深层 E[K] → 1 的死亡螺旋）
                 if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
                     loss = loss + args.ek_floor_weight * out.ek_floor_cost / args.accumulation_steps
+                # SNVR: 层间权重范数方差正则化（遏制 Jacobian 谱范数发散）
+                if out.snvr_cost is not None and args.snvr_weight > 0:
+                    loss = loss + args.snvr_weight * out.snvr_cost / args.accumulation_steps
                 # b_th L2 正则化（遏制 10×LR 下 V_th 漂移 → MPD alpha 崩溃）
                 if out.b_th_reg_cost is not None and args.b_th_reg_weight > 0:
                     loss = loss + args.b_th_reg_weight * out.b_th_reg_cost / args.accumulation_steps
@@ -329,6 +332,7 @@ def train_epoch(epoch, model, raw_model, train_loader, sampler, optimizer, ctx, 
                                 'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
                                 'tokens_seen': tokens_seen,
                                 'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                                'snvr_cost': out.snvr_cost.item() if out.snvr_cost is not None else 0.0,
                                 'b_th_reg_cost': out.b_th_reg_cost.item() if out.b_th_reg_cost is not None else 0.0,
                                 'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
                                 'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
@@ -414,6 +418,8 @@ if __name__ == "__main__":
                         help='E[K] 下界: 低于此值时产生惩罚（遏制 PonderNet 坍缩）')
     parser.add_argument('--ek_floor_weight', type=float, default=0.1,
                         help='E[K] 下界惩罚权重')
+    parser.add_argument('--snvr_weight', type=float, default=0.01,
+                        help='SNVR 层间权重范数方差正则化权重（遏制 Jacobian 发散）')
     parser.add_argument('--b_th_reg_weight', type=float, default=0.01,
                         help='b_th L2 正则化权重（遏制 V_th 漂移）')
     parser.add_argument('--n_hc_streams', type=int, default=4,

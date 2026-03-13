@@ -41,6 +41,7 @@ class SNNModelOutput:
     logits: Optional[torch.Tensor] = None
     ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
     ek_floor_cost: Optional[torch.Tensor] = None  # E[K] 下界惩罚
+    snvr_cost: Optional[torch.Tensor] = None  # 层间权重谱范数方差正则化
     b_th_reg_cost: Optional[torch.Tensor] = None  # b_th L2 正则化（遏制 V_th 漂移）
 
 
@@ -560,6 +561,8 @@ class SNNLanguageModel(nn.Module):
         h_out, ponder_cost, ek_floor_cost = self.snn_forward(h_streams)  # SNN 核心
         logits = self.decode(h_out, seq_len)                  # 输出边界
 
+        # SNVR: 层间权重范数方差正则化（可微分，梯度流回权重）
+        snvr_cost = self._compute_snvr_cost()
         # b_th L2 正则化（遏制 10×LR 下 V_th 漂移）
         b_th_reg_cost = self._compute_b_th_reg_cost()
 
@@ -574,12 +577,49 @@ class SNNLanguageModel(nn.Module):
                 last_loss=self.last_loss,
                 ponder_cost=ponder_cost,
                 ek_floor_cost=ek_floor_cost,
+                snvr_cost=snvr_cost,
                 b_th_reg_cost=b_th_reg_cost,
             )
 
         return SNNModelOutput(logits=logits, ponder_cost=ponder_cost,
-                              ek_floor_cost=ek_floor_cost,
+                              ek_floor_cost=ek_floor_cost, snvr_cost=snvr_cost,
                               b_th_reg_cost=b_th_reg_cost)
+
+    def _compute_snvr_cost(self) -> torch.Tensor:
+        """Spectral Norm Variance Regularization: 惩罚同类权重跨层 Frobenius 范数方差。
+
+        Jacobian 谱范数与权重范数正相关。若各层同类权重范数不一致
+        (浅层大、深层小)，∏‖J_k‖ 必然指数发散 → 梯度消失/爆炸。
+        惩罚范数方差 → 迫使各层 ‖J_k‖ 趋近统一 → 梯度流保持。
+
+        与 mHC 互补: mHC 约束残差混合路径 ‖H_res‖ ≤ 1，
+        SNVR 约束计算路径 ‖W_l‖ 跨层一致性。
+
+        Returns:
+            scalar — 所有权重类型的范数方差之和
+        """
+        norms_by_type = {}
+        for layer_module in self.layers:
+            block = layer_module.snn_block
+            ffn = layer_module.snn_ffn
+            for name, param in [
+                ('W_in', block.W_in.weight),
+                ('W_out', block.W_out.weight),
+                ('W_gate', block.W_gate.weight),
+                ('W_skip', block.W_skip.weight),
+                ('ffn_gate', ffn.gate_proj.weight),
+                ('ffn_down', ffn.down_proj.weight),
+                ('out_proj', layer_module.block_out_proj.weight),
+                ('ffn_out_proj', layer_module.ffn_out_proj.weight),
+            ]:
+                norms_by_type.setdefault(name, []).append(param.norm())
+
+        total_var = torch.zeros(1, device=self.layers[0].block_out_proj.weight.device,
+                                dtype=torch.float32).squeeze()
+        for norms in norms_by_type.values():
+            stacked = torch.stack(norms)
+            total_var = total_var + stacked.var()
+        return total_var
 
     def _compute_b_th_reg_cost(self) -> torch.Tensor:
         """b_th L2 正则化：遏制 V_th 漂移（10×LR + 0 weight_decay 下 b_th 无约束）。
@@ -685,6 +725,8 @@ class SNNLanguageModel(nn.Module):
             groups['rms_norms'].extend([
                 layer_module.block_norm.weight,
                 layer_module.ffn_norm.weight,
+                layer_module.block_post_norm.weight,
+                layer_module.ffn_post_norm.weight,
             ])
 
             # 动态 K: 停止投影参数

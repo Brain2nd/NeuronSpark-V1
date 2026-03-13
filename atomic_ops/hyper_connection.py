@@ -1,36 +1,33 @@
 """
-HyperConnection: 流形约束超连接（DeepSeek mHC, arXiv 2512.24880）
+HyperConnection: 多流超连接（身份跳跃 + 动态聚合/分配）
 
-替代标准残差连接 x + f(x) 为多流残差混合:
-  x_{l+1} = H_res @ x_l + H_post ⊗ f(H_pre @ x_l)
+多流残差连接:
+  x_{l+1} = x_l + H_post ⊗ f(H_pre @ x_l)
 
-核心保证:
-  - H_res 约束在 Birkhoff 多面体（双随机矩阵集）
-  - 双随机矩阵谱范数 ≤ 1，对乘法封闭 → 梯度不爆炸的代数保证
-  - ∏_l ‖H_res^(l)‖ ≤ 1 — 无论网络多深，残差混合不放大信号
-  - Sinkhorn-Knopp 投影: log 域交替行列归一化
+设计原理:
+  - 身份跳跃连接: 梯度高速公路，Jacobian = I，所有方向梯度无衰减
+  - H_pre: 动态聚合 n 流 → 1 维子层输入（softmax + 方差重归一化）
+  - H_post: 动态分配子层输出 → n 流（2·sigmoid ∈ (0,2)）
+  - 流间信息交换通过计算路径（H_pre 聚合 → 子层 → H_post 分配）
+
+  注: H_res (Birkhoff 双随机混合) 已移除。实验表明 H_res 的 n×n 矩阵
+  在 skip 路径上引入非身份 Jacobian，非均匀方向特征值 λ₂ = 0.893，
+  40 个子层后衰减 0.893^40 ≈ 0.011，导致深层梯度消失/浅层梯度爆炸。
+  身份跳跃连接在所有方向保持完整梯度流，与 SubLN 互补。
 
 动态 H 矩阵（输入依赖，条件信号 = vec(x_l) 展平 nD 维）:
   c = RMSNorm(vec(x_l))                                    ∈ R^{nD}
   H_pre  = softmax(α_pre · (c @ θ_pre) + b_pre) / √(Σw²)  ∈ R^n, 方差保持
   H_post = 2·σ(α_post · (c @ θ_post) + b_post)            ∈ (0,2)^n
-  H_res  = Sinkhorn(α_res · (c @ θ_res) + b_res)          ∈ DS^{n×n}
 
-SNN 适配（vs 原始 mHC 论文）:
+SNN 适配:
   - H_pre 用 softmax 替代 sigmoid: 凸组合保证权重和 = 1
   - 方差重归一化 ÷√(Σw_i²): 防止凸组合压缩方差导致膜电位低于阈值
-  - b_res = 3.5·I: 减小谱间隙（λ₂ ≈ 0.04 vs 原 0.775），防止流快速同质化
 
 初始化:
   θ = 0, α = 0.01
   b_pre = 0 → softmax(0) = 1/n（均匀聚合）
   b_post ≈ 0 + noise → 2·sigmoid ≈ 1.0 ± 5%（打破流间对称）
-  b_res = 3.5·I → Sinkhorn 后对角 ≈ 0.92（强流身份保持）
-
-Sinkhorn 梯度:
-  直接反传 Sinkhorn 迭代会导致梯度指数衰减（Jacobian 谱半径 < 1）。
-  使用 SinkhornProjection 自定义反向: 前向完整 Sinkhorn 投影，
-  反向用切空间投影梯度（隐式微分的一阶近似）。
 """
 
 import math
@@ -126,19 +123,22 @@ def sinkhorn_projection(logits: torch.Tensor, num_iters: int = 20) -> torch.Tens
 
 
 class HyperConnection(nn.Module):
-    """流形约束超连接模块（单子层用）。
+    """多流超连接模块（单子层用）。
 
     使用 pre()/post() 分离接口，不包装子层本身:
       x_pre, cache = hc.pre(x)        # n 流 → 1 维子层输入
       f_out = sublayer(x_pre)          # 子层处理（不变）
-      x_out = hc.post(x, f_out, cache) # 残差混合 + 分配 → n 流
+      x_out = hc.post(x, f_out, cache) # 身份跳跃 + 分配 → n 流
 
-    参数量开销（n=4, D=896）: ~90K/instance, 2 instances/layer, 20 layers → ~3.6M（0.4%）
+    身份跳跃: x_{l+1} = x_l + H_post ⊗ f(H_pre @ x_l)
+    梯度高速公路: ∂x_{l+1}/∂x_l = I + O(gain)，所有方向梯度保持。
+
+    参数量开销（n=4, D=896）: ~33K/instance, 2 instances/layer, 20 layers → ~1.3M（0.15%）
 
     Args:
         n: 流数量（推荐 4）
         D: 隐藏维度
-        sinkhorn_iters: Sinkhorn 迭代次数
+        sinkhorn_iters: 保留兼容性（不再使用）
         alpha_init: 动态 H 矩阵初始缩放（越小越接近静态初始值）
     """
 
@@ -147,7 +147,6 @@ class HyperConnection(nn.Module):
         super().__init__()
         self.n = n
         self.D = D
-        self.sinkhorn_iters = sinkhorn_iters
 
         # 输入归一化（条件信号 = vec(x_l) 展平 nD 维，保留完整流间信息）
         self.norm = RMSNorm(n * D)
@@ -158,34 +157,26 @@ class HyperConnection(nn.Module):
         self.alpha_pre = nn.Parameter(torch.tensor([alpha_init]))
 
         # H_post: 分配权重 — 子层输出如何分配到各流
-        # b_post 加小噪声打破流间对称（加速 H_res 梯度涌现）
+        # b_post 加小噪声打破流间对称
         self.theta_post = nn.Parameter(torch.zeros(n * D, n))
         self.b_post = nn.Parameter(0.1 * torch.randn(n))  # 2·sigmoid(~0) ≈ 1.0 ± 5%
         self.alpha_post = nn.Parameter(torch.tensor([alpha_init]))
 
-        # H_res: 残差混合矩阵 — 双随机约束，谱范数 ≤ 1
-        # b_res = 3.5·I: 减小谱间隙（λ₂ ≈ 0.04），防止流在 3 层内同质化
-        self.theta_res = nn.Parameter(torch.zeros(n * D, n * n))
-        self.b_res = nn.Parameter(3.5 * torch.eye(n))  # Sinkhorn(3.5I) → 对角 ≈ 0.92
-        self.alpha_res = nn.Parameter(torch.tensor([alpha_init]))
-
     def _compute_H(self, x):
-        """从 n 流输入计算三个 H 矩阵（动态，输入依赖）。
+        """从 n 流输入计算 H_pre 和 H_post 矩阵（动态，输入依赖）。
 
         Args:
             x: (*, n, D) — n 流输入
 
         Returns:
-            H_pre:  (*, 1, n) — 聚合权重（softmax + 方差重归一化，非凸组合）
+            H_pre:  (*, 1, n) — 聚合权重（softmax + 方差重归一化）
             H_post: (*, n)    — 分配权重
-            H_res:  (*, n, n) — 双随机混合矩阵
         """
         # vec(x_l): 展平 n 流为 nD 维条件信号，保留完整流间区分信息
         x_flat = x.flatten(-2)  # (*, n, D) → (*, nD)
         x_norm = self.norm(x_flat)  # (*, nD)
 
         # H_pre: softmax → 凸组合 + 方差重归一化（SNN 阈值兼容）
-        # sigmoid 使各权重独立 ∈ (0,1)，凸组合 Var 压缩 Σw² 倍 → 膜电位低于阈值
         # softmax 保证 Σw=1; ÷√(Σw²) 补偿方差压缩: Var(x_pre) = σ²
         # 初始 w=1/n 时 renorm=√n，被下游 RMSNorm 吸收
         pre_logits = self.alpha_pre * (x_norm @ self.theta_pre) + self.b_pre
@@ -197,14 +188,7 @@ class HyperConnection(nn.Module):
         post_logits = self.alpha_post * (x_norm @ self.theta_post) + self.b_post
         H_post = 2.0 * torch.sigmoid(post_logits)  # (*, n)
 
-        # H_res: Sinkhorn → 双随机矩阵，谱范数 ≤ 1 保证梯度不爆炸
-        n = self.n
-        res_logits = self.alpha_res * (x_norm @ self.theta_res)  # (*, n*n)
-        shape = res_logits.shape[:-1] + (n, n)
-        res_logits = res_logits.view(shape) + self.b_res  # (*, n, n)
-        H_res = sinkhorn_projection(res_logits, self.sinkhorn_iters)  # (*, n, n)
-
-        return H_pre, H_post, H_res
+        return H_pre, H_post
 
     def pre(self, x):
         """聚合 n 流 → 子层输入。
@@ -214,32 +198,32 @@ class HyperConnection(nn.Module):
 
         Returns:
             x_pre: (*, D) — 子层输入（n 流加权聚合）
-            H_cache: tuple — 缓存的 H 矩阵，传给 post()
+            H_cache: tuple — 缓存的 H_post，传给 post()
         """
-        H_pre, H_post, H_res = self._compute_H(x)
+        H_pre, H_post = self._compute_H(x)
         # (*, 1, n) @ (*, n, D) → (*, 1, D) → squeeze → (*, D)
         x_pre = torch.matmul(H_pre, x).squeeze(-2)
-        return x_pre, (H_pre, H_post, H_res)
+        return x_pre, H_post
 
     def post(self, x, f_out, H_cache):
-        """残差混合 + 输出分配 → n 流。
+        """身份跳跃 + 输出分配 → n 流。
 
-        x_{l+1} = H_res @ x_l + H_post ⊗ f(x_pre)
+        x_{l+1} = x_l + H_post ⊗ f(x_pre)
+
+        身份跳跃连接保证 ∂x_{l+1}/∂x_l = I（所有方向无衰减）。
+        H_post 控制子层输出分配到各流的强度 ∈ (0, 2)。
 
         Args:
             x: (*, n, D) — 原始 n 流输入
             f_out: (*, D) — 子层输出
-            H_cache: tuple — 从 pre() 返回的 H 矩阵
+            H_cache: H_post tensor — 从 pre() 返回的分配权重
 
         Returns:
             (*, n, D) — 更新后的 n 流残差
         """
-        _, H_post, H_res = H_cache
-
-        # 残差混合: (*, n, n) @ (*, n, D) → (*, n, D)
-        h_res = torch.matmul(H_res, x)
+        H_post = H_cache
 
         # 输出分配: (*, n) ⊗ (*, D) → (*, n, D)
         z = torch.einsum("...n,...d->...nd", H_post, f_out)
 
-        return h_res + z
+        return x + z

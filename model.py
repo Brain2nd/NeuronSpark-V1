@@ -7,7 +7,7 @@ SNNLanguageModel: SNN 隐状态空间语言模型（mHC 多流残差 + 脉冲电
   model.decode(h_out, seq)   → logits             # 输出: n 流聚合 → K 帧 output_neuron → proj → logits
 
 核心设计：
-  1. mHC 多流残差: H_res ∈ Birkhoff 多面体，谱范数 ≤ 1，梯度不爆炸的代数保证
+  1. 多流身份跳跃残差: x + H_post ⊗ SubLN(f(H_pre @ x))，梯度高速公路 Jacobian = I
   2. 脉冲电流激活：神经元输出 V_th * spike（稀疏），经投影后汇入 n 流残差
   3. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
   4. 层间状态: (seq_len, batch, n, D) — n 流残差（n=4 推荐）
@@ -759,16 +759,15 @@ class SNNLanguageModel(nn.Module):
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
             ])
 
-            # mHC 超连接参数: theta 需要 weight decay（防止 94,728% 爆炸），其余不需要
+            # mHC 超连接参数: theta 需要 weight decay（防止爆炸），其余不需要
             for hc in [layer_module.block_hc, layer_module.ffn_hc]:
                 groups['hc_theta'].extend([
-                    hc.theta_pre, hc.theta_post, hc.theta_res,
+                    hc.theta_pre, hc.theta_post,
                 ])
                 groups['hc_params'].extend([
                     hc.norm.weight,
                     hc.b_pre, hc.alpha_pre,
                     hc.b_post, hc.alpha_post,
-                    hc.b_res, hc.alpha_res,
                 ])
 
         return groups

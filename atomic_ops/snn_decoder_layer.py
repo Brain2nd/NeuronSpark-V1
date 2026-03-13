@@ -1,14 +1,15 @@
 """
-SNNDecoderLayer: 单个 SNN 解码层（mHC 多流残差 + 动态 K 帧聚合）
+SNNDecoderLayer: 单个 SNN 解码层（多流残差 + 动态 K 帧聚合）
 
-  HyperConnection.pre → RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → HyperConnection.post
-  HyperConnection.pre → RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → HyperConnection.post
+  HyperConnection.pre → RMSNorm → PLIF → SNNBlock → 动态K聚合 → out_proj → SubLN → HyperConnection.post
+  HyperConnection.pre → RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → SubLN → HyperConnection.post
 
 残差连接:
-  标准残差 x + f(x) 替换为 mHC 多流残差:
-    x_{l+1} = H_res @ x_l + H_post ⊗ f(H_pre @ x_l)
-  H_res 约束在 Birkhoff 多面体（双随机矩阵），谱范数 ≤ 1，
-  代数保证梯度不爆炸，无论网络多深。
+  多流身份跳跃 + 动态分配:
+    x_{l+1} = x_l + H_post ⊗ SubLN(f(H_pre @ x_l))
+  身份跳跃连接保证梯度在所有方向无衰减（Jacobian = I）。
+  H_pre 动态聚合 n 流为子层输入，H_post 动态分配输出到 n 流。
+  SubLN 控制计算路径 f(x) 的幅度（自动增益）。
 
 层间状态: (seq_len, batch, n, D) — n 流残差（n=4 推荐）。
 层内 SNN: 展开到 (TK, batch, D) 做 K 帧时间动力学，PonderNet 聚合回 token 级。
@@ -99,8 +100,7 @@ class SNNDecoderLayer(base.MemoryModule):
     每个子层通过 HyperConnection 聚合 n 流 → 1 维输入，
     SNN 处理后 PonderNet 聚合 K 帧，再由 HyperConnection 分配回 n 流。
 
-    H_res 的 Birkhoff 多面体约束（谱范数 ≤ 1）代替了原 SubLN PostNorm
-    的自动增益控制，从代数层面保证深层梯度不爆炸。
+    身份跳跃连接 + SubLN 自动增益控制，保证深层梯度流稳定。
 
     Args:
         D: 可见维度
@@ -200,9 +200,10 @@ class SNNDecoderLayer(base.MemoryModule):
         self._gain_min = post_norm_gain * 0.25
         self._gain_max = post_norm_gain * 3.0
 
-        # ====== mHC 超连接（与 SubLN 互补）======
-        # mHC 控制残差混合路径 H_res @ x_l 的谱范数 ≤ 1
-        # SubLN 控制计算路径 f(x) 的输出幅度（归一化后再分配到 n 流）
+        # ====== 多流超连接（身份跳跃 + 动态聚合/分配）======
+        # 身份跳跃保证梯度高速公路（Jacobian = I）
+        # H_pre 聚合 n 流为子层输入，H_post 分配输出到 n 流
+        # SubLN 控制计算路径 f(x) 的输出幅度
         self.block_hc = HyperConnection(
             n=n_hc_streams, D=D, sinkhorn_iters=sinkhorn_iters,
         )

@@ -274,23 +274,14 @@ class SNNDashboard:
                 w.add_scalar(f"post_norm/layer_{i:02d}/ffn_gain",
                              layer_module.ffn_post_norm.weight.data.mean().item(), step)
 
-            # mHC H_res 对角占优度监控（诊断流混合程度）
+            # mHC H_pre/H_post alpha 动态性监控
             with torch.no_grad():
                 for hc_name, hc in [('block_hc', layer_module.block_hc),
                                      ('ffn_hc', layer_module.ffn_hc)]:
-                    # H_res 的 bias 对角值均值 vs 非对角均值
-                    b_res = hc.b_res.data
-                    n = b_res.shape[0]
-                    diag_mean = b_res.diagonal().mean().item()
-                    off_diag_mask = ~torch.eye(n, dtype=torch.bool, device=b_res.device)
-                    off_diag_mean = b_res[off_diag_mask].mean().item()
-                    w.add_scalar(f"hc_res/layer_{i:02d}/{hc_name}/diag_mean",
-                                 diag_mean, step)
-                    w.add_scalar(f"hc_res/layer_{i:02d}/{hc_name}/offdiag_mean",
-                                 off_diag_mean, step)
-                    # alpha 动态性
-                    w.add_scalar(f"hc_alpha/layer_{i:02d}/{hc_name}/alpha_res",
-                                 hc.alpha_res.data.item(), step)
+                    w.add_scalar(f"hc_alpha/layer_{i:02d}/{hc_name}/alpha_pre",
+                                 hc.alpha_pre.data.item(), step)
+                    w.add_scalar(f"hc_alpha/layer_{i:02d}/{hc_name}/alpha_post",
+                                 hc.alpha_post.data.item(), step)
 
             # MPD-AGL 自适应 surrogate alpha 监控
             for attr, tag in [('_alpha_input1', 'input1'),
@@ -384,20 +375,17 @@ class SNNDashboard:
             w.add_scalar("health/gain_ratio",
                           max(gain_vals) / (min(gain_vals) + 1e-8), step)
 
-        # mHC H_res 对角值均匀度
-        from atomic_ops.hyper_connection import sinkhorn_log
-        hc_diag_vals = []
+        # H_post 分配权重均匀度
+        hc_post_vals = []
         for layer_module in model.layers:
             for hc in [layer_module.block_hc, layer_module.ffn_hc]:
                 with torch.no_grad():
-                    H_res = sinkhorn_log(hc.b_res.data.unsqueeze(0),
-                                         num_iters=hc.sinkhorn_iters).squeeze(0)
-                    diag_mean = H_res.diagonal().mean().item()
-                hc_diag_vals.append(diag_mean)
-        w.add_scalar("health/hc_diag_mean_spread",
-                      max(hc_diag_vals) - min(hc_diag_vals) if hc_diag_vals else 0.0, step)
-        w.add_scalar("health/hc_diag_gini",
-                      self._gini(hc_diag_vals) if hc_diag_vals else 0.0, step)
+                    h_post_mean = (2.0 * torch.sigmoid(hc.b_post.data)).mean().item()
+                hc_post_vals.append(h_post_mean)
+        w.add_scalar("health/hc_post_mean_spread",
+                      max(hc_post_vals) - min(hc_post_vals) if hc_post_vals else 0.0, step)
+        w.add_scalar("health/hc_post_gini",
+                      self._gini(hc_post_vals) if hc_post_vals else 0.0, step)
 
         # ====== 2. MPD alpha 健康度 ======
         alphas = []

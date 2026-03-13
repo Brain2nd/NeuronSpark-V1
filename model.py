@@ -611,6 +611,8 @@ class SNNLanguageModel(nn.Module):
                 ('ffn_down', ffn.down_proj.weight),
                 ('out_proj', layer_module.block_out_proj.weight),
                 ('ffn_out_proj', layer_module.ffn_out_proj.weight),
+                ('block_lateral', layer_module.block_lateral.weight),
+                ('ffn_lateral', layer_module.ffn_lateral.weight),
             ]:
                 norms_by_type.setdefault(name, []).append(param.norm())
 
@@ -715,6 +717,8 @@ class SNNLanguageModel(nn.Module):
             groups['residual_projs'].extend([
                 layer_module.block_out_proj.weight,
                 layer_module.ffn_out_proj.weight,
+                layer_module.block_lateral.weight,
+                layer_module.ffn_lateral.weight,
             ])
             groups['input_neurons'].extend([
                 layer_module.input_neuron1.w,

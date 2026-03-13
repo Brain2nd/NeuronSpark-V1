@@ -210,6 +210,44 @@ class SNNDecoderLayer(base.MemoryModule):
             n=n_hc_streams, D=D, sinkhorn_iters=sinkhorn_iters,
         )
 
+        # ====== 皮层 Layer II/III 侧向连接 ======
+        # 因果侧向突触: token t 接收 token t-1 的平均脉冲模式
+        # 经 W_lateral 投影后加入当前 token 的 SNN 子层输入
+        # 零初始化: 训练初期不改变基线行为，模型逐步学习利用侧向信息
+        self.block_lateral = nn.Linear(D, D, bias=False)
+        self.ffn_lateral = nn.Linear(D, D, bias=False)
+        nn.init.zeros_(self.block_lateral.weight)
+        nn.init.zeros_(self.ffn_lateral.weight)
+
+    def _lateral_inject(self, spike_current, lateral_proj):
+        """皮层侧向连接: 因果注入相邻 token 的平均脉冲模式。
+
+        Layer II/III 水平突触: token t 接收 token t-1 的 K 帧平均脉冲模式，
+        经 W_lateral 投影后加回所有 K 帧，实现层内跨 token 脉冲传播。
+
+        Args:
+            spike_current: (TK, batch, D) — 输入神经元脉冲电流
+            lateral_proj: nn.Linear(D, D) — 侧向突触投影
+
+        Returns:
+            (TK, batch, D) — 加入侧向信号后的脉冲电流
+        """
+        TK, batch, D = spike_current.shape
+        K = self.K
+        seq_len = TK // K
+
+        # 每 token 的 K 帧平均脉冲模式（整体发放率）
+        sc_per_token = spike_current.view(seq_len, K, batch, D).mean(dim=1)  # (seq_len, batch, D)
+
+        # 因果移位: token t 接收 token t-1 的模式，token 0 无前驱则为零
+        lateral_input = torch.zeros_like(sc_per_token)
+        lateral_input[1:] = sc_per_token[:-1]
+
+        # 侧向突触投影 + 扩展回 K 帧
+        lateral_signal = lateral_proj(lateral_input)  # (seq_len, batch, D)
+        return spike_current + lateral_signal.unsqueeze(1).expand(
+            -1, K, -1, -1).reshape(TK, batch, D)
+
     def _input_neuron_parallel(self, input_neuron, x):
         """
         输入 PLIF 神经元的 parallel scan 前向传播。
@@ -386,6 +424,7 @@ class SNNDecoderLayer(base.MemoryModule):
         del h_tk
         with torch.no_grad():
             self._fr_input1 = v_in.count_nonzero().item() / max(v_in.numel(), 1)
+        v_in = self._lateral_inject(v_in, self.block_lateral)  # 侧向连接
         cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D)
         del v_in
 
@@ -416,6 +455,7 @@ class SNNDecoderLayer(base.MemoryModule):
         del h_tk2
         with torch.no_grad():
             self._fr_input2 = v_in2.count_nonzero().item() / max(v_in2.numel(), 1)
+        v_in2 = self._lateral_inject(v_in2, self.ffn_lateral)  # 侧向连接
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
         del v_in2
 

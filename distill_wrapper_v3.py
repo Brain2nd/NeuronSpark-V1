@@ -177,16 +177,18 @@ class DistillHybridModel(nn.Module):
         for idx, block in enumerate(backbone.layers):
             if idx in self._mamba_set:
                 # ===== Mamba 位置: 并行 forward =====
-                residual = hidden_states
-
-                # Mamba 路径 (冻结, no_grad)
-                # NemotronHBlock 的 forward 会先 norm 再传给 mixer
-                normed = block.norm(hidden_states.to(dtype=block.norm.weight.dtype))
+                # 必须调用完整 block() 以触发 FSDP all-gather
+                # 不能分别调用 block.norm / block.mixer (参数已分片)
                 with torch.no_grad():
-                    mamba_out = block.mixer(
-                        normed, cache_params=None, cache_position=cache_position,
+                    block_output = block(
+                        hidden_states,
+                        cache_params=None,
+                        cache_position=cache_position,
                         attention_mask=mamba_mask,
                     )
+                    # block 内部: output = residual + mixer(norm(residual))
+                    # 提取 mixer 增量用于 cosine alignment
+                    mamba_out = block_output - hidden_states
 
                 # BioSSM 路径 (可训练, 内部有自己的 norm)
                 bio_mixer = self.bio_ssm_modules[str(idx)]
@@ -203,8 +205,8 @@ class DistillHybridModel(nn.Module):
                 if bio_mixer.ek_floor_cost is not None:
                     total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
 
-                # Student 残差流
-                hidden_states = residual + bio_out
+                # Student 残差流 (BioSSM 输出替代 Mamba)
+                hidden_states = hidden_states + bio_out
             else:
                 # ===== 非 Mamba 层: 冻结直通 =====
                 if block.block_type == "attention":

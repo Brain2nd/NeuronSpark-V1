@@ -362,6 +362,8 @@ def main():
                         help='固定 CE 权重 (覆盖自动调度)')
     parser.add_argument('--beta_hidden', type=float, default=None,
                         help='固定 cosine alignment 权重 (覆盖自动调度)')
+    parser.add_argument('--no_detach_frozen', action='store_true',
+                        help='不切断冻结层梯度 (CE loss 可跨层传播, 但显存更高)')
 
     # FSDP
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
@@ -436,7 +438,11 @@ def main():
     )
 
     # BioSSM 初始化用统一种子 (torch.manual_seed(42) 已在上方设置)
-    distill_model = DistillHybridModel(nvidia_model, bio_config)
+    detach_frozen = not args.no_detach_frozen
+    distill_model = DistillHybridModel(nvidia_model, bio_config,
+                                        detach_frozen=detach_frozen)
+    Log(f'  冻结层梯度: {"切断 (省显存)" if detach_frozen else "保留 (CE 跨层传播)"}',
+        rank)
 
     n_mamba = distill_model._num_mamba
     bio_params = sum(p.numel() for p in distill_model.bio_ssm_modules.parameters())

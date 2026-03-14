@@ -9,9 +9,10 @@ v3 蒸馏封装: NVIDIA NemotronH + 并行 BioSSM
   5. 最终 logits 走 student 路径 (BioSSM)
 
 显存优化:
-  - 非 SSM 层冻结, 无 optimizer states
+  - 冻结层 detach+no_grad: 不保存激活, 不做 backward all-gather
+  - BioSSM gradient checkpointing: 只保存输入, backward 时重算
+    (每层 seq=2048 时 ~5.4GB 激活 → checkpoint 后仅 ~11MB)
   - FSDP use_orig_params=True, 分片所有参数
-  - gradient checkpointing 可选开启
 """
 
 import math
@@ -21,6 +22,7 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from atomic_ops.bio_ssm_layer import BioSSMLayer
 
@@ -113,12 +115,17 @@ class DistillHybridModel(nn.Module):
     Args:
         nvidia_model: NemotronHForCausalLM (pretrained, 将被冻结)
         bio_ssm_config: BioSSM 配置
+        detach_frozen: 切断冻结层梯度 (省显存+通信, 默认 True)
+            True:  BioSSM 仅从 cosine alignment 获得梯度 (逐层独立优化)
+            False: CE loss 梯度可穿越冻结层到达所有 BioSSM (显存更高)
     """
 
-    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig):
+    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig,
+                 detach_frozen: bool = True):
         super().__init__()
         self.nvidia_model = nvidia_model
         self.bio_ssm_config = bio_ssm_config
+        self.detach_frozen = detach_frozen
 
         # 冻结所有原始参数
         for p in self.nvidia_model.parameters():
@@ -190,8 +197,9 @@ class DistillHybridModel(nn.Module):
 
         for idx, block in enumerate(backbone.layers):
             if idx in self._mamba_set:
-                # ===== Mamba 位置: 调用完整 block() 触发 FSDP all-gather =====
-                # mixer 输出通过 forward hook 自动捕获到 _mamba_mixer_outputs
+                # ===== Mamba 位置: teacher(no_grad) + student(checkpointed) =====
+                # Teacher: 调用完整 block() 触发 FSDP all-gather
+                # mixer 输出通过 forward hook 自动捕获
                 with torch.no_grad():
                     block(
                         hidden_states,
@@ -199,18 +207,21 @@ class DistillHybridModel(nn.Module):
                         cache_position=cache_position,
                         attention_mask=mamba_mask,
                     )
-                mamba_out = self._mamba_mixer_outputs[idx]
+                mamba_out = self._mamba_mixer_outputs.pop(idx)  # pop 释放引用
 
-                # BioSSM 路径 (可训练, 内部有自己的 norm)
+                # BioSSM: gradient checkpointing 省 ~5.4GB/层 激活内存
                 bio_mixer = self.bio_ssm_modules[str(idx)]
-                bio_out = bio_mixer(hidden_states)
+                if self.training:
+                    bio_out = ckpt_fn(bio_mixer, hidden_states, use_reentrant=False)
+                else:
+                    bio_out = bio_mixer(hidden_states)
 
                 # 逐层 cosine alignment loss
                 cos_loss = compute_layer_cosine_loss(bio_out, mamba_out.detach())
                 layer_cosine_losses.append(cos_loss)
                 self._layer_cosine_dict[idx] = cos_loss.detach().item()
 
-                # 收集 SNN cost
+                # 收集 SNN cost (checkpoint 重算时属性会更新, 但 tensor 引用已被 loss 捕获)
                 if bio_mixer.ponder_cost is not None:
                     total_ponder = total_ponder + bio_mixer.ponder_cost
                 if bio_mixer.ek_floor_cost is not None:
@@ -225,12 +236,24 @@ class DistillHybridModel(nn.Module):
                 else:
                     layer_mask = None
 
-                hidden_states = block(
-                    hidden_states,
-                    cache_params=None,
-                    cache_position=cache_position,
-                    attention_mask=layer_mask,
-                )
+                if self.detach_frozen:
+                    # 切断梯度: 不通过冻结层反向传播
+                    # 省显存 (无需保存激活) + 省通信 (无 backward all-gather)
+                    hidden_states = hidden_states.detach()
+                    with torch.no_grad():
+                        hidden_states = block(
+                            hidden_states,
+                            cache_params=None,
+                            cache_position=cache_position,
+                            attention_mask=layer_mask,
+                        )
+                else:
+                    hidden_states = block(
+                        hidden_states,
+                        cache_params=None,
+                        cache_position=cache_position,
+                        attention_mask=layer_mask,
+                    )
 
         # Final norm + LM head
         hidden_states = backbone.norm_f(hidden_states)

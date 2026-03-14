@@ -194,9 +194,14 @@ run_stage() {
 
 # ======================== 三阶段执行 ========================
 #
-#   Stage 1 (对齐):  α=0.3, β=2.0, lr=3e-4, seq≤128, warmup 200
-#   Stage 2 (过渡):  α=0.7, β=0.5, lr=2e-4, seq≤256, warmup 100
-#   Stage 3 (自主):  α=1.0, β=0.1, lr=1e-4, seq≤512, warmup 100, 无课程
+# 显存优化后 (gradient checkpoint + detach_frozen) 可用序列长度:
+#   - BioSSM peak recompute: seq×K×D×N×2B (1 层/次)
+#   - 冻结层零激活存储 (detach + no_grad)
+#   - 可用激活显存 ~20GB/卡
+#
+#   Stage 1 (对齐):  α=0.3, β=2.0, lr=3e-4, seq≤512,  warmup 200
+#   Stage 2 (过渡):  α=0.7, β=0.5, lr=2e-4, seq≤1024, warmup 100
+#   Stage 3 (自主):  α=1.0, β=0.1, lr=1e-4, seq≤2048, warmup 100, 无课程
 #
 
 should_run() {
@@ -204,15 +209,15 @@ should_run() {
 }
 
 if should_run 1; then
-    run_stage 1  0.3  2.0  3e-4  128  200
+    run_stage 1  0.3  2.0  3e-4  512   200
 fi
 
 if should_run 2; then
-    run_stage 2  0.7  0.5  2e-4  256  100
+    run_stage 2  0.7  0.5  2e-4  1024  100
 fi
 
 if should_run 3; then
-    run_stage 3  1.0  0.1  1e-4  512  100  "--no_curriculum"
+    run_stage 3  1.0  0.1  1e-4  2048  100  "--no_curriculum"
 fi
 
 # ======================== 完成 ========================

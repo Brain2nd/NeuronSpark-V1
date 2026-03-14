@@ -460,11 +460,15 @@ def main():
     raw_model = distill_model
 
     # ==================== FSDP ====================
-    # NemotronHBlock + BioSSMLayer 作为 wrap 单元
-    from modeling_nemotron_h import NemotronHBlock
+    # 从已加载的模型实例获取实际的 block 类
+    # 注意: trust_remote_code=True 加载的类在 transformers_modules 命名空间下,
+    # 与 sys.path 直接导入的 NemotronHBlock 是不同的类对象!
+    # isinstance() 按类对象身份匹配, 必须用模型实例中的实际类
+    ActualBlockCls = type(nvidia_model.backbone.layers[0])
+    Log(f'  FSDP wrap 类: {ActualBlockCls.__module__}.{ActualBlockCls.__name__}', rank)
     auto_wrap = functools.partial(
         transformer_auto_wrap_policy,
-        transformer_layer_cls={NemotronHBlock, BioSSMLayer},
+        transformer_layer_cls={ActualBlockCls, BioSSMLayer},
     )
 
     sharding_map = {

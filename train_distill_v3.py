@@ -457,6 +457,9 @@ def main():
         weight_decay=args.weight_decay,
     )
 
+    # 统一 dtype: BioSSM 默认 fp32, Teacher 是 bf16, FSDP flatten 要求一致
+    distill_model.to(torch.bfloat16)
+
     raw_model = distill_model
 
     # ==================== FSDP ====================

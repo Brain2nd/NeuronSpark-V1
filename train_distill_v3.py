@@ -457,11 +457,12 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # 统一 dtype: BioSSM 默认 fp32, FSDP flatten 要求同 wrap 单元内 dtype 一致
-    # 从 Teacher 实际参数读取 dtype, 不写死
+    # 统一 dtype: FSDP flatten 要求同 wrap 单元内 dtype 一致
+    # Teacher 有混合精度 (MoE gate 23层 fp32, 其余 bf16), BioSSM 默认 fp32
+    # 全部对齐到 Teacher 主 dtype
     teacher_dtype = next(nvidia_model.parameters()).dtype
-    distill_model.bio_ssm_modules.to(teacher_dtype)
-    Log(f'  BioSSM dtype 对齐 Teacher: {teacher_dtype}', rank)
+    distill_model.to(teacher_dtype)
+    Log(f'  全模型 dtype 对齐: {teacher_dtype}', rank)
 
     raw_model = distill_model
 

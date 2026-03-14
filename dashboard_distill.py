@@ -57,24 +57,42 @@ class DistillDashboard:
     # ====== 公开方法 ======
 
     def cache_grad_norms(self, fsdp_model):
-        """optimizer.step() 前调用: 缓存 BioSSM 参数梯度范数。
+        """optimizer.step() 前调用: 缓存 BioSSM 参数梯度范数 (FSDP 安全)。
 
-        通过 all_reduce(sum of squares) 还原完整 grad_norm。
-        所有 rank 必须同时调用 (集合操作)。
+        FSDP FULL_SHARD 下 param.grad 只在拥有该分片的 rank 上有值,
+        不能对每个参数单独 all_reduce (各 rank 跳过不同参数 → 死锁)。
+        改为: 收集所有可训练参数 local squared norm (无 grad 填 0),
+        合并为一个 tensor 做单次 all_reduce(SUM)。
         """
         use_dist = dist.is_initialized() and dist.get_world_size() > 1
-        cache = {}
 
+        # 固定顺序收集所有可训练参数 (所有 rank 一致)
+        names = []
+        local_sqs = []
         for name, param in fsdp_model.named_parameters():
-            if not param.requires_grad or param.grad is None:
+            if not param.requires_grad:
                 continue
-            local_sq = param.grad.data.float().norm().square()
-            if use_dist:
-                dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
             clean_name = name.replace("._fsdp_wrapped_module", "")
-            cache[clean_name] = local_sq.sqrt().item()
+            names.append(clean_name)
+            if param.grad is not None:
+                local_sqs.append(param.grad.data.float().norm().square().item())
+            else:
+                local_sqs.append(0.0)
 
-        self._grad_cache = cache
+        if not names:
+            self._grad_cache = {}
+            return
+
+        # 单次 all_reduce: 所有 rank 参与, tensor 大小一致
+        device = next(fsdp_model.parameters()).device
+        sq_tensor = torch.tensor(local_sqs, dtype=torch.float32, device=device)
+        if use_dist:
+            dist.all_reduce(sq_tensor, op=dist.ReduceOp.SUM)
+
+        self._grad_cache = {
+            name: sq_tensor[i].sqrt().item()
+            for i, name in enumerate(names)
+        }
 
     def log_step(self, step, metrics, raw_model):
         """轻量日志: 训练标量 + 逐层指标 + 梯度健康。"""

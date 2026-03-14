@@ -142,6 +142,21 @@ class DistillHybridModel(nn.Module):
         self._mamba_set = set(self.mamba_indices)
         self._layer_cosine_dict = {}  # idx → cosine distance (供 dashboard 读取)
 
+        # 在 Mamba mixer 上注册 forward hook, 捕获 mixer 输出用于 cosine alignment
+        # hook 在 block() 内部触发, 此时 FSDP 已 all-gather 参数, 无需直接访问子组件
+        self._mamba_mixer_outputs = {}
+        self._mixer_hooks = []
+        for idx in self.mamba_indices:
+            block = self.nvidia_model.backbone.layers[idx]
+            hook = block.mixer.register_forward_hook(self._make_mixer_hook(idx))
+            self._mixer_hooks.append(hook)
+
+    def _make_mixer_hook(self, idx):
+        """创建 Mamba mixer forward hook, 捕获输出用于 cosine alignment。"""
+        def hook(module, input, output):
+            self._mamba_mixer_outputs[idx] = output
+        return hook
+
     def _reset_bio_ssm_states(self):
         """重置所有 BioSSM 层的 PLIF 膜电位。"""
         for bio_mixer in self.bio_ssm_modules.values():
@@ -174,21 +189,20 @@ class DistillHybridModel(nn.Module):
         total_ponder = 0.0
         total_ek_floor = 0.0
 
+        self._mamba_mixer_outputs = {}
+
         for idx, block in enumerate(backbone.layers):
             if idx in self._mamba_set:
-                # ===== Mamba 位置: 并行 forward =====
-                # 必须调用完整 block() 以触发 FSDP all-gather
-                # 不能分别调用 block.norm / block.mixer (参数已分片)
+                # ===== Mamba 位置: 调用完整 block() 触发 FSDP all-gather =====
+                # mixer 输出通过 forward hook 自动捕获到 _mamba_mixer_outputs
                 with torch.no_grad():
-                    block_output = block(
+                    block(
                         hidden_states,
                         cache_params=None,
                         cache_position=cache_position,
                         attention_mask=mamba_mask,
                     )
-                    # block 内部: output = residual + mixer(norm(residual))
-                    # 提取 mixer 增量用于 cosine alignment
-                    mamba_out = block_output - hidden_states
+                mamba_out = self._mamba_mixer_outputs[idx]
 
                 # BioSSM 路径 (可训练, 内部有自己的 norm)
                 bio_mixer = self.bio_ssm_modules[str(idx)]

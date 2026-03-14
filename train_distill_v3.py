@@ -457,12 +457,31 @@ def main():
         weight_decay=args.weight_decay,
     )
 
-    # 统一 dtype: FSDP flatten 要求同 wrap 单元内 dtype 一致
-    # Teacher 有混合精度 (MoE gate 23层 fp32, 其余 bf16), BioSSM 默认 fp32
-    # 全部对齐到 Teacher 主 dtype
-    teacher_dtype = next(nvidia_model.parameters()).dtype
-    distill_model.to(teacher_dtype)
-    Log(f'  全模型 dtype 对齐: {teacher_dtype}', rank)
+    # 自动 dtype 对齐: FSDP flatten 要求同 wrap 单元内 dtype 一致
+    # 扫描所有参数和 buffer, 统计 dtype 分布, 对齐到多数 dtype
+    from collections import Counter
+    dtype_counts = Counter()
+    dtype_names = {}  # dtype → 示例参数名 (用于日志)
+    for name, p in distill_model.named_parameters():
+        dtype_counts[p.dtype] += 1
+        if p.dtype not in dtype_names:
+            dtype_names[p.dtype] = name
+    for name, buf in distill_model.named_buffers():
+        dtype_counts[buf.dtype] += 1
+        if buf.dtype not in dtype_names:
+            dtype_names[buf.dtype] = name
+
+    if len(dtype_counts) > 1:
+        target_dtype = dtype_counts.most_common(1)[0][0]
+        Log(f'  dtype 分布: {dict(dtype_counts)}', rank)
+        for dt, example in dtype_names.items():
+            if dt != target_dtype:
+                Log(f'    {dt} → {target_dtype} (例: {example})', rank)
+        distill_model.to(target_dtype)
+        Log(f'  全模型 dtype 对齐: {target_dtype}', rank)
+    else:
+        target_dtype = dtype_counts.most_common(1)[0][0]
+        Log(f'  dtype 统一: {target_dtype}', rank)
 
     raw_model = distill_model
 

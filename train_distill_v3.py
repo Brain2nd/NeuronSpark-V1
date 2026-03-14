@@ -15,6 +15,11 @@ v3 蒸馏训练: Nemotron-3-Nano Mamba → BioSSM (FSDP 多卡)
   Optimizer:    ~6GB/卡 (仅 BioSSM)
   Activations:  ~24GB/卡 剩余
 
+加载策略 (防 OOM):
+  - 所有 rank 同种子独立加载到 CPU (low_cpu_mem_usage=True)
+  - FSDP 不用 sync_module_states (避免全量移到 rank0 GPU)
+  - FSDP 逐层分片, 每张卡只放 1/N 参数
+
 用法:
   torchrun --nproc_per_node=4 train_distill_v3.py \
       --teacher_path /path/to/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
@@ -393,7 +398,8 @@ def main():
     local_rank, rank, world_size = setup_distributed()
     device = f"cuda:{local_rank}"
 
-    torch.manual_seed(42 + rank)
+    # 统一种子: 保证所有 rank 的 BioSSM 初始化相同 (避免 sync_module_states)
+    torch.manual_seed(42)
     torch.set_float32_matmul_precision('high')
     torch.backends.cudnn.benchmark = True
     ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
@@ -404,8 +410,12 @@ def main():
 
     from transformers import AutoModelForCausalLM, AutoConfig
     nvidia_config = AutoConfig.from_pretrained(args.teacher_path, trust_remote_code=True)
+
+    # 所有 rank 独立加载到 CPU (同种子 → 同权重, 无需 sync_module_states)
+    # low_cpu_mem_usage: 逐层加载, 减少 CPU 峰值内存
     nvidia_model = AutoModelForCausalLM.from_pretrained(
         args.teacher_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        low_cpu_mem_usage=True,
     )
     # 从 teacher config 读取维度
     args.hidden_size = nvidia_config.hidden_size
@@ -425,6 +435,7 @@ def main():
         num_hidden_layers=args.num_layers,
     )
 
+    # BioSSM 初始化用统一种子 (torch.manual_seed(42) 已在上方设置)
     distill_model = DistillHybridModel(nvidia_model, bio_config)
 
     n_mamba = distill_model._num_mamba
@@ -462,6 +473,8 @@ def main():
         'no_shard': ShardingStrategy.NO_SHARD,
     }
 
+    # 关键: 不用 sync_module_states (避免 FSDP 把完整 60GB 模型移到 rank0 GPU)
+    # 所有 rank 已用相同种子加载相同权重, 无需广播
     model = FSDP(
         distill_model,
         auto_wrap_policy=auto_wrap,
@@ -476,8 +489,10 @@ def main():
         forward_prefetch=True,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         limit_all_gathers=True,
-        sync_module_states=True,
     )
+
+    # FSDP 分片完成后, 恢复 per-rank 随机种子 (数据 shuffle 需要不同种子)
+    torch.manual_seed(42 + rank)
 
     # ==================== Tokenizer ====================
     tok_path = args.tokenizer_path or args.teacher_path

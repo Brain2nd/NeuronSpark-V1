@@ -52,3 +52,9 @@ from .hyper_connection import HyperConnection, sinkhorn_log, sinkhorn_projection
 from .parallel_scan import hillis_steele_scan, linear_recurrence, plif_parallel_forward
 from .fp16_codec import fp16_encode, fp16_decode
 from .rms_norm import RMSNorm
+
+# v3 组件
+from .bio_ssm_layer import BioSSMLayer
+from .bio_latent_moe import BioLatentMoELayer
+from .bio_attention import BioAttentionLayer
+from .mtp_head import MTPHead

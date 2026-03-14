@@ -466,6 +466,13 @@ def main():
     # isinstance() 按类对象身份匹配, 必须用模型实例中的实际类
     ActualBlockCls = type(nvidia_model.backbone.layers[0])
     Log(f'  FSDP wrap 类: {ActualBlockCls.__module__}.{ActualBlockCls.__name__}', rank)
+
+    # 验证: 类匹配检查
+    match_count = sum(1 for layer in nvidia_model.backbone.layers
+                      if isinstance(layer, ActualBlockCls))
+    Log(f'  类匹配验证: {match_count}/{len(nvidia_model.backbone.layers)} 层命中 '
+        f'(应为 {len(nvidia_model.backbone.layers)})', rank)
+
     auto_wrap = functools.partial(
         transformer_auto_wrap_policy,
         transformer_layer_cls={ActualBlockCls, BioSSMLayer},
@@ -494,6 +501,18 @@ def main():
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         limit_all_gathers=True,
     )
+
+    # FSDP 分片后显存验证
+    fsdp_gpu_mb = torch.cuda.memory_allocated(local_rank) / 1e6
+    fsdp_gpu_gb = fsdp_gpu_mb / 1000
+    Log(f'  FSDP 分片后 GPU{local_rank} 显存: {fsdp_gpu_gb:.2f} GB '
+        f'(预期 ~17GB, 若 >40GB 则分片失败)', rank)
+
+    # 统计 FSDP 内部 wrap 数量
+    fsdp_count = sum(1 for m in model.modules()
+                     if isinstance(m, FSDP) and m is not model)
+    Log(f'  FSDP 内部 wrap 数: {fsdp_count} (预期 ~{len(nvidia_model.backbone.layers) + n_mamba})',
+        rank)
 
     # FSDP 分片完成后, 恢复 per-rank 随机种子 (数据 shuffle 需要不同种子)
     torch.manual_seed(42 + rank)

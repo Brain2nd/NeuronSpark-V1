@@ -21,7 +21,6 @@ from typing import Optional, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as ckpt_fn
 
 from atomic_ops.bio_ssm_layer import BioSSMLayer
 
@@ -116,12 +115,10 @@ class DistillHybridModel(nn.Module):
         bio_ssm_config: BioSSM 配置
     """
 
-    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig,
-                 gradient_checkpointing: bool = True):
+    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig):
         super().__init__()
         self.nvidia_model = nvidia_model
         self.bio_ssm_config = bio_ssm_config
-        self.gradient_checkpointing = gradient_checkpointing
 
         # 冻结所有原始参数
         for p in self.nvidia_model.parameters():
@@ -225,23 +222,15 @@ class DistillHybridModel(nn.Module):
                 # ===== 非 Mamba 层: 冻结直通 =====
                 if block.block_type == "attention":
                     layer_mask = causal_mask
-                elif block.block_type == "mamba":
-                    layer_mask = mamba_mask  # 不应走到这里
                 else:
                     layer_mask = None
 
-                if self.gradient_checkpointing and self.training:
-                    hidden_states = ckpt_fn(
-                        block, hidden_states, None, cache_position, layer_mask,
-                        use_reentrant=False,
-                    )
-                else:
-                    hidden_states = block(
-                        hidden_states,
-                        cache_params=None,
-                        cache_position=cache_position,
-                        attention_mask=layer_mask,
-                    )
+                hidden_states = block(
+                    hidden_states,
+                    cache_params=None,
+                    cache_position=cache_position,
+                    attention_mask=layer_mask,
+                )
 
         # Final norm + LM head
         hidden_states = backbone.norm_f(hidden_states)

@@ -525,7 +525,7 @@ def main():
         use_orig_params=True,
         forward_prefetch=True,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        limit_all_gathers=True,
+        limit_all_gathers=False,
     )
 
     # FSDP 分片后显存验证

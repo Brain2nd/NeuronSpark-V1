@@ -1,0 +1,115 @@
+W0314 22:54:39.187000 27201 torch/distributed/run.py:766] 
+W0314 22:54:39.187000 27201 torch/distributed/run.py:766] *****************************************
+W0314 22:54:39.187000 27201 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0314 22:54:39.187000 27201 torch/distributed/run.py:766] *****************************************
+加载 Teacher: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:01,  8.46it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:01,  7.25it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:01,  6.86it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:01,  9.01it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:01,  8.51it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:00<00:01,  6.61it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:01,  8.48it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:01,  7.61it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:01,  7.29it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:00<00:01,  6.45it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:01,  7.22it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:01,  7.17it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:01,  6.89it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:00<00:01,  6.31it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:01,  6.84it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:00<00:01,  6.87it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:00<00:01,  6.64it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:01<00:00,  6.13it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:00<00:01,  6.57it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:00<00:01,  6.69it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:00<00:01,  6.46it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:01<00:00,  5.98it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:00<00:01,  6.33it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:00<00:01,  6.53it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:00<00:01,  6.30it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:01<00:00,  5.83it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:00<00:01,  6.14it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:01<00:00,  6.35it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:01<00:00,  6.13it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:01<00:00,  5.69it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:01<00:00,  6.18it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:01<00:01,  5.93it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:01<00:00,  5.98it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:01<00:00,  6.04it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:01<00:00,  5.56it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:01<00:00,  5.77it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:01<00:00,  5.83it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:01<00:00,  5.89it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:02<00:00,  5.45it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:01<00:00,  5.61it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:01<00:00,  5.68it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:02<00:00,  6.22it/s]
+Loading checkpoint shards:  85%|████████▍ | 11/13 [00:01<00:00,  5.76it/s]  Teacher: 31.6B params, D=2688, L=52
+Loading checkpoint shards:  77%|███████▋  | 10/13 [00:01<00:00,  5.46it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:01<00:00,  5.56it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:01<00:00,  5.63it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:01<00:00,  5.33it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:02<00:00,  6.45it/s]
+Loading checkpoint shards:  92%|█████████▏| 12/13 [00:02<00:00,  5.44it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:02<00:00,  6.22it/s]
+Loading checkpoint shards:  92%|█████████▏| 12/13 [00:02<00:00,  5.22it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:02<00:00,  6.02it/s]
+  冻结层梯度: 切断 (省显存)
+  BioSSM: 23 层, 3823.2M 可训练参数 (N=4, K=16)
+  dtype 分布: {torch.bfloat16: 6197, torch.float32: 414}
+    torch.float32 → torch.bfloat16 (例: nvidia_model.backbone.layers.1.mixer.gate.weight)
+  全模型 dtype 对齐: torch.bfloat16
+  FSDP wrap 类: transformers_modules.NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.modeling_nemotron_h.NemotronHBlock
+  类匹配验证: 52/52 层命中 (应为 52)
+  FSDP 分片后 GPU0 显存: 17.70 GB (预期 ~17GB, 若 >40GB 则分片失败)
+  FSDP 内部 wrap 数: 75 (预期 ~75)
+  Tokenizer: vocab=131072
+  数据: /workspace/NeuronSpark-V1/data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl (type=jsonl, col=text)
+  样本数: 13,000,000
+
+============================================================
+NeuronSpark v3 蒸馏: Mamba → BioSSM (FSDP, 4 GPUs)
+  Teacher:      /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  BioSSM:       N=4, K=16, 3823.2M params
+  Mamba 层数:    23
+  Data:         /workspace/NeuronSpark-V1/data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl
+  Batch:        1/gpu × 4 × accum 16 = 64
+  LR:           0.0003 (WSD, warmup 200)
+  Neuron LR:    0.0029999999999999996 (10.0×)
+  Loss:         CE + cosine_align + ponder(0.01) + ek_floor(0.1)
+  α/β 固定:     α=0.3, β=2.0
+  Curriculum:   OFF
+  TensorBoard:  runs/distill_v3/stage1_2468187
+============================================================
+
+E0[15/3250000] loss:7.357 CE:16.449 cos:1.0014 E[K]:2.00 α=0.30 β=2.00 lr:0.00e+00 seq:511 TPS:146 Mem:28.8/36.7GB GPUs:4
+E0[31/3250000] loss:7.385 CE:16.536 cos:1.0023 E[K]:2.00 α=0.30 β=2.00 lr:1.50e-06 seq:511 TPS:149 Mem:28.8/40.6GB GPUs:4
+E0[47/3250000] loss:7.319 CE:16.333 cos:0.9997 E[K]:2.00 α=0.30 β=2.00 lr:3.00e-06 seq:511 TPS:150 Mem:28.8/40.6GB GPUs:4
+E0[63/3250000] loss:7.251 CE:16.175 cos:0.9894 E[K]:2.00 α=0.30 β=2.00 lr:4.50e-06 seq:511 TPS:149 Mem:28.8/40.6GB GPUs:4
+E0[79/3250000] loss:7.031 CE:15.683 cos:0.9538 E[K]:2.00 α=0.30 β=2.00 lr:6.00e-06 seq:511 TPS:149 Mem:28.8/40.6GB GPUs:4
+E0[95/3250000] loss:7.161 CE:16.331 cos:0.9218 E[K]:2.01 α=0.30 β=2.00 lr:7.50e-06 seq:511 TPS:150 Mem:28.8/40.6GB GPUs:4
+E0[111/3250000] loss:7.075 CE:16.244 cos:0.8928 E[K]:2.01 α=0.30 β=2.00 lr:9.00e-06 seq:511 TPS:151 Mem:28.8/40.6GB GPUs:4
+E0[127/3250000] loss:7.082 CE:16.507 cos:0.8574 E[K]:2.01 α=0.30 β=2.00 lr:1.05e-05 seq:511 TPS:154 Mem:28.8/40.6GB GPUs:4
+E0[143/3250000] loss:7.270 CE:17.319 cos:0.8304 E[K]:2.02 α=0.30 β=2.00 lr:1.20e-05 seq:511 TPS:153 Mem:28.8/40.6GB GPUs:4
+E0[159/3250000] loss:6.893 CE:16.694 cos:0.7369 E[K]:2.02 α=0.30 β=2.00 lr:1.35e-05 seq:511 TPS:154 Mem:28.8/40.6GB GPUs:4
+E0[175/3250000] loss:6.737 CE:16.528 cos:0.6849 E[K]:2.03 α=0.30 β=2.00 lr:1.50e-05 seq:511 TPS:154 Mem:28.8/40.6GB GPUs:4
+E0[191/3250000] loss:6.524 CE:15.785 cos:0.6911 E[K]:2.04 α=0.30 β=2.00 lr:1.65e-05 seq:511 TPS:154 Mem:28.8/40.6GB GPUs:4
+E0[207/3250000] loss:6.612 CE:16.395 cos:0.6458 E[K]:2.05 α=0.30 β=2.00 lr:1.80e-05 seq:511 TPS:154 Mem:28.8/40.6GB GPUs:4
+E0[223/3250000] loss:6.371 CE:15.788 cos:0.6185 E[K]:2.06 α=0.30 β=2.00 lr:1.95e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[239/3250000] loss:6.358 CE:16.056 cos:0.5748 E[K]:2.07 α=0.30 β=2.00 lr:2.10e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[255/3250000] loss:6.362 CE:16.405 cos:0.5282 E[K]:2.09 α=0.30 β=2.00 lr:2.25e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[271/3250000] loss:6.361 CE:16.568 cos:0.5075 E[K]:2.12 α=0.30 β=2.00 lr:2.40e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[287/3250000] loss:6.118 CE:15.998 cos:0.4770 E[K]:2.15 α=0.30 β=2.00 lr:2.55e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[303/3250000] loss:6.186 CE:16.490 cos:0.4439 E[K]:2.19 α=0.30 β=2.00 lr:2.70e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[319/3250000] loss:6.127 CE:16.304 cos:0.4499 E[K]:2.23 α=0.30 β=2.00 lr:2.85e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[335/3250000] loss:6.207 CE:16.762 cos:0.4298 E[K]:2.29 α=0.30 β=2.00 lr:3.00e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[351/3250000] loss:6.357 CE:17.241 cos:0.4418 E[K]:2.35 α=0.30 β=2.00 lr:3.15e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[367/3250000] loss:6.367 CE:17.298 cos:0.4484 E[K]:2.42 α=0.30 β=2.00 lr:3.30e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[383/3250000] loss:6.375 CE:17.547 cos:0.4286 E[K]:2.53 α=0.30 β=2.00 lr:3.45e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[399/3250000] loss:6.173 CE:17.096 cos:0.4093 E[K]:2.66 α=0.30 β=2.00 lr:3.60e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[415/3250000] loss:6.556 CE:18.459 cos:0.4097 E[K]:2.82 α=0.30 β=2.00 lr:3.75e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[431/3250000] loss:6.671 CE:18.957 cos:0.4035 E[K]:3.01 α=0.30 β=2.00 lr:3.90e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[447/3250000] loss:6.551 CE:18.936 cos:0.3576 E[K]:3.26 α=0.30 β=2.00 lr:4.05e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[463/3250000] loss:6.568 CE:19.092 cos:0.3510 E[K]:3.48 α=0.30 β=2.00 lr:4.20e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[479/3250000] loss:6.538 CE:19.266 cos:0.3195 E[K]:3.76 α=0.30 β=2.00 lr:4.35e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[495/3250000] loss:6.335 CE:18.699 cos:0.3128 E[K]:4.06 α=0.30 β=2.00 lr:4.50e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[511/3250000] loss:6.310 CE:18.691 cos:0.3101 E[K]:4.35 α=0.30 β=2.00 lr:4.65e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[527/3250000] loss:6.313 CE:18.726 cos:0.3134 E[K]:4.62 α=0.30 β=2.00 lr:4.80e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[543/3250000] loss:6.667 CE:19.800 cos:0.3332 E[K]:4.84 α=0.30 β=2.00 lr:4.95e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[559/3250000] loss:6.637 CE:19.696 cos:0.3355 E[K]:5.06 α=0.30 β=2.00 lr:5.10e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[575/3250000] loss:4.806 CE:13.564 cos:0.3412 E[K]:5.24 α=0.30 β=2.00 lr:5.25e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[591/3250000] loss:4.275 CE:11.753 cos:0.3475 E[K]:5.36 α=0.30 β=2.00 lr:5.40e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[607/3250000] loss:4.034 CE:10.850 cos:0.3621 E[K]:5.43 α=0.30 β=2.00 lr:5.55e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[623/3250000] loss:4.372 CE:11.958 cos:0.3653 E[K]:5.45 α=0.30 β=2.00 lr:5.70e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[639/3250000] loss:3.899 CE:10.418 cos:0.3598 E[K]:5.41 α=0.30 β=2.00 lr:5.85e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[655/3250000] loss:3.952 CE:10.597 cos:0.3593 E[K]:5.30 α=0.30 β=2.00 lr:6.00e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[671/3250000] loss:4.011 CE:10.826 cos:0.3547 E[K]:5.16 α=0.30 β=2.00 lr:6.15e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[687/3250000] loss:3.636 CE:9.563 cos:0.3578 E[K]:5.00 α=0.30 β=2.00 lr:6.30e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[703/3250000] loss:3.877 CE:10.166 cos:0.3874 E[K]:4.79 α=0.30 β=2.00 lr:6.45e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[719/3250000] loss:3.824 CE:10.023 cos:0.3822 E[K]:4.67 α=0.30 β=2.00 lr:6.60e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[735/3250000] loss:3.924 CE:10.366 cos:0.3807 E[K]:4.60 α=0.30 β=2.00 lr:6.75e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[751/3250000] loss:3.934 CE:10.434 cos:0.3773 E[K]:4.56 α=0.30 β=2.00 lr:6.90e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[767/3250000] loss:3.949 CE:10.709 cos:0.3441 E[K]:4.61 α=0.30 β=2.00 lr:7.05e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[783/3250000] loss:4.051 CE:11.059 cos:0.3430 E[K]:4.56 α=0.30 β=2.00 lr:7.20e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[799/3250000] loss:3.960 CE:10.731 cos:0.3476 E[K]:4.42 α=0.30 β=2.00 lr:7.35e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[815/3250000] loss:4.043 CE:11.088 cos:0.3355 E[K]:4.38 α=0.30 β=2.00 lr:7.50e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[831/3250000] loss:4.282 CE:11.928 cos:0.3295 E[K]:4.32 α=0.30 β=2.00 lr:7.65e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[847/3250000] loss:4.310 CE:12.076 cos:0.3219 E[K]:4.22 α=0.30 β=2.00 lr:7.80e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[863/3250000] loss:4.507 CE:12.838 cos:0.3060 E[K]:4.15 α=0.30 β=2.00 lr:7.95e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[879/3250000] loss:4.767 CE:13.619 cos:0.3178 E[K]:4.07 α=0.30 β=2.00 lr:8.10e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[895/3250000] loss:4.785 CE:13.788 cos:0.3021 E[K]:4.09 α=0.30 β=2.00 lr:8.25e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[911/3250000] loss:4.508 CE:13.000 cos:0.2825 E[K]:4.10 α=0.30 β=2.00 lr:8.40e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[927/3250000] loss:4.479 CE:12.951 cos:0.2758 E[K]:4.15 α=0.30 β=2.00 lr:8.55e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[943/3250000] loss:4.770 CE:13.926 cos:0.2749 E[K]:4.23 α=0.30 β=2.00 lr:8.70e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[959/3250000] loss:4.607 CE:13.373 cos:0.2761 E[K]:4.26 α=0.30 β=2.00 lr:8.85e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[975/3250000] loss:4.566 CE:13.250 cos:0.2740 E[K]:4.26 α=0.30 β=2.00 lr:9.00e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[991/3250000] loss:4.700 CE:13.746 cos:0.2657 E[K]:4.23 α=0.30 β=2.00 lr:9.15e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1007/3250000] loss:4.631 CE:13.511 cos:0.2674 E[K]:4.22 α=0.30 β=2.00 lr:9.30e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1023/3250000] loss:4.749 CE:13.852 cos:0.2754 E[K]:4.17 α=0.30 β=2.00 lr:9.45e-05 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1039/3250000] loss:4.689 CE:13.609 cos:0.2821 E[K]:4.16 α=0.30 β=2.00 lr:9.60e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1055/3250000] loss:4.875 CE:14.215 cos:0.2837 E[K]:4.19 α=0.30 β=2.00 lr:9.75e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1071/3250000] loss:4.867 CE:14.129 cos:0.2930 E[K]:4.16 α=0.30 β=2.00 lr:9.90e-05 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1087/3250000] loss:4.745 CE:13.776 cos:0.2852 E[K]:4.11 α=0.30 β=2.00 lr:1.01e-04 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1103/3250000] loss:4.475 CE:12.770 cos:0.3009 E[K]:4.04 α=0.30 β=2.00 lr:1.02e-04 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1119/3250000] loss:4.700 CE:13.614 cos:0.2867 E[K]:4.04 α=0.30 β=2.00 lr:1.03e-04 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1135/3250000] loss:4.655 CE:13.464 cos:0.2866 E[K]:4.13 α=0.30 β=2.00 lr:1.05e-04 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1151/3250000] loss:4.666 CE:13.522 cos:0.2836 E[K]:4.19 α=0.30 β=2.00 lr:1.07e-04 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1167/3250000] loss:4.599 CE:13.370 cos:0.2728 E[K]:4.18 α=0.30 β=2.00 lr:1.08e-04 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1183/3250000] loss:4.468 CE:12.953 cos:0.2698 E[K]:4.17 α=0.30 β=2.00 lr:1.09e-04 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4
+E0[1199/3250000] loss:4.574 CE:13.265 cos:0.2758 E[K]:4.23 α=0.30 β=2.00 lr:1.11e-04 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1215/3250000] loss:4.497 CE:13.064 cos:0.2675 E[K]:4.24 α=0.30 β=2.00 lr:1.12e-04 seq:511 TPS:156 Mem:28.8/40.6GB GPUs:4
+E0[1231/3250000] loss:4.318 CE:12.399 cos:0.2771 E[K]:4.29 α=0.30 β=2.00 lr:1.14e-04 seq:511 TPS:155 Mem:28.8/40.6GB GPUs:4

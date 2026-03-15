@@ -173,6 +173,29 @@ class DistillHybridModel(nn.Module):
                          attention_mask=layer_mask)
         return fn
 
+    @staticmethod
+    def _make_ce_fn(norm_f, lm_head, lm_dtype, loss_mask_chunk):
+        """创建 CE loss 分块计算闭包 (gradient checkpoint 用)。
+
+        每次只算 1 个 micro-batch 的 logits, 避免全量 logits 占数 GB 显存。
+        """
+        def fn(h_c, l_c):
+            h_norm = norm_f(h_c)
+            logits = lm_head(h_norm.to(lm_dtype)).float()
+            V = logits.size(-1)
+            if loss_mask_chunk is not None:
+                mask = loss_mask_chunk.contiguous().view(-1).float()
+                ce = F.cross_entropy(
+                    logits.view(-1, V), l_c.view(-1), reduction='none')
+                return (ce * mask).sum(), mask.sum()
+            else:
+                valid = (l_c.view(-1) != -100).float()
+                ce = F.cross_entropy(
+                    logits.view(-1, V), l_c.view(-1),
+                    ignore_index=-100, reduction='none')
+                return (ce * valid).sum(), valid.sum()
+        return fn
+
     def _reset_bio_ssm_states(self):
         """重置所有 BioSSM 层的 PLIF 膜电位。"""
         for bio_mixer in self.bio_ssm_modules.values():
@@ -292,28 +315,30 @@ class DistillHybridModel(nn.Module):
                         attention_mask=layer_mask,
                     )
 
-        # CE loss: 梯度穿越冻结层回传到所有 BioSSM
+        # CE loss: 逐 micro-batch 分块计算, 避免全量 logits OOM
+        # (vocab 维度大, accum 个 micro-batch 拼接后 logits 在 float32 下数 GB)
         ce_loss = None
         logits = None
         if labels is not None:
-            hidden_states = backbone.norm_f(hidden_states)
-            logits = self.nvidia_model.lm_head(
-                hidden_states.to(self.nvidia_model.lm_head.weight.dtype)
-            ).float()
-            if loss_mask is not None:
-                mask = loss_mask.contiguous().view(-1).float()
-                ce_loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                    reduction='none',
-                )
-                ce_loss = (ce_loss * mask).sum() / mask.sum().clamp(min=1)
-            else:
-                ce_loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                    ignore_index=-100,
-                )
+            lm_head = self.nvidia_model.lm_head
+            lm_dtype = lm_head.weight.dtype
+            h_chunks = hidden_states.chunk(accum, dim=0)
+            l_chunks = labels.chunk(accum, dim=0)
+            m_chunks = (loss_mask.chunk(accum, dim=0)
+                        if loss_mask is not None else [None] * accum)
+
+            ce_sum = torch.tensor(0.0, device=hidden_states.device)
+            mask_sum = torch.tensor(0.0, device=hidden_states.device)
+
+            for h_c, l_c, m_c in zip(h_chunks, l_chunks, m_chunks):
+                # 每块 checkpoint: backward 时重算 logits, 不保存全量
+                _fn = self._make_ce_fn(backbone.norm_f, lm_head, lm_dtype, m_c)
+                chunk_ce, chunk_mask = ckpt_fn(
+                    _fn, h_c, l_c, use_reentrant=False)
+                ce_sum = ce_sum + chunk_ce
+                mask_sum = mask_sum + chunk_mask
+
+            ce_loss = ce_sum / mask_sum.clamp(min=1)
 
         # Hidden alignment loss (平均: 所有层 × 所有 micro-batch)
         hidden_loss = None

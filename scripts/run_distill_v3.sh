@@ -199,7 +199,7 @@ run_stage() {
 #   - 冻结层: accum 个 micro-batch 在 batch 维拼接, 1 次 FSDP all-gather
 #   - BioSSM: 逐 micro-batch (控制显存)
 #   - 52 冻结层 all-gather: 52×accum → 52×1 (accum=16 时 -93.75%)
-#   - 跳过 norm_f + lm_head + CE loss (detach_frozen 下梯度到不了 BioSSM)
+#   - CE loss 梯度端到端穿越冻结层回传到所有 BioSSM
 #
 #   Stage 1 (对齐):  α=0.3, β=2.0, lr=3e-4, seq≤512,  warmup 200
 #   Stage 2 (过渡):  α=0.7, β=0.5, lr=2e-4, seq≤1024, warmup 100

@@ -261,7 +261,7 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
 
             loss = torch.tensor(0.0, device=device)
 
-            # CE loss (detach_frozen 时为 None, 梯度到不了 BioSSM)
+            # CE loss (梯度穿越冻结层回传到 BioSSM)
             if out.ce_loss is not None:
                 loss = loss + alpha_ce * out.ce_loss
 
@@ -304,12 +304,10 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
             mem_peak = torch.cuda.max_memory_allocated() / 1e9
             seq = X_cat.shape[1]
 
-            ce_val = out.ce_loss.item() if out.ce_loss is not None else None
-            hid_val = out.hidden_loss.item() if out.hidden_loss is not None else None
-            pc_val = (out.ponder_cost.item()
-                      if torch.is_tensor(out.ponder_cost) else None)
-            ek_val = (out.ek_floor_cost.item()
-                      if torch.is_tensor(out.ek_floor_cost) else None)
+            ce_val = out.ce_loss.item()
+            hid_val = out.hidden_loss.item()
+            pc_val = out.ponder_cost.item()
+            ek_val = out.ek_floor_cost.item()
 
             dashboard.log_step(opt_step, {
                 'loss': batch_loss,
@@ -399,9 +397,6 @@ def main():
                         help='固定 CE 权重 (覆盖自动调度)')
     parser.add_argument('--beta_hidden', type=float, default=None,
                         help='固定 cosine alignment 权重 (覆盖自动调度)')
-    parser.add_argument('--no_detach_frozen', action='store_true',
-                        help='不切断冻结层梯度 (CE loss 可跨层传播, 但显存更高)')
-
     # FSDP
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
                         choices=['full_shard', 'shard_grad_op', 'no_shard'])
@@ -475,11 +470,8 @@ def main():
     )
 
     # BioSSM 初始化用统一种子 (torch.manual_seed(42) 已在上方设置)
-    detach_frozen = not args.no_detach_frozen
-    distill_model = DistillHybridModel(nvidia_model, bio_config,
-                                        detach_frozen=detach_frozen)
-    Log(f'  冻结层梯度: {"切断 (省显存)" if detach_frozen else "保留 (CE 跨层传播)"}',
-        rank)
+    distill_model = DistillHybridModel(nvidia_model, bio_config)
+    Log(f'  冻结层梯度: 保留 (CE loss 端到端回传)', rank)
 
     n_mamba = distill_model._num_mamba
     bio_params = sum(p.numel() for p in distill_model.bio_ssm_modules.parameters())

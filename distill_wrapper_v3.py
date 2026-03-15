@@ -6,7 +6,7 @@ v3 蒸馏封装: NVIDIA NemotronH + 并行 BioSSM
   2. 在每个 Mamba 位置并行挂载 BioSSMMixer (可训练)
   3. Forward: Mamba(no_grad) 和 BioSSM 并行跑, BioSSM 输出进入残差流
   4. 每个 Mamba 位置收集 cosine alignment loss
-  5. 最终 logits 走 student 路径 (BioSSM)
+  5. 最终 logits 走 student 路径 (BioSSM), CE loss 梯度穿越冻结层回传
 
 通讯优化 (layer-batched accumulation):
   - 将梯度累积从 micro-step 维度翻转到 layer 维度
@@ -15,10 +15,8 @@ v3 蒸馏封装: NVIDIA NemotronH + 并行 BioSSM
   - 冻结层 all-gather 从 52×accum 降到 52×1 (accum=16 时 -93.75%)
 
 显存优化:
-  - 冻结层 detach+no_grad: 不保存激活, 不做 backward all-gather
   - BioSSM gradient checkpointing: 只保存输入, backward 时重算
     (每层 seq=2048 时 ~5.4GB 激活 → checkpoint 后仅 ~11MB)
-  - detach_frozen 时跳过 norm_f + lm_head + CE loss (梯度到不了 BioSSM)
   - FSDP use_orig_params=True, 分片所有参数
 """
 
@@ -122,17 +120,15 @@ class DistillHybridModel(nn.Module):
     Args:
         nvidia_model: NemotronHForCausalLM (pretrained, 将被冻结)
         bio_ssm_config: BioSSM 配置
-        detach_frozen: 切断冻结层梯度 (省显存+通信, 默认 True)
-            True:  BioSSM 仅从 cosine alignment 获得梯度 (逐层独立优化)
-            False: CE loss 梯度可穿越冻结层到达所有 BioSSM (显存更高)
+
+    梯度流: CE loss → norm_f → 冻结层(保持梯度流) → BioSSM, 端到端训练。
+    冻结层参数 requires_grad=False, 不产生梯度更新, 但梯度可穿越。
     """
 
-    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig,
-                 detach_frozen: bool = True):
+    def __init__(self, nvidia_model, bio_ssm_config: BioSSMConfig):
         super().__init__()
         self.nvidia_model = nvidia_model
         self.bio_ssm_config = bio_ssm_config
-        self.detach_frozen = detach_frozen
 
         # 冻结所有原始参数
         for p in self.nvidia_model.parameters():
@@ -210,8 +206,8 @@ class DistillHybridModel(nn.Module):
 
         layer_cosine_losses = []
         self._layer_cosine_dict = {}
-        total_ponder = 0.0
-        total_ek_floor = 0.0
+        total_ponder = torch.tensor(0.0, device=hidden_states.device)
+        total_ek_floor = torch.tensor(0.0, device=hidden_states.device)
         self._mamba_mixer_outputs = {}
 
         for idx, block in enumerate(backbone.layers):
@@ -269,32 +265,23 @@ class DistillHybridModel(nn.Module):
 
             else:
                 # ===== 冻结层: 拼接 batch 一次 forward (1 次 FSDP all-gather) =====
+                # 冻结层 requires_grad=False, 不产生梯度更新, 但梯度可穿越到 BioSSM
                 if block.block_type == "attention":
                     layer_mask = causal_mask
                 else:
                     layer_mask = None
 
-                if self.detach_frozen:
-                    hidden_states = hidden_states.detach()
-                    with torch.no_grad():
-                        hidden_states = block(
-                            hidden_states,
-                            cache_params=None,
-                            cache_position=cache_position,
-                            attention_mask=layer_mask,
-                        )
-                else:
-                    hidden_states = block(
-                        hidden_states,
-                        cache_params=None,
-                        cache_position=cache_position,
-                        attention_mask=layer_mask,
-                    )
+                hidden_states = block(
+                    hidden_states,
+                    cache_params=None,
+                    cache_position=cache_position,
+                    attention_mask=layer_mask,
+                )
 
-        # CE loss: detach_frozen 时梯度到不了 BioSSM, 跳过 norm_f + lm_head 省计算
+        # CE loss: 梯度穿越冻结层回传到所有 BioSSM
         ce_loss = None
         logits = None
-        if labels is not None and not self.detach_frozen:
+        if labels is not None:
             hidden_states = backbone.norm_f(hidden_states)
             logits = self.nvidia_model.lm_head(
                 hidden_states.to(self.nvidia_model.lm_head.weight.dtype)

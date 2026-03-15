@@ -186,102 +186,131 @@ def save_checkpoint(model, optimizer, step, args, rank):
 def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
                 dashboard, args, epoch, iter_per_epoch, tokens_seen,
                 rank, world_size):
-    """单 epoch 蒸馏训练。"""
+    """单 epoch 蒸馏训练 (layer-batched accumulation)。
+
+    核心优化: 收集 accum 个 micro-batch, 在 batch 维拼接后一次 forward。
+    冻结层对拼接 batch 只做 1 次 FSDP all-gather (而非 accum 次)。
+    BioSSM 内部逐 micro-batch 处理 (控制显存峰值)。
+
+    通讯量: 52 冻结层 × 1 次/optimizer_step (原: 52 × accum)
+    """
     sampler.set_epoch(epoch)
     model.train()
     start_time = time.time()
     local_rank = int(os.environ["LOCAL_RANK"])
+    device = f"cuda:{local_rank}"
     total_iters = args.epochs * iter_per_epoch
+    accum = args.accumulation_steps
+
+    # 收集 micro-batch 的缓冲区
+    micro_X, micro_Y, micro_M = [], [], []
+    micro_step_base = 0  # 当前累积窗口的第一个 micro-step
 
     for step, (X, Y, loss_mask) in enumerate(train_loader):
         global_step = epoch * iter_per_epoch + step
 
-        # 序列长度课程
+        # 记录累积窗口起点 (用于 curriculum 和调度)
+        if not micro_X:
+            micro_step_base = global_step
+
+        # 序列长度课程 (同一累积窗口内统一 seq_len, 基于窗口起点)
         if not args.no_curriculum:
-            curr_seq = get_curriculum_seq_len(global_step, total_iters, args.max_length)
+            curr_seq = get_curriculum_seq_len(
+                micro_step_base, total_iters, args.max_length)
             X = X[:, :curr_seq]
             Y = Y[:, :curr_seq]
             loss_mask = loss_mask[:, :curr_seq]
 
-        X = X.to(f"cuda:{local_rank}", non_blocking=True)
-        Y = Y.to(f"cuda:{local_rank}", non_blocking=True)
-        loss_mask = loss_mask.to(f"cuda:{local_rank}", non_blocking=True)
+        micro_X.append(X.to(device, non_blocking=True))
+        micro_Y.append(Y.to(device, non_blocking=True))
+        micro_M.append(loss_mask.to(device, non_blocking=True))
 
-        # 学习率
-        opt_step = global_step // args.accumulation_steps
-        lr = get_lr_wsd(opt_step, total_iters // args.accumulation_steps,
+        is_boundary = (step + 1) % accum == 0
+        if not is_boundary:
+            continue
+
+        # ===================== 累积窗口完整, 一次性处理 =====================
+        n_micro = len(micro_X)
+        opt_step = global_step // accum
+
+        # 学习率 (基于 optimizer step)
+        lr = get_lr_wsd(opt_step, total_iters // accum,
                         args.learning_rate, args.warmup_iters)
         for pg in optimizer.param_groups:
             pg['lr'] = lr * pg.get('lr_mult', 1.0)
 
-        # 蒸馏调度 (固定值优先)
+        # 蒸馏调度
         if args.alpha_ce is not None and args.beta_hidden is not None:
             alpha_ce, beta_hidden = args.alpha_ce, args.beta_hidden
         else:
-            alpha_ce, beta_hidden = get_distill_schedule(global_step, total_iters)
+            alpha_ce, beta_hidden = get_distill_schedule(
+                micro_step_base, total_iters)
 
-        is_boundary = (step + 1) % args.accumulation_steps == 0
-        sync_ctx = nullcontext() if is_boundary else model.no_sync()
+        # 拼接所有 micro-batch (batch 维)
+        X_cat = torch.cat(micro_X, dim=0)
+        Y_cat = torch.cat(micro_Y, dim=0)
+        M_cat = torch.cat(micro_M, dim=0)
+        micro_X, micro_Y, micro_M = [], [], []
 
-        with sync_ctx:
-            with ctx:
-                out = model(X, Y, loss_mask=loss_mask)
+        # Forward: 冻结层处理拼接 batch, BioSSM 逐 micro-batch
+        with ctx:
+            out = model(
+                X_cat, Y_cat, loss_mask=M_cat,
+                accumulation_steps=n_micro,
+            )
 
-                loss = torch.tensor(0.0, device=X.device)
+            loss = torch.tensor(0.0, device=device)
 
-                # CE loss
-                if out.ce_loss is not None:
-                    loss = loss + alpha_ce * out.ce_loss
+            # CE loss (detach_frozen 时为 None, 梯度到不了 BioSSM)
+            if out.ce_loss is not None:
+                loss = loss + alpha_ce * out.ce_loss
 
-                # Hidden alignment (cosine)
-                if out.hidden_loss is not None:
-                    loss = loss + beta_hidden * out.hidden_loss
+            # Hidden alignment (cosine) — 主要训练信号
+            if out.hidden_loss is not None:
+                loss = loss + beta_hidden * out.hidden_loss
 
-                # SNN 正则
-                if out.ponder_cost is not None and args.ponder_weight > 0:
-                    loss = loss + args.ponder_weight * out.ponder_cost
-                if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
-                    loss = loss + args.ek_floor_weight * out.ek_floor_cost
+            # SNN 正则
+            if out.ponder_cost is not None and args.ponder_weight > 0:
+                loss = loss + args.ponder_weight * out.ponder_cost
+            if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
+                loss = loss + args.ek_floor_weight * out.ek_floor_cost
 
-                loss = loss / args.accumulation_steps
+            # 注意: forward 内部已平均 (layers × micro-batches), 无需再除 accum
 
-            loss.backward()
+        loss.backward()
 
-        if is_boundary:
-            # Dashboard: 缓存梯度范数 (all ranks 参与 all_reduce)
-            if step % args.log_interval < args.accumulation_steps:
-                dashboard.cache_grad_norms(model)
+        # Gradient ops
+        should_log = (step % args.log_interval < accum)
+        if should_log:
+            dashboard.cache_grad_norms(model)
 
-            raw_model.compensate_modulation_gradients()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+        raw_model.compensate_modulation_gradients()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
 
-        # Token 统计 (本地累积, 仅 boundary step 做 all_reduce 减少通讯)
-        local_valid = int(loss_mask.view(-1).sum().item())
-        if is_boundary:
-            valid_tokens = torch.tensor(local_valid, device=X.device, dtype=torch.long)
-            if world_size > 1:
-                dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
-            tokens_seen += int(valid_tokens.item())
-        else:
-            tokens_seen += local_valid * world_size  # 近似 (各卡 batch 相同大小)
+        # Token 统计 (1 次 all_reduce/optimizer_step)
+        valid_tokens = M_cat.view(-1).sum()
+        if world_size > 1:
+            dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
+        tokens_seen += int(valid_tokens.item())
 
         # 日志
-        if is_boundary and step % args.log_interval < args.accumulation_steps:
-            batch_loss = loss.item() * args.accumulation_steps
+        if should_log:
+            batch_loss = loss.item()
             elapsed = time.time() - start_time
             tps = tokens_seen / max(elapsed, 1)
             mem_cur = torch.cuda.memory_allocated() / 1e9
             mem_peak = torch.cuda.max_memory_allocated() / 1e9
-            seq = X.shape[1]
+            seq = X_cat.shape[1]
 
             ce_val = out.ce_loss.item() if out.ce_loss is not None else None
             hid_val = out.hidden_loss.item() if out.hidden_loss is not None else None
-            pc_val = out.ponder_cost.item() if torch.is_tensor(out.ponder_cost) else None
-            ek_val = out.ek_floor_cost.item() if torch.is_tensor(out.ek_floor_cost) else None
+            pc_val = (out.ponder_cost.item()
+                      if torch.is_tensor(out.ponder_cost) else None)
+            ek_val = (out.ek_floor_cost.item()
+                      if torch.is_tensor(out.ek_floor_cost) else None)
 
-            # Dashboard TensorBoard
             dashboard.log_step(opt_step, {
                 'loss': batch_loss,
                 'ce_loss': ce_val,
@@ -298,23 +327,27 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
                 'memory_peak_gb': mem_peak,
             }, raw_model)
 
-            # 终端输出
             if rank == 0:
                 ce_str = f'{ce_val:.3f}' if ce_val is not None else '-'
                 hid_str = f'{hid_val:.4f}' if hid_val is not None else '-'
                 pc_str = f'{pc_val:.2f}' if pc_val is not None else '-'
 
                 print(
-                    f'E{epoch}[{step}/{iter_per_epoch}] '
-                    f'loss:{batch_loss:.3f} CE:{ce_str} cos:{hid_str} E[K]:{pc_str} '
-                    f'α={alpha_ce:.2f} β={beta_hidden:.2f} lr:{lr:.2e} seq:{seq} '
+                    f'E{epoch}[{opt_step}] '
+                    f'loss:{batch_loss:.4f} CE:{ce_str} cos:{hid_str} '
+                    f'E[K]:{pc_str} '
+                    f'α={alpha_ce:.2f} β={beta_hidden:.2f} '
+                    f'lr:{lr:.2e} seq:{seq} '
                     f'TPS:{tps:.0f} Mem:{mem_cur:.1f}/{mem_peak:.1f}GB '
                     f'GPUs:{world_size}',
                     flush=True,
                 )
 
+        # 释放拼接 tensor
+        del X_cat, Y_cat, M_cat, out
+
         # 保存
-        if is_boundary and opt_step > 0 and opt_step % args.save_interval == 0:
+        if opt_step > 0 and opt_step % args.save_interval == 0:
             dashboard.log_save_point(opt_step, raw_model)
             model.eval()
             save_checkpoint(model, optimizer, global_step, args, rank)

@@ -8,10 +8,17 @@ v3 蒸馏封装: NVIDIA NemotronH + 并行 BioSSM
   4. 每个 Mamba 位置收集 cosine alignment loss
   5. 最终 logits 走 student 路径 (BioSSM)
 
+通讯优化 (layer-batched accumulation):
+  - 将梯度累积从 micro-step 维度翻转到 layer 维度
+  - 冻结层: accum 个 micro-batch 拼接 batch 维, 一次 FSDP all-gather
+  - BioSSM: 逐 micro-batch 处理 (控制显存峰值)
+  - 冻结层 all-gather 从 52×accum 降到 52×1 (accum=16 时 -93.75%)
+
 显存优化:
   - 冻结层 detach+no_grad: 不保存激活, 不做 backward all-gather
   - BioSSM gradient checkpointing: 只保存输入, backward 时重算
     (每层 seq=2048 时 ~5.4GB 激活 → checkpoint 后仅 ~11MB)
+  - detach_frozen 时跳过 norm_f + lm_head + CE loss (梯度到不了 BioSSM)
   - FSDP use_orig_params=True, 分片所有参数
 """
 
@@ -173,33 +180,44 @@ class DistillHybridModel(nn.Module):
         labels: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        accumulation_steps: int = 1,
     ) -> DistillOutput:
+        """蒸馏前向传播。
+
+        当 accumulation_steps > 1 时, input_ids 的 batch 维包含 accum 个 micro-batch
+        拼接. 冻结层一次性处理拼接 batch (1 次 FSDP all-gather), BioSSM 逐 micro-batch
+        处理 (控制显存峰值). 通讯量从 52×accum 降到 52.
+
+        Args:
+            input_ids: (accum * batch, seq) — 多个 micro-batch 在 batch 维拼接
+            labels: (accum * batch, seq) 或 None
+            loss_mask: (accum * batch, seq) 或 None
+            attention_mask: 通常 None (训练模式)
+            accumulation_steps: micro-batch 数量, 1 = 无累积 (兼容旧行为)
+        """
         backbone = self.nvidia_model.backbone
+        accum = accumulation_steps
 
         # Embedding
         hidden_states = backbone.embeddings(input_ids)
-        batch, seq_len = input_ids.shape
+        batch_total, seq_len = input_ids.shape
 
-        # Masks
+        # Masks (基于完整拼接 batch 创建, batch 维独立, 安全)
         cache_position = torch.arange(seq_len, device=hidden_states.device)
-        causal_mask = backbone._update_causal_mask(attention_mask, hidden_states, cache_position)
+        causal_mask = backbone._update_causal_mask(
+            attention_mask, hidden_states, cache_position)
         mamba_mask = backbone._update_mamba_mask(attention_mask, cache_position)
-
-        # 重置 BioSSM 神经元状态
-        self._reset_bio_ssm_states()
 
         layer_cosine_losses = []
         self._layer_cosine_dict = {}
         total_ponder = 0.0
         total_ek_floor = 0.0
-
         self._mamba_mixer_outputs = {}
 
         for idx, block in enumerate(backbone.layers):
             if idx in self._mamba_set:
-                # ===== Mamba 位置: teacher(no_grad) + student(checkpointed) =====
-                # Teacher: 调用完整 block() 触发 FSDP all-gather
-                # mixer 输出通过 forward hook 自动捕获
+                # ===== Mamba 位置 =====
+                # Teacher: 拼接 batch 一次 forward (1 次 FSDP all-gather)
                 with torch.no_grad():
                     block(
                         hidden_states,
@@ -207,38 +225,56 @@ class DistillHybridModel(nn.Module):
                         cache_position=cache_position,
                         attention_mask=mamba_mask,
                     )
-                mamba_out = self._mamba_mixer_outputs.pop(idx)  # pop 释放引用
+                mamba_out = self._mamba_mixer_outputs.pop(idx)
 
-                # BioSSM: gradient checkpointing 省 ~5.4GB/层 激活内存
+                # BioSSM: 逐 micro-batch (控制显存, K=16 展开占大量显存)
                 bio_mixer = self.bio_ssm_modules[str(idx)]
-                if self.training:
-                    bio_out = ckpt_fn(bio_mixer, hidden_states, use_reentrant=False)
+                h_chunks = hidden_states.chunk(accum, dim=0)
+                m_chunks = mamba_out.chunk(accum, dim=0)
+                del mamba_out
+
+                bio_outs = []
+                layer_cos_sum = 0.0
+                for i in range(accum):
+                    # 每个 micro-batch 重置神经元膜电位
+                    bio_mixer.bio_ssm.input_neuron.v = 0.
+                    bio_mixer.bio_ssm.snn_block.hidden_neuron.v = 0.
+
+                    if self.training:
+                        bo = ckpt_fn(bio_mixer, h_chunks[i],
+                                     use_reentrant=False)
+                    else:
+                        bo = bio_mixer(h_chunks[i])
+                    bio_outs.append(bo)
+
+                    cos_loss = compute_layer_cosine_loss(
+                        bo, m_chunks[i].detach())
+                    layer_cosine_losses.append(cos_loss)
+                    layer_cos_sum += cos_loss.detach().item()
+
+                    if bio_mixer.ponder_cost is not None:
+                        total_ponder = total_ponder + bio_mixer.ponder_cost
+                    if bio_mixer.ek_floor_cost is not None:
+                        total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
+
+                self._layer_cosine_dict[idx] = layer_cos_sum / accum
+
+                # 重组 bio_out 到拼接 batch 维
+                if accum > 1:
+                    bio_out_cat = torch.cat(bio_outs, dim=0)
                 else:
-                    bio_out = bio_mixer(hidden_states)
+                    bio_out_cat = bio_outs[0]
+                hidden_states = hidden_states + bio_out_cat
+                del h_chunks, m_chunks, bio_outs, bio_out_cat
 
-                # 逐层 cosine alignment loss
-                cos_loss = compute_layer_cosine_loss(bio_out, mamba_out.detach())
-                layer_cosine_losses.append(cos_loss)
-                self._layer_cosine_dict[idx] = cos_loss.detach().item()
-
-                # 收集 SNN cost (checkpoint 重算时属性会更新, 但 tensor 引用已被 loss 捕获)
-                if bio_mixer.ponder_cost is not None:
-                    total_ponder = total_ponder + bio_mixer.ponder_cost
-                if bio_mixer.ek_floor_cost is not None:
-                    total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
-
-                # Student 残差流 (BioSSM 输出替代 Mamba)
-                hidden_states = hidden_states + bio_out
             else:
-                # ===== 非 Mamba 层: 冻结直通 =====
+                # ===== 冻结层: 拼接 batch 一次 forward (1 次 FSDP all-gather) =====
                 if block.block_type == "attention":
                     layer_mask = causal_mask
                 else:
                     layer_mask = None
 
                 if self.detach_frozen:
-                    # 切断梯度: 不通过冻结层反向传播
-                    # 省显存 (无需保存激活) + 省通信 (无 backward all-gather)
                     hidden_states = hidden_states.detach()
                     with torch.no_grad():
                         hidden_states = block(
@@ -255,21 +291,14 @@ class DistillHybridModel(nn.Module):
                         attention_mask=layer_mask,
                     )
 
-        # Final norm + LM head
-        hidden_states = backbone.norm_f(hidden_states)
-        logits = self.nvidia_model.lm_head(
-            hidden_states.to(self.nvidia_model.lm_head.weight.dtype)
-        ).float()
-
-        # Loss
+        # CE loss: detach_frozen 时梯度到不了 BioSSM, 跳过 norm_f + lm_head 省计算
         ce_loss = None
-        hidden_loss = None
-        loss = None
-
-        if labels is not None:
-            # CE loss
-            # PretrainDataset 已做 shift: X=input_id[:-1], Y=input_id[1:]
-            # logits[i] 预测 labels[i], 无需再 shift
+        logits = None
+        if labels is not None and not self.detach_frozen:
+            hidden_states = backbone.norm_f(hidden_states)
+            logits = self.nvidia_model.lm_head(
+                hidden_states.to(self.nvidia_model.lm_head.weight.dtype)
+            ).float()
             if loss_mask is not None:
                 mask = loss_mask.contiguous().view(-1).float()
                 ce_loss = F.cross_entropy(
@@ -285,16 +314,18 @@ class DistillHybridModel(nn.Module):
                     ignore_index=-100,
                 )
 
-            # Hidden alignment loss (平均逐层 cosine)
-            if layer_cosine_losses:
-                hidden_loss = sum(layer_cosine_losses) / len(layer_cosine_losses)
+        # Hidden alignment loss (平均: 所有层 × 所有 micro-batch)
+        hidden_loss = None
+        if layer_cosine_losses:
+            hidden_loss = sum(layer_cosine_losses) / len(layer_cosine_losses)
 
-        # Ponder / EK floor (平均)
-        ponder_cost = total_ponder / max(self._num_mamba, 1)
-        ek_floor_cost = total_ek_floor / max(self._num_mamba, 1)
+        # Ponder / EK floor (平均: 所有层 × 所有 micro-batch)
+        n_total = max(self._num_mamba * accum, 1)
+        ponder_cost = total_ponder / n_total
+        ek_floor_cost = total_ek_floor / n_total
 
         return DistillOutput(
-            loss=loss,
+            loss=None,
             logits=logits,
             ce_loss=ce_loss,
             hidden_loss=hidden_loss,

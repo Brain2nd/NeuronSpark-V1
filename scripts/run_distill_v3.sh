@@ -146,9 +146,7 @@ run_stage() {
     local lr=$4
     local max_len=$5
     local warmup=$6
-    local batch=$7
-    local accum=$8
-    local extra_args="${9:-}"
+    local extra_args="${7:-}"
 
     local log_dir="${LOG_BASE}/stage${stage}"
     local resume_arg=""
@@ -164,11 +162,9 @@ run_stage() {
         echo "  恢复自 (自动): $ckpt"
     fi
 
-    local eff=$((batch * NGPU * accum))
     echo ""
     echo "============================================================"
     echo "  Stage $stage: α=$alpha β=$beta lr=$lr max_len=$max_len"
-    echo "  Batch: ${batch}/gpu × ${NGPU} × accum ${accum} = ${eff}"
     echo "  TensorBoard: $log_dir"
     echo "============================================================"
 
@@ -182,7 +178,7 @@ run_stage() {
         --alpha_ce "$alpha" --beta_hidden "$beta" \
         --learning_rate "$lr" --max_length "$max_len" \
         --warmup_iters "$warmup" \
-        --batch_size "$batch" --accumulation_steps "$accum" \
+        --batch_size "$BATCH" --accumulation_steps "$ACCUM" \
         --grad_clip "$GRAD_CLIP" --neuron_lr_mult "$NEURON_LR" \
         --weight_decay "$WEIGHT_DECAY" \
         --ponder_weight "$PONDER_W" --ek_floor_weight "$EK_FLOOR_W" \
@@ -198,18 +194,16 @@ run_stage() {
 
 # ======================== 三阶段执行 ========================
 #
-# 通讯优化: 增大 batch_size 减少 micro-steps → 线性减少冻结层 all-gather 次数
-# effective batch = batch × NGPU × accum = 64 (恒定)
+# 通讯优化 (layer-batched accumulation):
+#   梯度累积从 micro-step 维翻转到 layer 维:
+#   - 冻结层: accum 个 micro-batch 在 batch 维拼接, 1 次 FSDP all-gather
+#   - BioSSM: 逐 micro-batch (控制显存)
+#   - 52 冻结层 all-gather: 52×accum → 52×1 (accum=16 时 -93.75%)
+#   - 跳过 norm_f + lm_head + CE loss (detach_frozen 下梯度到不了 BioSSM)
 #
-# 52 冻结层 × micro-steps 次 all-gather/optimizer_step:
-#   Stage 1: 4×4×4=64,  micro=4  → 208 all-gathers (-75% vs accum=16)
-#   Stage 2: 2×4×8=64,  micro=8  → 416 all-gathers (-50%)
-#   Stage 3: 1×4×16=64, micro=16 → 832 all-gathers (显存限制)
-#
-#                           α    β    lr    seq   warm batch accum
-#   Stage 1 (对齐):        0.3  2.0  3e-4  512   200  4     4
-#   Stage 2 (过渡):        0.7  0.5  2e-4  1024  100  2     8
-#   Stage 3 (自主):        1.0  0.1  1e-4  2048  100  1     16   --no_curriculum
+#   Stage 1 (对齐):  α=0.3, β=2.0, lr=3e-4, seq≤512,  warmup 200
+#   Stage 2 (过渡):  α=0.7, β=0.5, lr=2e-4, seq≤1024, warmup 100
+#   Stage 3 (自主):  α=1.0, β=0.1, lr=1e-4, seq≤2048, warmup 100, 无课程
 #
 
 should_run() {
@@ -217,16 +211,15 @@ should_run() {
 }
 
 if should_run 1; then
-    #                α    β    lr    seq  warm batch accum
-    run_stage 1     0.3  2.0  3e-4  512  200  4     4
+    run_stage 1  0.3  2.0  3e-4  512   200
 fi
 
 if should_run 2; then
-    run_stage 2     0.7  0.5  2e-4  1024 100  2     8
+    run_stage 2  0.7  0.5  2e-4  1024  100
 fi
 
 if should_run 3; then
-    run_stage 3     1.0  0.1  1e-4  2048 100  1     16  "--no_curriculum"
+    run_stage 3  1.0  0.1  1e-4  2048  100  "--no_curriculum"
 fi
 
 # ======================== 完成 ========================

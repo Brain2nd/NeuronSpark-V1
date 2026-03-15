@@ -257,11 +257,15 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
 
-        # Token 统计
-        valid_tokens = loss_mask.view(-1).sum()
-        if world_size > 1:
-            dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
-        tokens_seen += int(valid_tokens.item())
+        # Token 统计 (本地累积, 仅 boundary step 做 all_reduce 减少通讯)
+        local_valid = int(loss_mask.view(-1).sum().item())
+        if is_boundary:
+            valid_tokens = torch.tensor(local_valid, device=X.device, dtype=torch.long)
+            if world_size > 1:
+                dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
+            tokens_seen += int(valid_tokens.item())
+        else:
+            tokens_seen += local_valid * world_size  # 近似 (各卡 batch 相同大小)
 
         # 日志
         if is_boundary and step % args.log_interval < args.accumulation_steps:

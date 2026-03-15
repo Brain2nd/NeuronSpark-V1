@@ -15,8 +15,8 @@ v3 蒸馏封装: NVIDIA NemotronH + 并行 BioSSM
   - 冻结层 all-gather 从 52×accum 降到 52×1 (accum=16 时 -93.75%)
 
 显存优化:
-  - BioSSM gradient checkpointing: 只保存输入, backward 时重算
-    (每层 seq=2048 时 ~5.4GB 激活 → checkpoint 后仅 ~11MB)
+  - 全层 gradient checkpointing: 冻结层和 BioSSM 均不保存中间激活, backward 时重算
+    (冻结层激活省数 GB, BioSSM 每层 seq=2048 时 ~5.4GB → checkpoint 后 ~11MB)
   - FSDP use_orig_params=True, 分片所有参数
 """
 
@@ -164,6 +164,15 @@ class DistillHybridModel(nn.Module):
             self._mamba_mixer_outputs[idx] = output
         return hook
 
+    @staticmethod
+    def _make_frozen_fn(block, cache_position, layer_mask):
+        """创建冻结层 forward 闭包 (正确捕获循环变量, 避免 late binding)。"""
+        def fn(hidden_states):
+            return block(hidden_states, cache_params=None,
+                         cache_position=cache_position,
+                         attention_mask=layer_mask)
+        return fn
+
     def _reset_bio_ssm_states(self):
         """重置所有 BioSSM 层的 PLIF 膜电位。"""
         for bio_mixer in self.bio_ssm_modules.values():
@@ -264,19 +273,24 @@ class DistillHybridModel(nn.Module):
                 del h_chunks, m_chunks, bio_outs, bio_out_cat
 
             else:
-                # ===== 冻结层: 拼接 batch 一次 forward (1 次 FSDP all-gather) =====
-                # 冻结层 requires_grad=False, 不产生梯度更新, 但梯度可穿越到 BioSSM
+                # ===== 冻结层: gradient checkpointing 省激活显存 =====
+                # 不保存中间激活, backward 时重算; 梯度仍穿越到 BioSSM
                 if block.block_type == "attention":
                     layer_mask = causal_mask
                 else:
                     layer_mask = None
 
-                hidden_states = block(
-                    hidden_states,
-                    cache_params=None,
-                    cache_position=cache_position,
-                    attention_mask=layer_mask,
-                )
+                if self.training:
+                    _fn = self._make_frozen_fn(block, cache_position, layer_mask)
+                    hidden_states = ckpt_fn(_fn, hidden_states,
+                                            use_reentrant=False)
+                else:
+                    hidden_states = block(
+                        hidden_states,
+                        cache_params=None,
+                        cache_position=cache_position,
+                        attention_mask=layer_mask,
+                    )
 
         # CE loss: 梯度穿越冻结层回传到所有 BioSSM
         ce_loss = None

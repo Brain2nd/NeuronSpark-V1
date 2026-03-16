@@ -1,0 +1,264 @@
+W0316 08:09:53.903000 7114 torch/distributed/run.py:766] 
+W0316 08:09:53.903000 7114 torch/distributed/run.py:766] *****************************************
+W0316 08:09:53.903000 7114 torch/distributed/run.py:766] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0316 08:09:53.903000 7114 torch/distributed/run.py:766] *****************************************
+加载 Teacher: /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   0%|          | 0/13 [00:00<?, ?it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:06,  1.96it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:06,  1.81it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:04,  2.44it/s]Loading checkpoint shards:   8%|▊         | 1/13 [00:00<00:04,  2.55it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:03,  2.79it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:03,  2.93it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:03,  3.41it/s]Loading checkpoint shards:  15%|█▌        | 2/13 [00:00<00:03,  3.33it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:02,  3.77it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:02,  3.91it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:02,  4.27it/s]Loading checkpoint shards:  23%|██▎       | 3/13 [00:00<00:02,  4.34it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:01<00:02,  3.24it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:01<00:02,  3.10it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:01<00:02,  3.27it/s]Loading checkpoint shards:  31%|███       | 4/13 [00:01<00:02,  3.05it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:01<00:02,  2.79it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:01<00:02,  2.90it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:01<00:02,  2.82it/s]Loading checkpoint shards:  38%|███▊      | 5/13 [00:01<00:02,  2.89it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:01<00:02,  3.26it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:01<00:02,  3.24it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:01<00:02,  3.33it/s]Loading checkpoint shards:  46%|████▌     | 6/13 [00:01<00:02,  3.34it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:02<00:01,  3.82it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:02<00:01,  3.79it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:02<00:01,  3.88it/s]Loading checkpoint shards:  54%|█████▍    | 7/13 [00:01<00:01,  3.88it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:02<00:01,  4.31it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:02<00:01,  4.29it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:02<00:01,  4.34it/s]Loading checkpoint shards:  62%|██████▏   | 8/13 [00:02<00:01,  4.34it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:02<00:00,  4.71it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:02<00:00,  4.68it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:02<00:00,  4.71it/s]Loading checkpoint shards:  69%|██████▉   | 9/13 [00:02<00:00,  4.70it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:02<00:00,  5.00it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:02<00:00,  4.95it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:02<00:00,  4.97it/s]Loading checkpoint shards:  77%|███████▋  | 10/13 [00:02<00:00,  4.96it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:02<00:00,  4.94it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:02<00:00,  4.95it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:02<00:00,  5.01it/s]Loading checkpoint shards:  85%|████████▍ | 11/13 [00:02<00:00,  5.02it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:02<00:00,  4.42it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:03<00:00,  4.38it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:03<00:00,  4.38it/s]Loading checkpoint shards:  92%|█████████▏| 12/13 [00:03<00:00,  4.41it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  5.22it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  5.18it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  5.18it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  4.18it/s]
+Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  5.21it/s]Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  4.03it/s]
+Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  3.98it/s]
+Loading checkpoint shards: 100%|██████████| 13/13 [00:03<00:00,  4.16it/s]
+  Teacher: 31.6B params, D=2688, L=52
+  冻结层梯度: 保留 (CE loss 端到端回传)
+  BioSSM: 23 层, 3823.2M 可训练参数 (N=4, K=16)
+  dtype 分布: {torch.bfloat16: 6197, torch.float32: 414}
+    torch.float32 → torch.bfloat16 (例: nvidia_model.backbone.layers.1.mixer.gate.weight)
+  全模型 dtype 对齐: torch.bfloat16
+  FSDP wrap 类: transformers_modules.NVIDIA-Nemotron-3-Nano-30B-A3B-BF16.modeling_nemotron_h.NemotronHBlock
+  类匹配验证: 52/52 层命中 (应为 52)
+  FSDP 分片后 GPU0 显存: 17.70 GB (预期 ~17GB, 若 >40GB 则分片失败)
+  FSDP 内部 wrap 数: 75 (预期 ~75)
+  Tokenizer: vocab=131072
+  数据: /workspace/NeuronSpark-V1/data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl (type=jsonl, col=text)
+  样本数: 13,000,000
+
+============================================================
+NeuronSpark v3 蒸馏: Mamba → BioSSM (FSDP, 4 GPUs)
+  Teacher:      /workspace/models/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+  BioSSM:       N=4, K=16, 3823.2M params
+  Mamba 层数:    23
+  Data:         /workspace/NeuronSpark-V1/data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl
+  Batch:        1/gpu × 4 × accum 16 = 64
+  LR:           0.0003 (WSD, warmup 200)
+  Neuron LR:    0.0029999999999999996 (10.0×)
+  Loss:         CE + cosine_align + ponder(0.1) + ek_floor(0.1)
+  α/β 固定:     α=0.3, β=2.0
+  Curriculum:   OFF
+  Cos floor:    0.15 (adaptive β)
+  EK smooth:    0.05
+  TensorBoard:  runs/distill_v3/stage1_f0e2d8f
+============================================================
+
+E0[0] loss:7.4713 CE:16.224 cos:1.0022 E[K]:2.00 α=0.30 β=2.00 lr:0.00e+00 seq:511 TPS:277 Mem:28.5/35.3GB GPUs:4
+E0[1] loss:7.4782 CE:16.247 cos:1.0021 E[K]:2.00 α=0.30 β=2.00 lr:1.50e-06 seq:511 TPS:291 Mem:28.5/39.2GB GPUs:4
+E0[2] loss:7.5071 CE:16.359 cos:0.9999 E[K]:2.00 α=0.30 β=2.00 lr:3.00e-06 seq:511 TPS:299 Mem:28.5/39.2GB GPUs:4
+E0[3] loss:7.3883 CE:16.019 cos:0.9916 E[K]:2.00 α=0.30 β=2.00 lr:4.50e-06 seq:511 TPS:299 Mem:28.5/39.2GB GPUs:4
+E0[4] loss:7.3999 CE:16.226 cos:0.9667 E[K]:2.00 α=0.30 β=2.00 lr:6.00e-06 seq:511 TPS:302 Mem:28.5/39.2GB GPUs:4
+E0[5] loss:7.3451 CE:16.242 cos:0.9372 E[K]:2.01 α=0.30 β=2.00 lr:7.50e-06 seq:511 TPS:303 Mem:28.5/39.2GB GPUs:4
+E0[6] loss:7.1801 CE:15.907 cos:0.9055 E[K]:2.01 α=0.30 β=2.00 lr:9.00e-06 seq:511 TPS:308 Mem:28.5/39.2GB GPUs:4
+E0[7] loss:7.0752 CE:15.950 cos:0.8472 E[K]:2.01 α=0.30 β=2.00 lr:1.05e-05 seq:511 TPS:313 Mem:28.5/39.2GB GPUs:4
+E0[8] loss:6.9625 CE:15.932 cos:0.7943 E[K]:2.02 α=0.30 β=2.00 lr:1.20e-05 seq:511 TPS:312 Mem:28.5/39.2GB GPUs:4
+E0[9] loss:6.8183 CE:15.786 cos:0.7451 E[K]:2.03 α=0.30 β=2.00 lr:1.35e-05 seq:511 TPS:315 Mem:28.5/39.2GB GPUs:4
+E0[10] loss:6.7393 CE:15.811 cos:0.7030 E[K]:2.03 α=0.30 β=2.00 lr:1.50e-05 seq:511 TPS:316 Mem:28.5/39.2GB GPUs:4
+E0[11] loss:6.6235 CE:15.706 cos:0.6622 E[K]:2.04 α=0.30 β=2.00 lr:1.65e-05 seq:511 TPS:317 Mem:28.5/39.2GB GPUs:4
+E0[12] loss:6.5320 CE:15.817 cos:0.6017 E[K]:2.06 α=0.30 β=2.00 lr:1.80e-05 seq:511 TPS:316 Mem:28.5/39.2GB GPUs:4
+E0[13] loss:6.4482 CE:15.735 cos:0.5743 E[K]:2.07 α=0.30 β=2.00 lr:1.95e-05 seq:511 TPS:318 Mem:28.5/39.2GB GPUs:4
+E0[14] loss:6.3764 CE:15.612 cos:0.5596 E[K]:2.09 α=0.30 β=2.00 lr:2.10e-05 seq:511 TPS:318 Mem:28.5/39.2GB GPUs:4
+E0[15] loss:6.3814 CE:15.491 cos:0.5833 E[K]:2.11 α=0.30 β=2.00 lr:2.25e-05 seq:511 TPS:319 Mem:28.5/39.2GB GPUs:4
+E0[16] loss:6.3443 CE:15.490 cos:0.5686 E[K]:2.14 α=0.30 β=2.00 lr:2.40e-05 seq:511 TPS:321 Mem:28.5/39.2GB GPUs:4
+E0[17] loss:6.4594 CE:15.856 cos:0.5743 E[K]:2.16 α=0.30 β=2.00 lr:2.55e-05 seq:511 TPS:320 Mem:28.5/39.2GB GPUs:4
+E0[18] loss:6.2911 CE:15.444 cos:0.5564 E[K]:2.20 α=0.30 β=2.00 lr:2.70e-05 seq:511 TPS:320 Mem:28.5/39.2GB GPUs:4
+E0[19] loss:6.1631 CE:15.309 cos:0.5183 E[K]:2.25 α=0.30 β=2.00 lr:2.85e-05 seq:511 TPS:320 Mem:28.5/39.2GB GPUs:4
+E0[20] loss:6.0463 CE:15.112 cos:0.4955 E[K]:2.30 α=0.30 β=2.00 lr:3.00e-05 seq:511 TPS:321 Mem:28.5/39.2GB GPUs:4
+E0[21] loss:5.9310 CE:14.900 cos:0.4772 E[K]:2.37 α=0.30 β=2.00 lr:3.15e-05 seq:511 TPS:321 Mem:28.5/39.2GB GPUs:4
+E0[22] loss:5.8720 CE:14.883 cos:0.4578 E[K]:2.45 α=0.30 β=2.00 lr:3.30e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[23] loss:5.7508 CE:14.595 cos:0.4484 E[K]:2.55 α=0.30 β=2.00 lr:3.45e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[24] loss:5.6617 CE:14.409 cos:0.4397 E[K]:2.68 α=0.30 β=2.00 lr:3.60e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[25] loss:5.6062 CE:14.287 cos:0.4365 E[K]:2.84 α=0.30 β=2.00 lr:3.75e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[26] loss:5.4840 CE:13.979 cos:0.4259 E[K]:3.01 α=0.30 β=2.00 lr:3.90e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[27] loss:5.5985 CE:14.330 cos:0.4369 E[K]:3.12 α=0.30 β=2.00 lr:4.05e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[28] loss:5.3930 CE:13.697 cos:0.4261 E[K]:3.33 α=0.30 β=2.00 lr:4.20e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[29] loss:5.4123 CE:13.721 cos:0.4327 E[K]:3.47 α=0.30 β=2.00 lr:4.35e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[30] loss:5.3535 CE:13.412 cos:0.4516 E[K]:3.57 α=0.30 β=2.00 lr:4.50e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[31] loss:5.3045 CE:13.253 cos:0.4556 E[K]:3.63 α=0.30 β=2.00 lr:4.65e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[32] loss:5.1160 CE:12.628 cos:0.4616 E[K]:3.62 α=0.30 β=2.00 lr:4.80e-05 seq:511 TPS:322 Mem:28.5/39.2GB GPUs:4
+E0[33] loss:5.0477 CE:12.290 cos:0.4827 E[K]:3.58 α=0.30 β=2.00 lr:4.95e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[34] loss:4.9391 CE:11.736 cos:0.5133 E[K]:3.51 α=0.30 β=2.00 lr:5.10e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[35] loss:4.5968 CE:10.202 cos:0.5707 E[K]:3.41 α=0.30 β=2.00 lr:5.25e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[36] loss:4.6508 CE:9.216 cos:0.7325 E[K]:3.25 α=0.30 β=2.00 lr:5.40e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[37] loss:4.7387 CE:9.123 cos:0.7885 E[K]:3.14 α=0.30 β=2.00 lr:5.55e-05 seq:511 TPS:323 Mem:28.5/39.2GB GPUs:4
+E0[38] loss:4.5595 CE:8.410 cos:0.8076 E[K]:3.04 α=0.30 β=2.00 lr:5.70e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[39] loss:4.4812 CE:8.202 cos:0.8012 E[K]:2.97 α=0.30 β=2.00 lr:5.85e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[40] loss:4.3538 CE:7.883 cos:0.7876 E[K]:2.97 α=0.30 β=2.00 lr:6.00e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[41] loss:4.2160 CE:7.616 cos:0.7650 E[K]:3.07 α=0.30 β=2.00 lr:6.15e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[42] loss:4.1095 CE:7.476 cos:0.7387 E[K]:3.27 α=0.30 β=2.00 lr:6.30e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[43] loss:4.0591 CE:7.450 cos:0.7184 E[K]:3.47 α=0.30 β=2.00 lr:6.45e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[44] loss:4.0781 CE:7.627 cos:0.7027 E[K]:3.56 α=0.30 β=2.00 lr:6.60e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[45] loss:4.0828 CE:7.788 cos:0.6833 E[K]:3.52 α=0.30 β=2.00 lr:6.75e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[46] loss:3.9008 CE:7.390 cos:0.6520 E[K]:3.42 α=0.30 β=2.00 lr:6.90e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[47] loss:3.8708 CE:7.487 cos:0.6216 E[K]:3.34 α=0.30 β=2.00 lr:7.05e-05 seq:511 TPS:324 Mem:28.5/39.2GB GPUs:4
+E0[48] loss:3.7765 CE:7.330 cos:0.5985 E[K]:3.33 α=0.30 β=2.00 lr:7.20e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[49] loss:3.8121 CE:7.583 cos:0.5788 E[K]:3.39 α=0.30 β=2.00 lr:7.35e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[50] loss:3.6741 CE:7.190 cos:0.5682 E[K]:3.45 α=0.30 β=2.00 lr:7.50e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[51] loss:3.6761 CE:7.256 cos:0.5588 E[K]:3.43 α=0.30 β=2.00 lr:7.65e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[52] loss:3.6681 CE:7.235 cos:0.5585 E[K]:3.36 α=0.30 β=2.00 lr:7.80e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[53] loss:3.6275 CE:7.166 cos:0.5489 E[K]:3.35 α=0.30 β=2.00 lr:7.95e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[54] loss:3.7470 CE:7.813 cos:0.5111 E[K]:3.41 α=0.30 β=2.00 lr:8.10e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[55] loss:3.5581 CE:7.272 cos:0.4950 E[K]:3.46 α=0.30 β=2.00 lr:8.25e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[56] loss:3.4311 CE:7.039 cos:0.4692 E[K]:3.48 α=0.30 β=2.00 lr:8.40e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[57] loss:3.4553 CE:7.083 cos:0.4751 E[K]:3.37 α=0.30 β=2.00 lr:8.55e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[58] loss:3.4761 CE:7.270 cos:0.4574 E[K]:3.44 α=0.30 β=2.00 lr:8.70e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[59] loss:3.4537 CE:7.376 cos:0.4270 E[K]:3.59 α=0.30 β=2.00 lr:8.85e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[60] loss:3.4278 CE:7.330 cos:0.4225 E[K]:3.59 α=0.30 β=2.00 lr:9.00e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[61] loss:3.3464 CE:7.072 cos:0.4224 E[K]:3.48 α=0.30 β=2.00 lr:9.15e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[62] loss:3.4081 CE:7.338 cos:0.4145 E[K]:3.44 α=0.30 β=2.00 lr:9.30e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[63] loss:3.3388 CE:7.251 cos:0.3913 E[K]:3.47 α=0.30 β=2.00 lr:9.45e-05 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[64] loss:3.2875 CE:7.225 cos:0.3707 E[K]:3.46 α=0.30 β=2.00 lr:9.60e-05 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[65] loss:3.2131 CE:7.103 cos:0.3520 E[K]:3.43 α=0.30 β=2.00 lr:9.75e-05 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[66] loss:3.2082 CE:7.131 cos:0.3449 E[K]:3.44 α=0.30 β=2.00 lr:9.90e-05 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[67] loss:3.2091 CE:7.043 cos:0.3595 E[K]:3.47 α=0.30 β=2.00 lr:1.01e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[68] loss:3.2525 CE:7.309 cos:0.3401 E[K]:3.55 α=0.30 β=2.00 lr:1.02e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[69] loss:3.1501 CE:7.090 cos:0.3231 E[K]:3.49 α=0.30 β=2.00 lr:1.03e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[70] loss:3.1899 CE:7.160 cos:0.3307 E[K]:3.37 α=0.30 β=2.00 lr:1.05e-04 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[71] loss:3.1015 CE:6.970 cos:0.3150 E[K]:3.42 α=0.30 β=2.00 lr:1.07e-04 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[72] loss:3.1106 CE:7.061 cos:0.3075 E[K]:3.51 α=0.30 β=2.00 lr:1.08e-04 seq:511 TPS:325 Mem:28.5/39.2GB GPUs:4
+E0[73] loss:3.1177 CE:7.107 cos:0.3033 E[K]:3.53 α=0.30 β=2.00 lr:1.09e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[74] loss:3.1577 CE:7.137 cos:0.3184 E[K]:3.51 α=0.30 β=2.00 lr:1.11e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[75] loss:3.2518 CE:7.201 cos:0.3564 E[K]:3.46 α=0.30 β=2.00 lr:1.12e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[76] loss:3.1501 CE:7.294 cos:0.2913 E[K]:3.57 α=0.30 β=2.00 lr:1.14e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[77] loss:3.0654 CE:7.109 cos:0.2773 E[K]:3.54 α=0.30 β=2.00 lr:1.15e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[78] loss:3.0558 CE:7.097 cos:0.2743 E[K]:3.46 α=0.30 β=2.00 lr:1.17e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[79] loss:3.0658 CE:7.079 cos:0.2808 E[K]:3.41 α=0.30 β=2.00 lr:1.18e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[80] loss:3.1142 CE:7.231 cos:0.2828 E[K]:3.46 α=0.30 β=2.00 lr:1.20e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[81] loss:3.0327 CE:7.002 cos:0.2767 E[K]:3.51 α=0.30 β=2.00 lr:1.21e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[82] loss:3.0620 CE:7.140 cos:0.2702 E[K]:3.51 α=0.30 β=2.00 lr:1.23e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[83] loss:3.0342 CE:7.092 cos:0.2635 E[K]:3.48 α=0.30 β=2.00 lr:1.24e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[84] loss:3.0682 CE:7.274 cos:0.2537 E[K]:3.46 α=0.30 β=2.00 lr:1.26e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[85] loss:2.9944 CE:6.977 cos:0.2608 E[K]:3.41 α=0.30 β=2.00 lr:1.27e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[86] loss:2.9881 CE:6.942 cos:0.2629 E[K]:3.45 α=0.30 β=2.00 lr:1.29e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[87] loss:3.0127 CE:7.027 cos:0.2627 E[K]:3.46 α=0.30 β=2.00 lr:1.31e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[88] loss:3.0164 CE:7.052 cos:0.2621 E[K]:3.49 α=0.30 β=2.00 lr:1.32e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[89] loss:2.9778 CE:7.005 cos:0.2484 E[K]:3.53 α=0.30 β=2.00 lr:1.33e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[90] loss:2.9688 CE:6.952 cos:0.2519 E[K]:3.48 α=0.30 β=2.00 lr:1.35e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[91] loss:3.0826 CE:7.166 cos:0.2772 E[K]:3.45 α=0.30 β=2.00 lr:1.36e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[92] loss:2.9854 CE:7.055 cos:0.2421 E[K]:3.53 α=0.30 β=2.00 lr:1.38e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[93] loss:2.9841 CE:7.091 cos:0.2376 E[K]:3.59 α=0.30 β=2.00 lr:1.39e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[94] loss:3.1426 CE:7.566 cos:0.2446 E[K]:3.46 α=0.30 β=2.00 lr:1.41e-04 seq:511 TPS:326 Mem:28.5/39.2GB GPUs:4
+E0[95] loss:2.9913 CE:7.069 cos:0.2406 E[K]:3.38 α=0.30 β=2.00 lr:1.42e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[96] loss:2.9480 CE:7.038 cos:0.2268 E[K]:3.47 α=0.30 β=2.00 lr:1.44e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[97] loss:2.9360 CE:7.002 cos:0.2261 E[K]:3.59 α=0.30 β=2.00 lr:1.45e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[98] loss:2.9054 CE:6.955 cos:0.2174 E[K]:3.60 α=0.30 β=2.00 lr:1.47e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[99] loss:2.9420 CE:7.141 cos:0.2089 E[K]:3.43 α=0.30 β=2.00 lr:1.48e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[100] loss:2.9807 CE:7.097 cos:0.2314 E[K]:3.33 α=0.30 β=2.00 lr:1.50e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[101] loss:2.9828 CE:7.055 cos:0.2405 E[K]:3.37 α=0.30 β=2.00 lr:1.51e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[102] loss:3.1684 CE:7.300 cos:0.2976 E[K]:3.39 α=0.30 β=2.00 lr:1.53e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[103] loss:2.9962 CE:7.013 cos:0.2519 E[K]:3.57 α=0.30 β=2.00 lr:1.54e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[104] loss:2.9784 CE:7.172 cos:0.2226 E[K]:3.63 α=0.30 β=2.00 lr:1.56e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[105] loss:2.8960 CE:6.946 cos:0.2152 E[K]:3.46 α=0.30 β=2.00 lr:1.58e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[106] loss:2.9201 CE:7.054 cos:0.2102 E[K]:3.36 α=0.30 β=2.00 lr:1.59e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[107] loss:2.8809 CE:6.966 cos:0.2050 E[K]:3.36 α=0.30 β=2.00 lr:1.60e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[108] loss:2.9311 CE:7.129 cos:0.2052 E[K]:3.53 α=0.30 β=2.00 lr:1.62e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[109] loss:2.9038 CE:7.016 cos:0.2102 E[K]:3.55 α=0.30 β=2.00 lr:1.63e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[110] loss:2.9709 CE:7.117 cos:0.2275 E[K]:3.45 α=0.30 β=2.00 lr:1.65e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[111] loss:2.9213 CE:7.172 cos:0.1938 E[K]:3.45 α=0.30 β=2.00 lr:1.66e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[112] loss:2.8264 CE:6.882 cos:0.1907 E[K]:3.46 α=0.30 β=2.00 lr:1.68e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[113] loss:2.8795 CE:6.932 cos:0.2103 E[K]:3.48 α=0.30 β=2.00 lr:1.70e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[114] loss:2.8858 CE:7.018 cos:0.2000 E[K]:3.47 α=0.30 β=2.00 lr:1.71e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[115] loss:2.8631 CE:6.975 cos:0.1960 E[K]:3.48 α=0.30 β=2.00 lr:1.72e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[116] loss:2.8981 CE:7.034 cos:0.2048 E[K]:3.52 α=0.30 β=2.00 lr:1.74e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[117] loss:2.8759 CE:6.982 cos:0.2006 E[K]:3.46 α=0.30 β=2.00 lr:1.75e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[118] loss:2.9282 CE:6.931 cos:0.2361 E[K]:3.46 α=0.30 β=2.00 lr:1.77e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[119] loss:2.9461 CE:6.830 cos:0.2563 E[K]:3.58 α=0.30 β=2.00 lr:1.78e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[120] loss:2.9344 CE:7.008 cos:0.2261 E[K]:3.55 α=0.30 β=2.00 lr:1.80e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[121] loss:2.9794 CE:7.137 cos:0.2262 E[K]:3.47 α=0.30 β=2.00 lr:1.81e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[122] loss:2.9320 CE:6.949 cos:0.2274 E[K]:3.42 α=0.30 β=2.00 lr:1.83e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[123] loss:2.8936 CE:6.930 cos:0.2136 E[K]:3.41 α=0.30 β=2.00 lr:1.84e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[124] loss:2.9349 CE:7.000 cos:0.2286 E[K]:3.51 α=0.30 β=2.00 lr:1.86e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[125] loss:2.9733 CE:7.170 cos:0.2201 E[K]:3.57 α=0.30 β=2.00 lr:1.88e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[126] loss:2.8580 CE:6.804 cos:0.2190 E[K]:3.49 α=0.30 β=2.00 lr:1.89e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[127] loss:2.8558 CE:6.953 cos:0.1940 E[K]:3.50 α=0.30 β=2.00 lr:1.90e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[128] loss:2.9208 CE:6.954 cos:0.2275 E[K]:3.47 α=0.30 β=2.00 lr:1.92e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[129] loss:3.0311 CE:7.308 cos:0.2289 E[K]:3.45 α=0.30 β=2.00 lr:1.93e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[130] loss:2.9124 CE:6.907 cos:0.2227 E[K]:3.45 α=0.30 β=2.00 lr:1.95e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[131] loss:2.9548 CE:7.135 cos:0.2169 E[K]:3.44 α=0.30 β=2.00 lr:1.96e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[132] loss:2.9448 CE:7.091 cos:0.2148 E[K]:3.50 α=0.30 β=2.00 lr:1.98e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[133] loss:3.0418 CE:7.063 cos:0.2675 E[K]:3.46 α=0.30 β=2.00 lr:1.99e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[134] loss:2.8805 CE:6.855 cos:0.2227 E[K]:3.47 α=0.30 β=2.00 lr:2.01e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[135] loss:2.9094 CE:6.874 cos:0.2295 E[K]:3.48 α=0.30 β=2.00 lr:2.02e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[136] loss:2.8717 CE:6.948 cos:0.1991 E[K]:3.47 α=0.30 β=2.00 lr:2.04e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[137] loss:2.9506 CE:6.963 cos:0.2382 E[K]:3.50 α=0.30 β=2.00 lr:2.05e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[138] loss:2.9006 CE:7.023 cos:0.2059 E[K]:3.50 α=0.30 β=2.00 lr:2.07e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[139] loss:2.9096 CE:7.002 cos:0.2121 E[K]:3.49 α=0.30 β=2.00 lr:2.08e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[140] loss:2.8971 CE:7.019 cos:0.2039 E[K]:3.44 α=0.30 β=2.00 lr:2.10e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[141] loss:2.9671 CE:6.919 cos:0.2554 E[K]:3.42 α=0.30 β=2.00 lr:2.11e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[142] loss:2.9547 CE:6.773 cos:0.2693 E[K]:3.52 α=0.30 β=2.00 lr:2.13e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[143] loss:2.9956 CE:7.042 cos:0.2501 E[K]:3.55 α=0.30 β=2.00 lr:2.14e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[144] loss:2.9052 CE:6.842 cos:0.2345 E[K]:3.59 α=0.30 β=2.00 lr:2.16e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[145] loss:2.9012 CE:6.777 cos:0.2421 E[K]:3.43 α=0.30 β=2.00 lr:2.17e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[146] loss:2.9108 CE:6.928 cos:0.2237 E[K]:3.39 α=0.30 β=2.00 lr:2.19e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[147] loss:3.0072 CE:7.092 cos:0.2482 E[K]:3.52 α=0.30 β=2.00 lr:2.20e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[148] loss:2.8289 CE:6.703 cos:0.2175 E[K]:3.54 α=0.30 β=2.00 lr:2.22e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[149] loss:3.0642 CE:7.074 cos:0.2785 E[K]:3.48 α=0.30 β=2.00 lr:2.23e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[150] loss:2.9962 CE:6.864 cos:0.2732 E[K]:3.44 α=0.30 β=2.00 lr:2.25e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[151] loss:3.0279 CE:6.863 cos:0.2923 E[K]:3.42 α=0.30 β=2.00 lr:2.26e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[152] loss:3.0622 CE:6.843 cos:0.3123 E[K]:3.49 α=0.30 β=2.00 lr:2.28e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[153] loss:3.2171 CE:6.825 cos:0.3859 E[K]:3.55 α=0.30 β=2.00 lr:2.29e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[154] loss:3.2794 CE:6.872 cos:0.4064 E[K]:3.63 α=0.30 β=2.00 lr:2.31e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[155] loss:3.3272 CE:6.919 cos:0.4275 E[K]:3.63 α=0.30 β=2.00 lr:2.32e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[156] loss:3.3150 CE:6.929 cos:0.4249 E[K]:3.54 α=0.30 β=2.00 lr:2.34e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[157] loss:3.2342 CE:6.755 cos:0.4104 E[K]:3.45 α=0.30 β=2.00 lr:2.35e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[158] loss:3.2265 CE:6.816 cos:0.3975 E[K]:3.48 α=0.30 β=2.00 lr:2.37e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[159] loss:3.1883 CE:6.807 cos:0.3797 E[K]:3.52 α=0.30 β=2.00 lr:2.38e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[160] loss:3.1376 CE:6.652 cos:0.3773 E[K]:3.53 α=0.30 β=2.00 lr:2.40e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[161] loss:3.0587 CE:6.659 cos:0.3379 E[K]:3.48 α=0.30 β=2.00 lr:2.41e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[162] loss:3.0085 CE:6.697 cos:0.3082 E[K]:3.44 α=0.30 β=2.00 lr:2.43e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[163] loss:3.0773 CE:6.679 cos:0.3450 E[K]:3.51 α=0.30 β=2.00 lr:2.44e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[164] loss:3.0187 CE:6.637 cos:0.3217 E[K]:3.59 α=0.30 β=2.00 lr:2.46e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[165] loss:3.1344 CE:6.744 cos:0.3645 E[K]:3.48 α=0.30 β=2.00 lr:2.47e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[166] loss:3.1719 CE:6.571 cos:0.4086 E[K]:3.49 α=0.30 β=2.00 lr:2.49e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[167] loss:3.3015 CE:6.889 cos:0.4240 E[K]:3.45 α=0.30 β=2.00 lr:2.51e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[168] loss:3.2217 CE:6.779 cos:0.4013 E[K]:3.56 α=0.30 β=2.00 lr:2.52e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[169] loss:3.1932 CE:6.714 cos:0.3988 E[K]:3.54 α=0.30 β=2.00 lr:2.53e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[170] loss:3.1596 CE:6.846 cos:0.3605 E[K]:3.46 α=0.30 β=2.00 lr:2.55e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[171] loss:3.2221 CE:7.166 cos:0.3448 E[K]:3.44 α=0.30 β=2.00 lr:2.57e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[172] loss:3.1525 CE:6.957 cos:0.3412 E[K]:3.53 α=0.30 β=2.00 lr:2.58e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[173] loss:3.1493 CE:6.852 cos:0.3528 E[K]:3.55 α=0.30 β=2.00 lr:2.59e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[174] loss:3.1458 CE:6.874 cos:0.3503 E[K]:3.49 α=0.30 β=2.00 lr:2.61e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[175] loss:3.0243 CE:6.698 cos:0.3161 E[K]:3.46 α=0.30 β=2.00 lr:2.62e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[176] loss:2.9822 CE:6.577 cos:0.3121 E[K]:3.54 α=0.30 β=2.00 lr:2.64e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[177] loss:2.9694 CE:6.522 cos:0.3153 E[K]:3.49 α=0.30 β=2.00 lr:2.65e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[178] loss:3.0044 CE:6.661 cos:0.3124 E[K]:3.51 α=0.30 β=2.00 lr:2.67e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[179] loss:3.0306 CE:6.692 cos:0.3200 E[K]:3.51 α=0.30 β=2.00 lr:2.68e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[180] loss:2.9934 CE:6.585 cos:0.3181 E[K]:3.53 α=0.30 β=2.00 lr:2.70e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[181] loss:3.0472 CE:6.785 cos:0.3154 E[K]:3.46 α=0.30 β=2.00 lr:2.71e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[182] loss:3.0122 CE:6.664 cos:0.3165 E[K]:3.48 α=0.30 β=2.00 lr:2.73e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[183] loss:3.0481 CE:6.786 cos:0.3159 E[K]:3.50 α=0.30 β=2.00 lr:2.75e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[184] loss:2.9703 CE:6.547 cos:0.3125 E[K]:3.47 α=0.30 β=2.00 lr:2.76e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[185] loss:3.0187 CE:6.541 cos:0.3375 E[K]:3.51 α=0.30 β=2.00 lr:2.77e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[186] loss:3.0959 CE:6.679 cos:0.3544 E[K]:3.49 α=0.30 β=2.00 lr:2.79e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[187] loss:3.0276 CE:6.549 cos:0.3403 E[K]:3.56 α=0.30 β=2.00 lr:2.80e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[188] loss:3.0917 CE:6.831 cos:0.3290 E[K]:3.56 α=0.30 β=2.00 lr:2.82e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[189] loss:3.0108 CE:6.644 cos:0.3175 E[K]:3.47 α=0.30 β=2.00 lr:2.83e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[190] loss:3.0437 CE:6.723 cos:0.3215 E[K]:3.52 α=0.30 β=2.00 lr:2.85e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[191] loss:3.0105 CE:6.652 cos:0.3176 E[K]:3.50 α=0.30 β=2.00 lr:2.86e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[192] loss:2.9818 CE:6.620 cos:0.3031 E[K]:3.59 α=0.30 β=2.00 lr:2.88e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[193] loss:3.0777 CE:6.832 cos:0.3202 E[K]:3.40 α=0.30 β=2.00 lr:2.89e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[194] loss:3.0688 CE:6.847 cos:0.3163 E[K]:3.45 α=0.30 β=2.00 lr:2.91e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[195] loss:3.0947 CE:6.589 cos:0.3628 E[K]:3.49 α=0.30 β=2.00 lr:2.93e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[196] loss:2.9696 CE:6.603 cos:0.3025 E[K]:3.54 α=0.30 β=2.00 lr:2.94e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[197] loss:3.0013 CE:6.780 cos:0.2919 E[K]:3.44 α=0.30 β=2.00 lr:2.95e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[198] loss:2.9556 CE:6.609 cos:0.2940 E[K]:3.45 α=0.30 β=2.00 lr:2.97e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[199] loss:2.9135 CE:6.555 cos:0.2823 E[K]:3.48 α=0.30 β=2.00 lr:2.98e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[200] loss:2.9573 CE:6.700 cos:0.2824 E[K]:3.51 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[201] loss:2.9417 CE:6.620 cos:0.2857 E[K]:3.50 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[202] loss:2.9241 CE:6.534 cos:0.2911 E[K]:3.51 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[203] loss:2.9430 CE:6.572 cos:0.2953 E[K]:3.44 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[204] loss:2.9656 CE:6.691 cos:0.2889 E[K]:3.52 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[205] loss:2.9669 CE:6.675 cos:0.2923 E[K]:3.51 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[206] loss:2.9559 CE:6.669 cos:0.2873 E[K]:3.43 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[207] loss:2.9227 CE:6.560 cos:0.2873 E[K]:3.53 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[208] loss:2.9379 CE:6.552 cos:0.2959 E[K]:3.50 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[209] loss:2.8927 CE:6.535 cos:0.2761 E[K]:3.48 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[210] loss:2.8835 CE:6.537 cos:0.2705 E[K]:3.43 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[211] loss:2.9029 CE:6.629 cos:0.2680 E[K]:3.54 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[212] loss:2.8710 CE:6.567 cos:0.2591 E[K]:3.50 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:328 Mem:28.5/39.2GB GPUs:4
+E0[213] loss:2.8753 CE:6.555 cos:0.2647 E[K]:3.45 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[214] loss:2.8651 CE:6.630 cos:0.2474 E[K]:3.46 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[215] loss:2.8518 CE:6.531 cos:0.2567 E[K]:3.45 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[216] loss:2.8470 CE:6.523 cos:0.2554 E[K]:3.53 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[217] loss:2.8768 CE:6.602 cos:0.2582 E[K]:3.53 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[218] loss:2.8293 CE:6.527 cos:0.2457 E[K]:3.45 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[219] loss:2.7986 CE:6.443 cos:0.2437 E[K]:3.46 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[220] loss:2.8152 CE:6.529 cos:0.2383 E[K]:3.47 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[221] loss:2.7903 CE:6.409 cos:0.2436 E[K]:3.49 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[222] loss:2.8209 CE:6.605 cos:0.2301 E[K]:3.56 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4
+E0[223] loss:2.9597 CE:7.040 cos:0.2339 E[K]:3.50 α=0.30 β=2.00 lr:3.00e-04 seq:511 TPS:327 Mem:28.5/39.2GB GPUs:4

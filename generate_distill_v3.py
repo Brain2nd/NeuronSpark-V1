@@ -1,22 +1,21 @@
 """
-蒸馏模型推理: NVIDIA NemotronH + BioSSM 文本生成
-
-加载 NVIDIA 30B 冻结模型 + 蒸馏得到的 BioSSM 权重, 合并后推理。
+蒸馏模型推理: 从合并目录加载 NVIDIA NemotronH + BioSSM 文本生成
 
 用法:
-    python generate_distill_v3.py \
+    # 先合并
+    python scripts/merge_distill_v3.py \
         --teacher_path /path/to/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
         --bio_ssm_ckpt checkpoints_distill_v3/distill_v3_step8015.pth \
-        --prompt "人工智能的发展"
+        --output_dir merged_model_v3
 
-    # 交互模式
-    python generate_distill_v3.py \
-        --teacher_path /path/to/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-        --bio_ssm_ckpt checkpoints_distill_v3/distill_v3_step8015.pth \
-        --interactive
+    # 推理 (只需传合并目录)
+    python generate_distill_v3.py --model_dir merged_model_v3 --interactive
+    python generate_distill_v3.py --model_dir merged_model_v3 --prompt "人工智能的发展"
 """
 
+import os
 import sys
+import json
 import argparse
 
 import torch
@@ -25,44 +24,56 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from distill_wrapper_v3 import DistillHybridModel, BioSSMConfig
 
 
-def load_distill_model(teacher_path, bio_ssm_ckpt_path):
-    """加载 NVIDIA 模型 (device_map='auto' 多卡分布) + BioSSM 蒸馏权重。"""
+def load_merged_model(model_dir):
+    """从合并目录加载完整蒸馏模型 (device_map='auto' 多卡分布)。"""
+    # 读取配置
+    config_path = os.path.join(model_dir, 'config.json')
+    with open(config_path) as f:
+        config = json.load(f)
+
+    teacher_path = config['teacher_path']
+    bio_cfg = config['bio_ssm']
+
+    # 加载 Teacher (多卡分布)
     print(f"加载 Teacher: {teacher_path}")
     sys.path.insert(0, teacher_path)
-
-    nvidia_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=True)
     nvidia_model = AutoModelForCausalLM.from_pretrained(
         teacher_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
         low_cpu_mem_usage=True, device_map='auto',
     )
     print(f"  Teacher: {sum(p.numel() for p in nvidia_model.parameters())/1e9:.1f}B params")
 
-    # 加载 BioSSM checkpoint
-    print(f"加载 BioSSM: {bio_ssm_ckpt_path}")
-    ckpt = torch.load(bio_ssm_ckpt_path, map_location='cpu', weights_only=False)
-    cfg = ckpt.get('config', {})
-
+    # 构建蒸馏模型
     bio_config = BioSSMConfig(
-        hidden_size=cfg.get('hidden_size', nvidia_config.hidden_size),
-        ssm_N=cfg.get('ssm_N', 4),
-        ssm_K=cfg.get('ssm_K', 16),
-        ssm_v_th_min=cfg.get('ssm_v_th_min', 0.1),
-        ssm_ek_floor=cfg.get('ssm_ek_floor', 4.0),
-        num_hidden_layers=cfg.get('num_hidden_layers', nvidia_config.num_hidden_layers),
+        hidden_size=bio_cfg['hidden_size'],
+        ssm_N=bio_cfg['ssm_N'],
+        ssm_K=bio_cfg['ssm_K'],
+        ssm_v_th_min=bio_cfg['ssm_v_th_min'],
+        ssm_ek_floor=bio_cfg['ssm_ek_floor'],
+        num_hidden_layers=bio_cfg['num_hidden_layers'],
     )
-
-    # 构建蒸馏模型 + 加载 BioSSM 权重
     model = DistillHybridModel(nvidia_model, bio_config)
-    model.load_bio_ssm_state(ckpt['bio_ssm'])
-    bio_params = sum(p.numel() for p in model.bio_ssm_modules.parameters())
-    print(f"  BioSSM: {model._num_mamba} 层, "
-          f"{bio_params/1e6:.1f}M params, step={ckpt.get('step', '?')}")
 
-    # BioSSM 模块放到第一张卡 (teacher 已通过 device_map 分布多卡)
+    # 加载 BioSSM 权重
+    bio_ssm_path = os.path.join(model_dir, 'bio_ssm.pth')
+    print(f"加载 BioSSM: {bio_ssm_path}")
+    bio_sd = torch.load(bio_ssm_path, map_location='cpu', weights_only=False)
+    model.load_bio_ssm_state(bio_sd)
+    bio_params = sum(p.numel() for p in model.bio_ssm_modules.parameters())
+    print(f"  BioSSM: {model._num_mamba} 层, {bio_params/1e6:.1f}M params")
+
+    # BioSSM 放到第一张卡
     first_device = next(nvidia_model.parameters()).device
     model.bio_ssm_modules.to(first_device)
     model.eval()
-    del ckpt
+
+    # 读取合并信息
+    merge_info_path = os.path.join(model_dir, 'merge_info.json')
+    if os.path.exists(merge_info_path):
+        with open(merge_info_path) as f:
+            merge_info = json.load(f)
+        print(f"  Distill step: {merge_info.get('distill_step', '?')}")
+
     return model, first_device
 
 
@@ -81,10 +92,8 @@ def generate(model, tokenizer, prompt, max_new_tokens=256,
             print("  [警告] logits 为 None, 无法生成")
             break
 
-        # 取最后一个 token 的 logits
         next_logits = out.logits[:, -1, :].float()
 
-        # Temperature + top-k 采样
         if temperature > 0:
             next_logits = next_logits / temperature
             if top_k > 0:
@@ -115,10 +124,8 @@ TEST_PROMPTS = [
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NeuronSpark v3 蒸馏模型推理")
-    parser.add_argument('--teacher_path', type=str, required=True,
-                        help='NVIDIA Nemotron-3 模型目录')
-    parser.add_argument('--bio_ssm_ckpt', type=str, required=True,
-                        help='BioSSM 蒸馏 checkpoint 路径')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='合并后的模型目录 (merge_distill_v3.py 输出)')
     parser.add_argument('--prompt', type=str, default=None)
     parser.add_argument('--max_new_tokens', type=int, default=256)
     parser.add_argument('--temperature', type=float, default=0.8)
@@ -127,8 +134,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.teacher_path, trust_remote_code=True)
-    model, device = load_distill_model(args.teacher_path, args.bio_ssm_ckpt)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_dir, trust_remote_code=True)
+    model, device = load_merged_model(args.model_dir)
 
     if args.interactive:
         print(f"\n{'='*50}")

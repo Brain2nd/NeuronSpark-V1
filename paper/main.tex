@@ -1,33 +1,28 @@
-\documentclass[11pt]{article}
+\documentclass[10pt,twocolumn]{article}
 
-% ============================================================
-% Packages
-% ============================================================
+\usepackage[margin=0.75in]{geometry}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
-\usepackage[margin=1in]{geometry}
+% \usepackage{microtype}
 \usepackage{graphicx}
 \usepackage{amsmath,amssymb,amsfonts}
 \usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{booktabs}
-\usepackage{hyperref}
-\usepackage{xcolor}
-\usepackage{tikz}
 \usepackage{natbib}
+\usepackage{hyperref}
+\usepackage{url}
 \usepackage{float}
-\usepackage{caption}
 \usepackage{subcaption}
 \usepackage{multirow}
 \usepackage{bm}
 \usepackage{pifont}
+\usepackage{xcolor}
 
-\hypersetup{
-    colorlinks=true,
-    linkcolor=blue,
-    citecolor=blue,
-    urlcolor=blue,
-}
+\definecolor{darkblue}{rgb}{0, 0, 0.5}
+\hypersetup{colorlinks=true, citecolor=darkblue, linkcolor=darkblue, urlcolor=darkblue}
+
+\setlength{\columnsep}{0.25in}
 
 % ============================================================
 % Custom Commands
@@ -149,19 +144,9 @@ The non-differentiability of spike generation ($\Theta(V - \vth)$) is addressed 
 \label{sec:overview}
 
 \model{} follows a three-stage pipeline (Figure~\ref{fig:architecture}):
-
-\begin{enumerate}
-    \item \textbf{Encode}: Token IDs $\to$ embedding lookup ($D$-dim) $\to$ repeat $K$ times along the temporal dimension, producing a $(T \cdot K, B, D)$ tensor for SNN processing.
-    Gradients flow directly through the embedding; no spike encoding is used at the input boundary.
-    The output head reuses the embedding matrix (weight tying~\citep{press2017using}).
-
-    \item \textbf{SNN Forward}: $L=20$ decoder layers with gradient checkpointing.
-    Each layer contains two sublayers --- an SNNBlock (attention analogue) and an SNNFFN (MLP analogue) --- each with PonderNet adaptive $K$-frame aggregation.
-    All neuron states are reset at the start of each sequence.
-
-    \item \textbf{Decode}: RMSNorm~\citep{zhang2019root} $\to$ output PLIFNode (leakage activation) $\to$ $K$-frame \emph{uniform} mean pooling $\to$ linear projection $\to$ lateral inhibition normalization~\citep{carandini2012normalization} $\to$ tied embedding head $\to$ logits.
-    Note: the decode stage uses simple mean over $K$ frames (not PonderNet), as the output neuron operates on the final layer's residual stream where adaptive weighting is less critical.
-\end{enumerate}
+\textbf{(1)~Encode}: Token IDs $\to$ embedding ($D$-dim) $\to$ repeat $K$ times, producing a $(T{\cdot}K, B, D)$ tensor. Gradients flow directly through embedding; the output head reuses the embedding matrix (weight tying~\citep{press2017using}).
+\textbf{(2)~SNN Forward}: $L{=}20$ decoder layers with gradient checkpointing, each containing an SNNBlock (attention analogue) and an SNNFFN (MLP analogue), with PonderNet adaptive $K$-frame aggregation. All neuron states reset per sequence.
+\textbf{(3)~Decode}: RMSNorm~\citep{zhang2019root} $\to$ output PLIFNode (leakage) $\to$ $K$-frame uniform mean $\to$ projection $\to$ lateral inhibition~\citep{carandini2012normalization} $\to$ tied head $\to$ logits.
 
 Each decoder layer follows a Pre-LN residual pattern matching Qwen3/LLaMA~\citep{touvron2023llama, yang2025qwen3}:
 \begin{align}
@@ -173,7 +158,7 @@ The residual stream $\mathbf{h} \in \R^{TK \times B \times D}$ carries continuou
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=\textwidth]{figures/Architrcture.png}
+    \includegraphics[width=\columnwidth]{figures/Architrcture.png}
     \caption{\model{} architecture overview.
     The residual stream carries continuous values $\mathbf{h}$; PLIFLeak denotes PLIF neurons with leakage activation $(1-\beta)\cdot\vpost$.
     PonderNet aggregation (applied per sublayer) collapses $K$ frames per token with learned geometric-distribution weights.
@@ -460,7 +445,7 @@ Peak memory / GPU & \multicolumn{2}{c}{$\sim$48 GB} \\
 \end{tabular}
 \end{table}
 
-\begin{figure}[H]
+\begin{figure*}[t]
     \centering
     \includegraphics[width=\textwidth]{figures/loss_curve.pdf}
     \caption{Pretraining loss curve for \model{}-0.9B over 85K steps ($\sim$1.4B tokens).
@@ -468,7 +453,7 @@ Peak memory / GPU & \multicolumn{2}{c}{$\sim$48 GB} \\
     The model reaches loss $\leq$5.0 by step 6.6K and $\leq$3.6 by step 14.5K, with continued gradual improvement thereafter.
     Training throughput: $\sim$960 tokens/sec on 4$\times$ GB10 GPUs.}
     \label{fig:loss-curve}
-\end{figure}
+\end{figure*}
 
 \paragraph{Qualitative evaluation.}
 After SFT, the model demonstrates basic Chinese dialogue capabilities (translated for readability; model outputs in Chinese):
@@ -497,8 +482,8 @@ Table~\ref{tab:ablation} summarizes 7 architectural variants; Figure~\ref{fig:ab
 \caption{Architectural ablation variants. All variants stagnated above loss 7.0, while the final architecture reached 3.5.
 ``Diverged'' means loss increased above 7.5 and failed to recover.}
 \label{tab:ablation}
-\small
-\begin{tabular}{p{4.5cm}rrp{5cm}}
+\scriptsize
+\begin{tabular}{p{1.8cm}rrp{3.5cm}}
 \toprule
 \textbf{Variant} & \textbf{Steps} & \textbf{Final Loss} & \textbf{What Changed} \\
 \midrule
@@ -533,14 +518,14 @@ Table~\ref{tab:ablation} summarizes 7 architectural variants; Figure~\ref{fig:ab
 (4)~\textbf{Removing gradient synchronization} caused immediate NaN divergence within 630 steps, highlighting the fragility of SNN training at scale.
 (5)~No single variant broke below loss 7.0; only the full combination of all design choices in V1 achieved continued loss decrease.
 
-\begin{figure}[H]
+\begin{figure*}[t]
     \centering
     \includegraphics[width=\textwidth]{figures/ablation_runs.pdf}
     \caption{Training loss comparison: final V1 architecture (blue) vs.\ 9 ablation variants from earlier development.
     Red: diverged (loss $>$7.5); Orange: survived but stagnated (loss 7.1--7.5).
     Only the final architecture breaks below loss 7.0.}
     \label{fig:ablation}
-\end{figure}
+\end{figure*}
 
 
 \subsection{Comparison with Existing SNN Language Models}

@@ -25,15 +25,15 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from distill_wrapper_v3 import DistillHybridModel, BioSSMConfig
 
 
-def load_distill_model(teacher_path, bio_ssm_ckpt_path, device='cuda'):
-    """加载 NVIDIA 模型 + BioSSM 蒸馏权重。"""
+def load_distill_model(teacher_path, bio_ssm_ckpt_path):
+    """加载 NVIDIA 模型 (device_map='auto' 多卡分布) + BioSSM 蒸馏权重。"""
     print(f"加载 Teacher: {teacher_path}")
     sys.path.insert(0, teacher_path)
 
     nvidia_config = AutoConfig.from_pretrained(teacher_path, trust_remote_code=True)
     nvidia_model = AutoModelForCausalLM.from_pretrained(
         teacher_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=True, device_map='auto',
     )
     print(f"  Teacher: {sum(p.numel() for p in nvidia_model.parameters())/1e9:.1f}B params")
 
@@ -54,13 +54,16 @@ def load_distill_model(teacher_path, bio_ssm_ckpt_path, device='cuda'):
     # 构建蒸馏模型 + 加载 BioSSM 权重
     model = DistillHybridModel(nvidia_model, bio_config)
     model.load_bio_ssm_state(ckpt['bio_ssm'])
+    bio_params = sum(p.numel() for p in model.bio_ssm_modules.parameters())
     print(f"  BioSSM: {model._num_mamba} 层, "
-          f"{sum(p.numel() for p in model.bio_ssm_modules.parameters())/1e6:.1f}M params, "
-          f"step={ckpt.get('step', '?')}")
+          f"{bio_params/1e6:.1f}M params, step={ckpt.get('step', '?')}")
 
-    model = model.to(device).eval()
+    # BioSSM 模块放到第一张卡 (teacher 已通过 device_map 分布多卡)
+    first_device = next(nvidia_model.parameters()).device
+    model.bio_ssm_modules.to(first_device)
+    model.eval()
     del ckpt
-    return model
+    return model, first_device
 
 
 @torch.no_grad()
@@ -116,7 +119,6 @@ if __name__ == "__main__":
                         help='NVIDIA Nemotron-3 模型目录')
     parser.add_argument('--bio_ssm_ckpt', type=str, required=True,
                         help='BioSSM 蒸馏 checkpoint 路径')
-    parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--prompt', type=str, default=None)
     parser.add_argument('--max_new_tokens', type=int, default=256)
     parser.add_argument('--temperature', type=float, default=0.8)
@@ -126,7 +128,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_path, trust_remote_code=True)
-    model = load_distill_model(args.teacher_path, args.bio_ssm_ckpt, args.device)
+    model, device = load_distill_model(args.teacher_path, args.bio_ssm_ckpt)
 
     if args.interactive:
         print(f"\n{'='*50}")
@@ -146,13 +148,13 @@ if __name__ == "__main__":
             response = generate(model, tokenizer, prompt,
                                 max_new_tokens=args.max_new_tokens,
                                 temperature=args.temperature,
-                                top_k=args.top_k, device=args.device)
+                                top_k=args.top_k, device=device)
             print(f"\n{response}\n")
     elif args.prompt:
         response = generate(model, tokenizer, args.prompt,
                             max_new_tokens=args.max_new_tokens,
                             temperature=args.temperature,
-                            top_k=args.top_k, device=args.device)
+                            top_k=args.top_k, device=device)
         print(f"\n{response}")
     else:
         print(f"\n{'='*50}")
@@ -162,7 +164,7 @@ if __name__ == "__main__":
             response = generate(model, tokenizer, prompt,
                                 max_new_tokens=args.max_new_tokens,
                                 temperature=args.temperature,
-                                top_k=args.top_k, device=args.device)
+                                top_k=args.top_k, device=device)
             print(f"\n[{i}/{len(TEST_PROMPTS)}] Prompt: {prompt}")
             print(f"Output: {response}")
             print("-" * 40)

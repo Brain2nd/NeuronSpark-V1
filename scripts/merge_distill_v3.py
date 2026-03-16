@@ -53,7 +53,7 @@ def merge_and_save(teacher_path, bio_ssm_ckpt_path, output_dir):
     sys.path.insert(0, teacher_path)
     nvidia_model = AutoModelForCausalLM.from_pretrained(
         teacher_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        low_cpu_mem_usage=True,
+        low_cpu_mem_usage=True, device_map='auto',
     )
     teacher_params = sum(p.numel() for p in nvidia_model.parameters())
 

@@ -39,25 +39,132 @@ print(response.split("assistant\n")[-1].replace("<|im_end|>", "").strip())
 
 ## Architecture
 
+### Overview
+
+NeuronSpark processes each token as K=16 SNN temporal frames. The model has 3 stages:
+
 ```
-token -> Embedding(D=896) -> repeat K=16 frames
-  -> L=20 x SNNDecoderLayer:
-      RMSNorm(h) -> PLIFNode(leak) -> SNNBlock -> PonderNet K-agg -> out_proj -> residual
-      RMSNorm(h) -> PLIFNode(leak) -> SNNFFN   -> PonderNet K-agg -> out_proj -> residual
-  -> RMSNorm -> PLIFNode(leak) -> K-frame mean -> decode_proj -> LateralInhibition -> tied head -> logits
+                          ┌─────────────────────────────────────────────────────────┐
+ token_ids ──► Embedding ─┤  repeat K=16 times along temporal dim                   │
+                          │  (batch, seq_len, D) → (seq_len*K, batch, D)            │
+                          └──────────────────────────┬──────────────────────────────┘
+                                                     │
+                          ┌──────────────────────────▼──────────────────────────────┐
+                          │  L=20 × SNNDecoderLayer (continuous residual stream h)  │
+                          │                                                         │
+                          │  Sublayer 1 — SNNBlock (attention analogue):             │
+                          │    h → RMSNorm → PLIFNode → SNNBlock → PonderNet        │
+                          │      → out_proj → residual add back to h                │
+                          │                                                         │
+                          │  Sublayer 2 — SNNFFN (MLP analogue):                    │
+                          │    h → RMSNorm → PLIFNode → SNNFFN → PonderNet          │
+                          │      → out_proj → residual add back to h                │
+                          └──────────────────────────┬──────────────────────────────┘
+                                                     │
+                          ┌──────────────────────────▼──────────────────────────────┐
+                          │  Output PLIFNode → K-frame mean → decode_proj            │
+                          │  → LateralInhibition → tied Embedding head → logits      │
+                          └─────────────────────────────────────────────────────────┘
 ```
 
-### Key Design Choices
+### PLIF Neuron — The Basic Building Block
 
-- **Membrane Potential Leakage Activation**: PLIFNode outputs `(1-β)·V_post` (leak current), naturally emphasizing fast-responding neurons over slow-memory neurons
-- **PonderNet Adaptive K**: Each sublayer learns per-frame halt probabilities with geometric distribution weighting; different tokens use different effective timesteps ∈ [1, K_max]
-- **Selective State Space**: PLIF neurons with input-dependent dynamic β(t), α(t), V_th(t) — structurally identical to Mamba's selective SSM
-- **Continuous Residual Stream**: Inter-layer signals are continuous values; only SNN sublayers operate on spike/membrane dynamics
-- **Pre-LN RMSNorm**: Branch normalization controlling PLIFNode input scale + residual centering to eliminate DC drift
-- **7 Parallel Input Paths**: W_in, W_β, W_α, W_th, W_gate, W_skip, W_out
-- **Triton Fused PLIF Kernels**: Single kernel for scan + spike + soft reset + surrogate gradient
-- **Natural Gradient Compensation**: Sigmoid/softplus saturation compensation + cross-layer gradient equalization
-- **Training**: Surrogate Gradient + standard backpropagation via SpikingJelly
+Every neuron in NeuronSpark is a **Parametric Leaky Integrate-and-Fire (PLIF)** neuron:
+
+```
+V_pre[t]  = β · V_post[t-1] + (1-β) · x[t]      # charge: exponential decay + input
+spike[t]  = Θ(V_pre[t] - V_th)                     # fire: threshold comparison
+V_post[t] = V_pre[t] - V_th · spike[t]             # soft reset: subtract threshold
+```
+
+- **β = sigmoid(w)**: per-dimension learnable decay rate (how fast the neuron "forgets")
+- **V_th**: per-dimension learnable firing threshold
+- Training uses **surrogate gradient** (Sigmoid) to backprop through the non-differentiable Θ
+
+**Leakage Activation**: Inter-layer signals use `(1-β) · V_post` — the amount of membrane potential that will leak away. This naturally emphasizes fast-responding neurons (large 1-β) and attenuates slow-memory neurons (small 1-β).
+
+### SNNBlock — Selective State Space Block (Attention Analogue)
+
+The SNNBlock replaces Transformer's self-attention. It contains D×N=896×8=7168 hidden spiking neurons with **input-dependent dynamic parameters** — making it a selective state space model:
+
+```
+                    ┌──► W_in ──────────► I[t] (input current, D*N dim)
+                    │
+                    ├──► W_β + b_β ─► sigmoid ──► β(t)   (decay rate, controls memory)
+                    │
+ leak_input ────────├──► W_α + b_α ─► softplus ─► α(t)   (input gain, controls writing)
+ (D dim)            │
+                    ├──► W_th + b_th ► |·|+V_min ► V_th(t) (threshold, controls firing)
+                    │
+                    ├──► W_gate ────► sigmoid ──► gate    (output gating, D dim)
+                    │
+                    └──► W_skip ────────────────► I_skip  (skip connection, D dim)
+
+                              ▼
+              SelectivePLIF Hidden Neurons (D*N dim):
+              V[t] = β(t)·V[t-1] + α(t)·I[t]   ← selective state space recurrence
+              spike[t] = Θ(V[t] - V_th(t))       ← spike with dynamic threshold
+              V[t] -= V_th(t) · spike[t]          ← soft reset
+
+                              ▼
+              Output: W_out · V_post ⊙ gate + I_skip   (D dim)
+```
+
+**SNN–SSM Duality**: The recurrence `V[t] = β(t)·V[t-1] + α(t)·I[t]` is structurally identical to Mamba's selective SSM `h[t] = A̅(t)·h[t-1] + B̅(t)·x[t]`, with β mapping to A̅ and α to B̅. The key difference is the spike-and-reset mechanism that introduces discrete nonlinearity.
+
+### SNNFFN — SNN Feed-Forward Network (MLP Analogue)
+
+Replaces the standard SwiGLU MLP with spiking neurons:
+
+```
+                    ┌──► gate_proj → PLIF gate_neuron → leak_gate ──┐
+ leak_input ────────┤                                                ├──► × (element-wise)
+                    └──► up_proj   → PLIF up_neuron   → leak_up   ──┘         │
+                                                                               ▼
+                                                        down_proj(gated) + skip_proj(input) → output
+```
+
+The element-wise product of two leakage signals replaces SiLU(x)⊙x gating in SwiGLU. The PLIF dynamics provide implicit nonlinearity through integrate-fire-reset.
+
+### PonderNet Adaptive Timesteps
+
+Each token is represented as K=16 SNN frames, but not all tokens need all 16 steps. PonderNet learns per-frame halt probabilities:
+
+```
+For each frame k = 1, ..., K:
+  p_k = sigmoid(halt_proj(frame_k))          # halt probability
+  S_k = ∏(1 - p_j) for j < k                # survival probability
+  λ_k = p_k · S_k                            # geometric distribution weight
+  λ̂_k = λ_k / Σ λ_k                          # normalize to sum=1
+
+output = Σ λ̂_k · frame_k                     # weighted aggregation
+E[K]   = Σ k · λ̂_k                           # expected steps (ponder cost)
+```
+
+Simple tokens halt early (E[K] ≈ 2-3), complex tokens use more steps (E[K] ≈ 10-15). The ponder cost E[K] is regularized to encourage efficiency.
+
+### Each Decoder Layer (Pre-LN Pattern)
+
+Matches Qwen3/LLaMA's Pre-LN structure:
+
+```
+h ──────────────────────────────────────────────────────── + ──► h  (sublayer 1)
+ └─► RMSNorm → PLIFNode(leak) → SNNBlock → PonderNet → out_proj ─┘
+
+h ──────────────────────────────────────────────────────── + ──► h  (sublayer 2)
+ └─► RMSNorm → PLIFNode(leak) → SNNFFN   → PonderNet → out_proj ─┘
+```
+
+The residual stream `h` carries **continuous values** throughout. Only inside the SNN sublayers do spike/membrane dynamics operate. This solves the vanishing gradient problem in deep SNNs.
+
+### Triton Fused PLIF Kernels
+
+The PLIF sequential recurrence (with spike-and-reset) cannot be naively parallelized. We implement custom Triton kernels:
+
+- **Fused forward**: Single kernel for charge → fire → soft reset across all K steps
+- **Fused backward**: Single kernel with inline Sigmoid surrogate gradient
+- **Row-parameter variant**: For PLIFNode (fixed β/V_th), loads parameters into registers once — 40% faster
+- All computations in fp32 internally, bf16 for storage
 
 ## Acknowledgments
 

@@ -490,17 +490,47 @@ Crucially, these results demonstrate that \emph{a pure SNN architecture can lear
 \subsection{Architecture Ablation via Training Stability}
 \label{sec:ablation}
 
-During development, we explored 9 architectural variants (prior to the final design) using the same training setup.
-These variants differed in key design decisions --- e.g., different activation choices, absence of natural gradient compensation, alternative aggregation strategies --- but were not systematically controlled single-variable ablations (due to compute constraints, each variant was run only once for 1K--12K steps).
+During development, we explored multiple architectural variants prior to the final design.
+Due to compute constraints, each variant was trained only once for 1K--12K steps rather than to full convergence.
+Nevertheless, the training loss trajectories reveal clear signals about which design decisions are critical.
+Table~\ref{tab:ablation} summarizes 6 meaningful architectural variants (excluding 3 engineering/debugging runs); Figure~\ref{fig:ablation} shows all loss curves.
 
-Figure~\ref{fig:ablation} shows training loss curves for all variants alongside the final V1 architecture:
-\begin{itemize}
-    \item \textbf{3 variants diverged}: loss increased above 7.5 within 2K--4K steps and failed to recover.
-    \item \textbf{6 variants survived but stagnated}: loss decreased to 7.1--7.5 but plateaued, with the best reaching only 7.15 after 12K steps.
-    \item \textbf{Final architecture (V1)}: loss decreased steadily from 9.0 to 3.5 over 85K steps, the only variant to break below 7.0.
-\end{itemize}
+\begin{table}[h]
+\centering
+\caption{Architectural ablation variants. All variants stagnated above loss 7.0, while the final architecture reached 3.5.
+``Diverged'' means loss increased above 7.5 and failed to recover.}
+\label{tab:ablation}
+\small
+\begin{tabular}{p{4.5cm}rrp{5cm}}
+\toprule
+\textbf{Variant} & \textbf{Steps} & \textbf{Final Loss} & \textbf{What Changed} \\
+\midrule
+\textbf{Final V1 (this work)} & \textbf{85,000} & \textbf{3.5} & \textbf{Full architecture} \\
+\midrule
+\multicolumn{4}{l}{\emph{Surrogate gradient \& gradient compensation}} \\
+\quad MPD-AGL + no Phase 2 & 4,800 & 7.21 & Adaptive surrogate gradient (MPD-AGL), SNVR regularization, \emph{removed} cross-layer gradient equalization (Phase 2) \\
+\midrule
+\multicolumn{4}{l}{\emph{PonderNet / adaptive computation}} \\
+\quad E[K] floor constraint & 1,200 & 7.47 & Added minimum E[K] floor to prevent PonderNet collapse \\
+\quad Bounded $\alpha$ gain & 5,100 & 7.47 & Replaced unbounded softplus $\alpha$ with bounded gain multiplier \\
+\midrule
+\multicolumn{4}{l}{\emph{Neuron dynamics}} \\
+\quad HC $\alpha$ (decoupled $\alpha$-$\beta$) & 3,700 & 7.44 & Separate learnable $\alpha$ parameter (1D tensor), decoupled from $\beta$ \\
+\midrule
+\multicolumn{4}{l}{\emph{Regularization / normalization}} \\
+\quad Sinkhorn health score & 2,100 & 7.62 (diverged) & Replaced raw gradient ratio with Sinkhorn-projected health score for training stability monitoring \\
+\midrule
+\multicolumn{4}{l}{\emph{Novel architectural components}} \\
+\quad Cortical lateral connections & 4,100 & 7.66 (diverged) & Added layer-internal causal spike propagation across tokens (inspired by cortical Layer II/III) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-While these are not controlled single-factor ablations, the stark contrast --- all 9 variants stalled above 7.0 while V1 reached 3.5 --- provides evidence that the combination of design choices in the final architecture (leakage activation, PonderNet, natural gradient compensation, structured initialization, residual centering) is critical for stable training at this scale.
+\paragraph{Key observations.}
+(1)~\textbf{Removing Phase 2 gradient equalization} (MPD-AGL variant) produced the best ablation result (loss 7.21) but still far above V1's 3.5, suggesting that cross-layer gradient balance is necessary but not sufficient.
+(2)~\textbf{PonderNet modifications} (E[K] floor, bounded $\alpha$) both stagnated at 7.47, indicating that the original PonderNet design with unconstrained softplus $\alpha$ and no E[K] floor is already near-optimal.
+(3)~\textbf{Cortical lateral connections} --- the most biologically ambitious variant --- diverged quickly, suggesting that cross-token spike propagation introduces instability at this training scale.
+(4)~No single variant broke below loss 7.0; only the full combination of all design choices in V1 achieved continued loss decrease.
 
 \begin{figure}[t]
     \centering

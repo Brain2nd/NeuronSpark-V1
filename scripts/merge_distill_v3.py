@@ -35,7 +35,7 @@ def build_neuronspark_config(nvidia_config, bio_cfg):
         hidden_size=nvidia_config.hidden_size,
         intermediate_size=nvidia_config.intermediate_size,
         num_hidden_layers=nvidia_config.num_hidden_layers,
-        hybrid_override_pattern=nvidia_config.hybrid_override_pattern,
+        hybrid_override_pattern=nvidia_config.hybrid_override_pattern.replace('M', 'S'),
         num_attention_heads=nvidia_config.num_attention_heads,
         head_dim=nvidia_config.head_dim,
         num_key_value_heads=nvidia_config.num_key_value_heads,

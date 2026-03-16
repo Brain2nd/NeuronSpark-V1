@@ -1,0 +1,217 @@
+\begin{thebibliography}{33}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[Abbott(1999)]{abbott1999lapicque}
+Larry~F Abbott.
+\newblock Lapicque's introduction of the integrate-and-fire model neuron
+  (1907).
+\newblock \emph{Brain Research Bulletin}, 50\penalty0 (5-6):\penalty0 303--304,
+  1999.
+
+\bibitem[Bal and Sengupta(2024)]{bal2024spikingbert}
+Malyaban Bal and Abhronil Sengupta.
+\newblock Spikingbert: Distilling bert to train spiking language models using
+  implicit differentiation.
+\newblock \emph{Proceedings of the AAAI Conference on Artificial Intelligence},
+  38\penalty0 (10):\penalty0 10998--11006, 2024.
+
+\bibitem[Banino et~al.(2021)Banino, Balaguer, and
+  Blundell]{banino2021pondernet}
+Andrea Banino, Jan Balaguer, and Charles Blundell.
+\newblock Pondernet: Learning to ponder.
+\newblock \emph{International Conference on Machine Learning Workshop on
+  Theoretic Foundation, Criticism, and Application Trend of Explainable AI},
+  2021.
+
+\bibitem[BelleGroup(2023)]{bellegroup2023}
+BelleGroup.
+\newblock Bellegroup train\_3.5m\_cn: Chinese instruction-following dataset,
+  2023.
+\newblock URL \url{https://huggingface.co/datasets/BelleGroup/train_3.5M_CN}.
+
+\bibitem[Blelloch(1990)]{blelloch1990prefix}
+Guy~E Blelloch.
+\newblock Prefix sums and their applications.
+\newblock \emph{Technical Report CMU-CS-90-190, School of Computer Science,
+  Carnegie Mellon University}, 1990.
+
+\bibitem[Carandini and Heeger(2012)]{carandini2012normalization}
+Matteo Carandini and David~J Heeger.
+\newblock Normalization as a canonical neural computation.
+\newblock \emph{Nature Reviews Neuroscience}, 13\penalty0 (1):\penalty0 51--62,
+  2012.
+
+\bibitem[Chen et~al.(2016)Chen, Xu, Zhang, and Guestrin]{chen2016training}
+Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin.
+\newblock Training deep nets with sublinear memory cost.
+\newblock \emph{arXiv preprint arXiv:1604.06174}, 2016.
+
+\bibitem[Dao and Gu(2024)]{dao2024transformers}
+Tri Dao and Albert Gu.
+\newblock Transformers are {SSMs}: Generalized models and efficient algorithms
+  through structured state space duality.
+\newblock \emph{International Conference on Machine Learning}, 2024.
+
+\bibitem[Davies et~al.(2018)Davies, Srinivasa, Lin, Chinya, Cao, Choday, Dimou,
+  Joshi, Imam, Jain, et~al.]{davies2018loihi}
+Mike Davies, Narayan Srinivasa, Tsung-Han Lin, Gautham Chinya, Yongqiang Cao,
+  Sri~Harsha Choday, Georgios Dimou, Prasad Joshi, Nabil Imam, Shweta Jain,
+  et~al.
+\newblock Loihi: A neuromorphic manycore processor with on-chip learning.
+\newblock \emph{IEEE Micro}, 38\penalty0 (1):\penalty0 82--99, 2018.
+
+\bibitem[Fang et~al.(2021)Fang, Yu, Chen, Masquelier, Huang, and
+  Tian]{fang2021incorporating}
+Wei Fang, Zhaofei Yu, Yanqi Chen, Timothee Masquelier, Tiejun Huang, and
+  Yonghong Tian.
+\newblock Incorporating learnable membrane time constant to enhance learning of
+  spiking neural networks.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on
+  Computer Vision}, pages 2661--2671, 2021.
+
+\bibitem[Fang et~al.(2023)Fang, Chen, Ding, Yu, Masquelier, Chen, Huang, Zhou,
+  Li, and Tian]{fang2023spikingjelly}
+Wei Fang, Yanqi Chen, Jianhao Ding, Zhaofei Yu, Timoth{\'e}e Masquelier, Ding
+  Chen, Liwei Huang, Huihui Zhou, Guoqi Li, and Yonghong Tian.
+\newblock Spikingjelly: An open-source machine learning infrastructure platform
+  for spike-based intelligence.
+\newblock \emph{Science Advances}, 9\penalty0 (40):\penalty0 eadi1480, 2023.
+
+\bibitem[Graves(2016)]{graves2016adaptive}
+Alex Graves.
+\newblock Adaptive computation time for recurrent neural networks.
+\newblock \emph{arXiv preprint arXiv:1603.08983}, 2016.
+
+\bibitem[Gu and Dao(2024)]{gu2024mamba}
+Albert Gu and Tri Dao.
+\newblock Mamba: Linear-time sequence modeling with selective state spaces.
+\newblock \emph{International Conference on Machine Learning}, 2024.
+
+\bibitem[Gu et~al.(2022)Gu, Goel, and R{\'e}]{gu2022efficiently}
+Albert Gu, Karan Goel, and Christopher R{\'e}.
+\newblock Efficiently modeling long sequences with structured state spaces.
+\newblock \emph{International Conference on Learning Representations}, 2022.
+
+\bibitem[Hodgkin and Huxley(1952)]{hodgkin1952quantitative}
+Alan~L Hodgkin and Andrew~F Huxley.
+\newblock A quantitative description of membrane current and its application to
+  conduction and excitation in nerve.
+\newblock \emph{The Journal of Physiology}, 117\penalty0 (4):\penalty0
+  500--544, 1952.
+
+\bibitem[Loshchilov and Hutter(2019)]{loshchilov2019decoupled}
+Ilya Loshchilov and Frank Hutter.
+\newblock Decoupled weight decay regularization.
+\newblock \emph{International Conference on Learning Representations}, 2019.
+
+\bibitem[Lv et~al.(2023)Lv, Xu, Li, Wang, and Liu]{lv2023spikebert}
+Changze Lv, Tianlong Xu, Jianhan Li, Chenxi Wang, and Jian Liu.
+\newblock Spikebert: A language spikformer trained with two-stage knowledge
+  distillation from bert.
+\newblock \emph{arXiv preprint arXiv:2308.15122}, 2023.
+
+\bibitem[Maass(1997)]{maass1997networks}
+Wolfgang Maass.
+\newblock Networks of spiking neurons: the third generation of neural network
+  models.
+\newblock \emph{Neural Networks}, 10\penalty0 (9):\penalty0 1659--1671, 1997.
+
+\bibitem[Martin and Cundy(2018)]{martin2018parallelizing}
+Eric Martin and Chris Cundy.
+\newblock Parallelizing linear recurrent neural nets over sequence length.
+\newblock \emph{International Conference on Learning Representations}, 2018.
+
+\bibitem[Micikevicius et~al.(2018)Micikevicius, Narang, Alben, Diamos, Elsen,
+  Garcia, Ginsburg, Houston, Kuchaiev, Venkatesh, and
+  Wu]{micikevicius2018mixed}
+Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen,
+  David Garcia, Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh
+  Venkatesh, and Hao Wu.
+\newblock Mixed precision training.
+\newblock \emph{International Conference on Learning Representations}, 2018.
+
+\bibitem[Mobvoi(2023)]{seqmonkey2023}
+Mobvoi.
+\newblock Seq-monkey general open corpus, 2023.
+\newblock URL \url{https://modelscope.cn/datasets/ddzhu123/seq-monkey}.
+
+\bibitem[Neftci et~al.(2019)Neftci, Mostafa, and Zenke]{neftci2019surrogate}
+Emre~O Neftci, Hesham Mostafa, and Friedemann Zenke.
+\newblock Surrogate gradient learning in spiking neural networks: Bringing the
+  power of gradient-based optimization to spiking neural networks.
+\newblock \emph{IEEE Signal Processing Magazine}, 36\penalty0 (6):\penalty0
+  51--63, 2019.
+
+\bibitem[Press and Wolf(2017)]{press2017using}
+Ofir Press and Lior Wolf.
+\newblock Using the output embedding to improve language models.
+\newblock \emph{Proceedings of the 15th Conference of the European Chapter of
+  the Association for Computational Linguistics}, pages 157--163, 2017.
+
+\bibitem[Radford et~al.(2019)Radford, Wu, Child, Luan, Amodei, and
+  Sutskever]{radford2019language}
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya
+  Sutskever.
+\newblock Language models are unsupervised multitask learners.
+\newblock \emph{OpenAI blog}, 2019.
+
+\bibitem[Sennrich et~al.(2016)Sennrich, Haddow, and Birch]{sennrich2016neural}
+Rico Sennrich, Barry Haddow, and Alexandra Birch.
+\newblock Neural machine translation of rare words with subword units.
+\newblock \emph{Proceedings of the 54th Annual Meeting of the Association for
+  Computational Linguistics}, pages 1715--1725, 2016.
+
+\bibitem[Shazeer(2020)]{shazeer2020glu}
+Noam Shazeer.
+\newblock {GLU} variants improve transformer.
+\newblock \emph{arXiv preprint arXiv:2002.05202}, 2020.
+
+\bibitem[Tillet et~al.(2019)Tillet, Kung, and Cox]{tillet2019triton}
+Philippe Tillet, H.~T. Kung, and David Cox.
+\newblock Triton: An intermediate language and compiler for tiled neural
+  network computations.
+\newblock \emph{Proceedings of the 3rd MLSys Conference}, 2019.
+
+\bibitem[Touvron et~al.(2023)Touvron, Lavril, Izacard, Martinet, Lachaux,
+  Lacroix, Rozi{\`e}re, Goyal, Hambro, Azhar, et~al.]{touvron2023llama}
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne
+  Lachaux, Timoth{\'e}e Lacroix, Baptiste Rozi{\`e}re, Naman Goyal, Eric
+  Hambro, Faisal Azhar, et~al.
+\newblock {LLaMA}: Open and efficient foundation language models.
+\newblock \emph{arXiv preprint arXiv:2302.13971}, 2023.
+
+\bibitem[Vaswani et~al.(2017)Vaswani, Shazeer, Parmar, Uszkoreit, Jones, Gomez,
+  Kaiser, and Polosukhin]{vaswani2017attention}
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+  Aidan~N Gomez, {\L}ukasz Kaiser, and Illia Polosukhin.
+\newblock Attention is all you need.
+\newblock \emph{Advances in Neural Information Processing Systems}, 30, 2017.
+
+\bibitem[Yang et~al.(2025)Yang, Yang, Zhang, et~al.]{yang2025qwen3}
+An~Yang, Baosong Yang, Beichen Zhang, et~al.
+\newblock Qwen3 technical report.
+\newblock \emph{arXiv preprint arXiv:2505.09388}, 2025.
+
+\bibitem[Zenke and Vogels(2021)]{zenke2021remarkable}
+Friedemann Zenke and Tim~P Vogels.
+\newblock The remarkable robustness of surrogate gradient learning for
+  instilling complex function in spiking neural networks.
+\newblock \emph{Neural Computation}, 33\penalty0 (4):\penalty0 899--925, 2021.
+
+\bibitem[Zhang and Sennrich(2019)]{zhang2019root}
+Biao Zhang and Rico Sennrich.
+\newblock Root mean square layer normalization.
+\newblock \emph{Advances in Neural Information Processing Systems}, 32, 2019.
+
+\bibitem[Zhu et~al.(2024)Zhu, Zhao, Li, and Eshraghian]{zhu2024spikegpt}
+Rui-Jie Zhu, Qihang Zhao, Guoqi Li, and Jason~K Eshraghian.
+\newblock Spikegpt: Generative pre-trained language model with spiking neural
+  networks.
+\newblock \emph{IEEE Transactions on Neural Networks and Learning Systems},
+  2024.
+
+\end{thebibliography}

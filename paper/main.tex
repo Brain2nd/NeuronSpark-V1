@@ -487,6 +487,31 @@ The model generates grammatically correct Chinese responses and demonstrates bas
 It exhibits repetition on complex queries and limited knowledge depth, consistent with the small training data budget and 512-token context.
 Crucially, these results demonstrate that \emph{a pure SNN architecture can learn coherent language generation from scratch, even with limited data}.
 
+\subsection{Architecture Ablation via Training Stability}
+\label{sec:ablation}
+
+During development, we explored 9 architectural variants (prior to the final design) using the same training setup.
+These variants differed in key design decisions --- e.g., different activation choices, absence of natural gradient compensation, alternative aggregation strategies --- but were not systematically controlled single-variable ablations (due to compute constraints, each variant was run only once for 1K--12K steps).
+
+Figure~\ref{fig:ablation} shows training loss curves for all variants alongside the final V1 architecture:
+\begin{itemize}
+    \item \textbf{3 variants diverged}: loss increased above 7.5 within 2K--4K steps and failed to recover.
+    \item \textbf{6 variants survived but stagnated}: loss decreased to 7.1--7.5 but plateaued, with the best reaching only 7.15 after 12K steps.
+    \item \textbf{Final architecture (V1)}: loss decreased steadily from 9.0 to 3.5 over 85K steps, the only variant to break below 7.0.
+\end{itemize}
+
+While these are not controlled single-factor ablations, the stark contrast --- all 9 variants stalled above 7.0 while V1 reached 3.5 --- provides evidence that the combination of design choices in the final architecture (leakage activation, PonderNet, natural gradient compensation, structured initialization, residual centering) is critical for stable training at this scale.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\textwidth]{figures/ablation_runs.pdf}
+    \caption{Training loss comparison: final V1 architecture (blue) vs.\ 9 ablation variants from earlier development.
+    Red: diverged (loss $>$7.5); Orange: survived but stagnated (loss 7.1--7.5).
+    Only the final architecture breaks below loss 7.0.}
+    \label{fig:ablation}
+\end{figure}
+
+
 \subsection{Comparison with Existing SNN Language Models}
 
 \begin{table}[h]

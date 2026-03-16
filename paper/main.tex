@@ -1,0 +1,481 @@
+\documentclass[11pt]{article}
+
+% ============================================================
+% Packages
+% ============================================================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usepackage{natbib}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{bm}
+\usepackage{pifont}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue,
+}
+
+% ============================================================
+% Custom Commands
+% ============================================================
+\newcommand{\model}{\textsc{NeuronSpark}}
+\newcommand{\vpost}{V_{\text{post}}}
+\newcommand{\vpre}{V_{\text{pre}}}
+\newcommand{\vth}{V_{\text{th}}}
+\newcommand{\Expect}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+
+\title{
+    \model{}: A Spiking Neural Network Language Model \\
+    with Selective State Space Dynamics
+}
+
+\author{
+    Zhengzheng Tang \\
+    Boston University \\
+    \texttt{zztangbu@bu.edu}
+}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+% ============================================================
+% Abstract
+% ============================================================
+\begin{abstract}
+We present \model{}, a 0.9-billion parameter language model built \emph{entirely} on spiking neural networks (SNNs).
+Unlike prior SNN language models that distill from pretrained Transformers, \model{} is trained from scratch using surrogate gradient backpropagation, demonstrating that pure SNN architectures can acquire language modeling capabilities through standard next-token prediction.
+
+Our architecture introduces three key innovations:
+(1)~\textbf{Selective State Space SNN Blocks} with input-dependent dynamic parameters $\beta(t), \alpha(t), \vth(t)$, drawing a formal connection between SNN membrane dynamics and selective state space models;
+(2)~\textbf{Membrane potential leakage activation}, where PLIFNode neurons output $(1-\beta)\cdot\vpost$ --- the leak current --- as inter-layer signals, naturally weighting fast-responding neurons over slow-memory neurons;
+(3)~\textbf{PonderNet adaptive timesteps}, allowing each token to dynamically decide its effective SNN computation depth $K_{\text{eff}} \in [1, K_{\max}]$ via learned geometric-distribution halt probabilities.
+
+\model{}-0.9B, trained on 10B Chinese tokens with custom Triton-fused PLIF kernels on a single NVIDIA DGX Spark, achieves a pretraining loss of 3.6 and demonstrates basic dialogue capability after supervised fine-tuning.
+To our knowledge, this is the largest SNN language model trained from scratch to date.
+We release all code, weights, and training infrastructure under Apache~2.0.
+
+\end{abstract}
+
+% ============================================================
+% 1. Introduction
+% ============================================================
+\section{Introduction}
+\label{sec:intro}
+
+Large language models (LLMs) based on Transformers~\citep{vaswani2017attention} have achieved remarkable success across natural language processing tasks.
+However, their quadratic attention mechanism and dense floating-point computation raise fundamental questions about computational efficiency and biological plausibility.
+Meanwhile, spiking neural networks (SNNs)~\citep{maass1997networks} --- the ``third generation'' of neural networks --- process information through discrete spikes and temporal dynamics, offering potential advantages in energy efficiency and neuromorphic hardware deployment.
+
+Despite significant progress in SNN-based vision models, SNN language modeling remains largely unexplored.
+Existing approaches such as SpikeGPT~\citep{zhu2024spikegpt}, SpikingBERT~\citep{bal2024spikingbert}, and SpikeBERT~\citep{lv2023spikebert} either rely on knowledge distillation from pretrained Transformers or are limited to small-scale models.
+A fundamental question remains open: \emph{Can a pure SNN architecture learn language from scratch at scale, using only standard next-token prediction?}
+
+In this work, we answer affirmatively by introducing \model{}, a 0.9B-parameter SNN language model trained from scratch on 10B tokens.
+Our key insight is that the membrane potential dynamics of Leaky Integrate-and-Fire (LIF) neurons can be viewed as a selective state space model~\citep{gu2024mamba}, where the decay rate $\beta$, input gain $\alpha$, and firing threshold $\vth$ serve as input-dependent gating mechanisms analogous to Mamba's selection mechanism.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+    \item We propose the \textbf{Selective State Space SNN Block}, which computes dynamic $\beta(t), \alpha(t), \vth(t)$ from input spikes through learned modulation networks, establishing a formal SNN--SSM duality (Section~\ref{sec:snn-block}).
+
+    \item We introduce \textbf{membrane potential leakage activation} $(1-\beta)\cdot\vpost$ for PLIFNode inter-layer signals, which naturally emphasizes fast-responding neurons and provides implicit temporal-scale weighting (Section~\ref{sec:leakage}).
+
+    \item We design \textbf{PonderNet adaptive timesteps} at the layer level, enabling per-token dynamic SNN computation depth with geometric-distribution weighting (Section~\ref{sec:pondernet}).
+
+    \item We develop \textbf{Triton-fused PLIF kernels} that perform the entire PLIF forward (scan + spike + soft reset) and backward (surrogate gradient) in a single kernel launch, achieving $\sim$3$\times$ speedup over the na\"ive 3-phase approach (Section~\ref{sec:triton}).
+
+    \item We train and release \model{}-0.9B, the largest from-scratch SNN language model to date, along with complete training infrastructure (Section~\ref{sec:experiments}).
+\end{enumerate}
+
+
+% ============================================================
+% 2. Related Work
+% ============================================================
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Spiking Neural Networks for Language.}
+SpikeGPT~\citep{zhu2024spikegpt} proposed a generative SNN language model using binary spike activations, achieving perplexity comparable to small Transformers on limited benchmarks.
+SpikingBERT~\citep{bal2024spikingbert} and SpikeBERT~\citep{lv2023spikebert} distill BERT representations into spiking architectures.
+These approaches either start from pretrained ANN weights or operate at significantly smaller scales ($<$100M parameters).
+\model{} differs by training a 0.9B SNN from random initialization using only next-token prediction.
+
+\paragraph{State Space Models.}
+Structured State Spaces (S4)~\citep{gu2022efficiently} introduced efficient linear recurrence for sequence modeling.
+Mamba~\citep{gu2024mamba} added input-dependent selection, achieving Transformer-competitive performance.
+Mamba-2~\citep{dao2024transformers} established a formal duality between SSMs and attention.
+We observe that SNN membrane dynamics $V[t] = \beta(t) \cdot V[t-1] + \alpha(t) \cdot I[t]$ are structurally identical to the selective SSM recurrence, with $\beta$ as the decay coefficient and $\alpha$ as the input gate.
+
+\paragraph{Adaptive Computation.}
+Adaptive Computation Time (ACT)~\citep{graves2016adaptive} allows networks to vary computation per input.
+PonderNet~\citep{banino2021pondernet} improved upon ACT with a geometric distribution prior.
+We apply PonderNet at the SNN timestep level: each token's $K$ frames are aggregated with learned halt probabilities, enabling different tokens to use $1$ to $K_{\max}$ effective SNN steps.
+
+\paragraph{Surrogate Gradient Training.}
+The non-differentiability of spike generation ($\Theta(V - \vth)$) is addressed by surrogate gradient methods~\citep{neftci2019surrogate, zenke2021remarkable}, which replace the Heaviside derivative with smooth approximations (e.g., sigmoid).
+\model{} uses Sigmoid surrogate gradients throughout, with custom Triton kernels that fuse the surrogate computation into the scan.
+
+
+% ============================================================
+% 3. Architecture
+% ============================================================
+\section{Architecture}
+\label{sec:arch}
+
+\subsection{Overview}
+
+\model{} follows a three-stage pipeline (Figure~\ref{fig:architecture}):
+
+\begin{enumerate}
+    \item \textbf{Encode}: Token IDs $\to$ embedding $\to$ repeat $K$ times along the temporal dimension, producing a $(T \cdot K, B, D)$ sequence for SNN processing.
+    \item \textbf{SNN Forward}: $L=20$ decoder layers, each containing an SNNBlock (attention analogue) and an SNNFFN (MLP analogue), with PonderNet adaptive $K$-frame aggregation.
+    \item \textbf{Decode}: Output PLIF neuron $\to$ $K$-frame mean pooling $\to$ linear projection $\to$ tied embedding head $\to$ logits.
+\end{enumerate}
+
+Each decoder layer follows a Pre-LN residual pattern matching Qwen3/LLaMA~\citep{touvron2023llama, yang2025qwen3}:
+\begin{align}
+    \mathbf{h} &\leftarrow \mathbf{h} + \text{OutProj}\big(\text{PonderAgg}\big(\text{SNNBlock}\big(\text{PLIF}\big(\text{RMSNorm}(\mathbf{h})\big)\big)\big)\big) \\
+    \mathbf{h} &\leftarrow \mathbf{h} + \text{OutProj}\big(\text{PonderAgg}\big(\text{SNNFFN}\big(\text{PLIF}\big(\text{RMSNorm}(\mathbf{h})\big)\big)\big)\big)
+\end{align}
+
+\begin{figure}[t]
+    \centering
+    % Placeholder for architecture diagram
+    \fbox{\parbox{0.9\textwidth}{\centering\vspace{2cm}
+    \textbf{[Architecture Diagram]}\\
+    Token $\to$ Embed $\to$ Repeat $K$ $\to$ $L \times$ (RMSNorm $\to$ PLIF $\to$ SNNBlock/FFN $\to$ PonderNet $\to$ Residual) $\to$ Output PLIF $\to$ Logits
+    \vspace{2cm}}}
+    \caption{\model{} architecture overview. The residual stream carries continuous values $\mathbf{h}$; only the SNN sublayers operate on spike/membrane dynamics. PonderNet aggregation collapses $K$ frames per token with learned geometric-distribution weights.}
+    \label{fig:architecture}
+\end{figure}
+
+
+\subsection{PLIF Neuron Dynamics}
+\label{sec:plif}
+
+All neurons in \model{} follow the Parametric Leaky Integrate-and-Fire (PLIF) model~\citep{fang2021incorporating}:
+\begin{align}
+    \vpre[t] &= \beta \cdot \vpost[t-1] + (1-\beta) \cdot x[t] \label{eq:plif-charge} \\
+    s[t] &= \Theta(\vpre[t] - \vth) \label{eq:plif-fire} \\
+    \vpost[t] &= \vpre[t] - \vth \cdot s[t] \label{eq:plif-reset}
+\end{align}
+where $\beta = \sigma(w) \in (0,1)$ is a per-dimension learnable decay rate, $\vth$ is a per-dimension learnable threshold, and $\Theta$ is the Heaviside step function (Sigmoid surrogate in backward pass).
+Equation~\eqref{eq:plif-reset} implements \emph{soft reset}: the membrane potential is reduced by $\vth$ upon firing, preserving residual charge.
+
+
+\subsection{Membrane Potential Leakage Activation}
+\label{sec:leakage}
+
+A critical design choice is the signal transmitted between layers.
+Standard SNN practice uses binary spikes $s[t] \in \{0,1\}$, but this severely limits gradient flow.
+An alternative is the raw membrane potential $\vpost$, but this treats all neurons equally regardless of their temporal dynamics.
+
+We instead use the \textbf{membrane potential leakage}:
+\begin{equation}
+    \text{leak}[t] = (1 - \beta) \cdot \vpost[t]
+    \label{eq:leakage}
+\end{equation}
+This is the amount of membrane potential that will \emph{dissipate} due to exponential decay before the next input arrives.
+Biologically, it corresponds to the leak current through the membrane conductance~\citep{hodgkin1952quantitative}.
+
+The leakage activation provides natural \textbf{temporal-scale weighting}:
+neurons with large $(1-\beta)$ (fast dynamics, short memory) produce proportionally larger signals,
+while neurons with small $(1-\beta)$ (slow dynamics, long memory) are implicitly attenuated.
+Downstream projection weights compensate with per-column scaling $W_{\text{new}}[:, j] = W[:, j] / (1-\beta_j)$,
+making the transformation algebraically equivalent to $\vpost$ but with different numerical properties that distribute information more evenly across temporal scales.
+
+
+\subsection{Selective State Space SNN Block}
+\label{sec:snn-block}
+
+The SNNBlock is the attention analogue, processing input through $D \cdot N$ hidden spiking neurons with input-dependent parameters.
+It computes six parallel projections from the input leak signal:
+\begin{align}
+    \mathbf{I}[t] &= W_{\text{in}} \cdot \text{leak}[t] & &\in \R^{DN} & &\text{(input current)} \\
+    \beta(t) &= \sigma\big(W_\beta \cdot \text{leak}[t] + \mathbf{b}_\beta\big) & &\in (0,1)^{DN} & &\text{(decay rate)} \\
+    \alpha(t) &= \text{softplus}\big(W_\alpha \cdot \text{leak}[t] + \mathbf{b}_\alpha\big) & &\in \R_+^{DN} & &\text{(input gain)} \\
+    \vth(t) &= V_{\min} + \big|W_{\text{th}} \cdot \text{leak}[t] + \mathbf{b}_{\text{th}}\big| & &\in \R_+^{DN} & &\text{(threshold)} \\
+    \mathbf{g}[t] &= \sigma\big(W_{\text{gate}} \cdot \text{leak}[t]\big) & &\in (0,1)^D & &\text{(output gate)} \\
+    \mathbf{I}_{\text{skip}}[t] &= W_{\text{skip}} \cdot \text{leak}[t] & &\in \R^D & &\text{(skip connection)}
+\end{align}
+
+The hidden neuron dynamics follow a \textbf{Selective PLIF} model:
+\begin{equation}
+    V[t] = \beta(t) \cdot V[t-1] + \alpha(t) \cdot I[t], \quad
+    s[t] = \Theta(V[t] - \vth(t)), \quad
+    V[t] \mathrel{-}= \vth(t) \cdot s[t]
+    \label{eq:selective-plif}
+\end{equation}
+
+This is structurally identical to Mamba's selective SSM recurrence $h[t] = \bar{A}(t) \cdot h[t-1] + \bar{B}(t) \cdot x[t]$, with the crucial addition of the spike-and-reset mechanism that introduces discrete nonlinearity.
+The output is projected from the post-spike membrane potential:
+\begin{equation}
+    \text{out}[t] = W_{\text{out}} \cdot \vpost[t] \odot \mathbf{g}[t] + \mathbf{I}_{\text{skip}}[t]
+\end{equation}
+
+Note that while the \emph{hidden} neurons output $\vpost$ (since $\beta(t)$ is dynamic and per-step leakage scaling is not possible with static weights), the \emph{input} and \emph{output} neurons at layer boundaries use leakage activation (Eq.~\ref{eq:leakage}).
+
+
+\subsection{SNN Feed-Forward Network}
+\label{sec:snn-ffn}
+
+The SNNFFN mirrors the SwiGLU MLP~\citep{touvron2023llama}:
+\begin{align}
+    \text{gate\_leak} &= (1-\beta_g) \cdot \vpost\big(\text{PLIF}_{\text{gate}}(W_{\text{gate}} \cdot \text{leak})\big) \\
+    \text{up\_leak} &= (1-\beta_u) \cdot \vpost\big(\text{PLIF}_{\text{up}}(W_{\text{up}} \cdot \text{leak})\big) \\
+    \text{out} &= W_{\text{down}} \cdot (\text{gate\_leak} \odot \text{up\_leak}) + W_{\text{skip}} \cdot \text{leak}
+\end{align}
+The element-wise product of two leakage signals replaces the $\text{SiLU}(x) \odot x$ gating in SwiGLU.
+The PLIF neuron dynamics provide implicit nonlinearity through the integrate-fire-reset mechanism.
+
+
+\subsection{PonderNet Adaptive Timesteps}
+\label{sec:pondernet}
+
+Each token is represented as $K$ SNN frames.
+Rather than uniformly averaging all $K$ frames, we learn per-frame halt probabilities following PonderNet~\citep{banino2021pondernet}:
+\begin{align}
+    p_k &= \sigma\big(\text{halt\_proj}(\text{frame}_k)\big) \in (0, 1) \\
+    S_k &= \textstyle\prod_{j=1}^{k-1} (1 - p_j) \quad \text{(survival probability)} \\
+    \lambda_k &= p_k \cdot S_k \quad \text{(geometric distribution weight)} \\
+    \hat{\lambda}_k &= \lambda_k / \textstyle\sum_k \lambda_k \quad \text{(normalized)} \\
+    \text{output} &= \textstyle\sum_k \hat{\lambda}_k \cdot \text{frame}_k
+\end{align}
+
+The \textbf{expected timesteps} $\Expect[K] = \sum_k k \cdot \hat{\lambda}_k$ serves as a ponder cost regularizer, encouraging the model to use fewer steps for ``easy'' tokens while allocating more computation to complex ones.
+This is applied independently at each sublayer (SNNBlock and SNNFFN), giving $2L = 40$ adaptive aggregation points.
+
+
+% ============================================================
+% 4. Efficient Implementation
+% ============================================================
+\section{Efficient Implementation}
+\label{sec:implementation}
+
+\subsection{Triton Fused PLIF Kernels}
+\label{sec:triton}
+
+The PLIF neuron involves a sequential recurrence that cannot be trivially parallelized due to the spike-and-reset nonlinearity.
+We implement fused Triton~\citep{tillet2019triton} kernels that perform the entire forward and backward pass in a single kernel launch per direction:
+
+\paragraph{Forward kernel.} Each thread block processes \texttt{BLOCK=128} columns across all $K$ sequential steps, performing charge--fire--reset inline:
+\begin{algorithmic}
+\STATE $v \leftarrow v_{\text{init}}$
+\FOR{$k = 0, \ldots, K-1$}
+    \STATE $v_{\text{pre}} \leftarrow \beta[k] \cdot v + u[k]$ \COMMENT{charge}
+    \STATE $s \leftarrow \mathbf{1}[v_{\text{pre}} \geq \vth[k]]$ \COMMENT{fire}
+    \STATE $v \leftarrow v_{\text{pre}} - \vth[k] \cdot s$ \COMMENT{soft reset}
+\ENDFOR
+\end{algorithmic}
+
+\paragraph{Backward kernel.} Reverse accumulation with inline Sigmoid surrogate gradient $\sigma'(\alpha \cdot x) = \alpha \cdot \sigma(\alpha x) \cdot (1 - \sigma(\alpha x))$, computing $\nabla_\beta, \nabla_u, \nabla_{\vth}, \nabla_{v_{\text{init}}}$ in a single pass.
+
+\paragraph{Row-parameter variant.} For PLIFNode (fixed $\beta, \vth$ across $K$ steps), we provide a specialized kernel that loads $\beta, \vth$ once into registers, reducing global memory reads from 3 per step to 1 (only $u$), yielding $\sim$40\% speedup.
+
+\subsection{Natural Gradient Compensation}
+\label{sec:natural-gradient}
+
+The modulation biases $\mathbf{b}_\beta, \mathbf{b}_\alpha, \mathbf{b}_{\text{th}}$ suffer from two gradient pathologies:
+
+\paragraph{Phase 1: Activation saturation.}
+$\beta = \sigma(b_\beta)$ creates gradient vanishing when $\beta \to 0$ or $\beta \to 1$ (sigmoid saturation).
+We compensate by dividing the gradient by $\sigma'(b_\beta) = \beta(1-\beta)$, effectively performing gradient descent in $\beta$-space rather than $b_\beta$-space.
+
+\paragraph{Phase 2: Residual amplification.}
+The residual connection $\mathbf{h} = \mathbf{h} + f(\mathbf{h})$ causes gradients to accumulate multiplicatively across layers, with shallow layers receiving $\sim$20$\times$ larger gradients than deep layers for $L=20$.
+We normalize each layer's modulation parameter gradients to the geometric mean across layers.
+
+
+% ============================================================
+% 5. Experiments
+% ============================================================
+\section{Experiments}
+\label{sec:experiments}
+
+\subsection{Setup}
+
+\paragraph{Model configuration.}
+\model{}-0.9B has $D=896$, $N=8$, $K=16$, $L=20$, $D_{\text{ff}}=2688$, and a 6144-token BPE vocabulary, totaling 874M trainable parameters.
+
+\paragraph{Training.}
+We train on the Seq-Monkey corpus~\citep{seqmonkey2023} ($\sim$10B Chinese tokens, 29M samples at 512 token length) for 85,000 steps with 4-GPU DDP on a single NVIDIA DGX Spark (GB10, 128GB unified memory).
+Training uses Adam~\citep{loshchilov2019decoupled} with $\text{lr}=2\times10^{-4}$, warmup 1,000 steps + cosine decay, gradient accumulation 8, bfloat16 mixed precision, and gradient checkpointing~\citep{chen2016training}.
+Neuron parameters receive 10$\times$ base learning rate to compensate for surrogate gradient sparsity.
+
+\paragraph{SFT.}
+We fine-tune on BelleGroup 3.5M Chinese instructions~\citep{bellegroup2023} for 6,500 steps with $\text{lr}=5\times10^{-5}$, AdamW with weight decay 0.01, training only on assistant response tokens (ChatML format).
+
+\subsection{Results}
+
+\begin{table}[h]
+\centering
+\caption{Training results for \model{}-0.9B.}
+\label{tab:results}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Pretrain} & \textbf{SFT} \\
+\midrule
+Training loss & 3.6 & 2.1 \\
+Parameters & \multicolumn{2}{c}{874M} \\
+Training steps & 85,000 & 6,500 \\
+Tokens seen & $\sim$10B & $\sim$0.4B \\
+Hardware & \multicolumn{2}{c}{1$\times$ DGX Spark (4$\times$ GB10 GPU)} \\
+Peak memory & \multicolumn{2}{c}{$\sim$48 GB / GPU} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Qualitative evaluation.}
+After SFT, the model demonstrates basic Chinese dialogue capabilities:
+\begin{quote}
+\textbf{Q:} What is the capital of China? (\emph{zh: ``Zhongguo de shoudu shi nali?''}) \\
+\textbf{A:} The capital of China is Beijing. (\emph{zh: ``Zhongguo de shoudu zai Beijing.''})
+
+\textbf{Q:} Hello! (\emph{zh: ``Ni hao ya''}) \\
+\textbf{A:} How can I help you? (\emph{zh: ``Qingwen nin xuyao shenme yangde bangzhu?''})
+\end{quote}
+
+While the model exhibits repetition on complex queries and limited factual knowledge (expected at 0.9B scale with 512-token context), these results demonstrate that \emph{a pure SNN architecture can learn coherent language generation from scratch}.
+
+\subsection{Comparison with Existing SNN Language Models}
+
+\begin{table}[h]
+\centering
+\caption{Comparison with existing SNN language models.}
+\label{tab:comparison}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Params} & \textbf{From Scratch} & \textbf{Pure SNN} & \textbf{Generative} & \textbf{Dialogue} \\
+\midrule
+SpikeBERT & 110M & \ding{55} & \ding{55} & \ding{55} & \ding{55} \\
+SpikingBERT & 110M & \ding{55} & \ding{55} & \ding{55} & \ding{55} \\
+SpikeGPT & 216M & \ding{51} & \ding{51} & \ding{51} & \ding{55} \\
+\textbf{\model{}-0.9B} & \textbf{874M} & \ding{51} & \ding{51} & \ding{51} & \ding{51} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+
+% ============================================================
+% 6. Discussion
+% ============================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{SNN--SSM duality.}
+The selective PLIF dynamics (Eq.~\ref{eq:selective-plif}) establish a direct correspondence with Mamba's selective SSM:
+the decay $\beta(t)$ maps to $\bar{A}(t)$, the gain $\alpha(t)$ to $\bar{B}(t)$, and the state $V[t]$ to $h[t]$.
+The key difference is the spike-and-reset mechanism, which introduces a hard nonlinearity absent in standard SSMs.
+Whether this discrete dynamics provides computational benefits beyond continuous SSMs is an important open question.
+
+\paragraph{Leakage vs.\ membrane potential.}
+Using $(1-\beta) \cdot \vpost$ instead of $\vpost$ as inter-layer activation is mathematically equivalent (with weight compensation) but distributes signal magnitudes more uniformly across neurons with different time constants.
+Empirically, both produce identical outputs under greedy decoding.
+
+\paragraph{Limitations.}
+At 0.9B parameters and 512-token context, \model{} is significantly smaller than state-of-the-art LLMs.
+The model exhibits repetition artifacts and limited factual knowledge, typical of models at this scale.
+Future work should explore scaling to larger models and longer contexts.
+
+\paragraph{Energy efficiency.}
+While \model{} is trained using standard GPU floating-point computation (not on neuromorphic hardware), the spike-based hidden computation could in principle be deployed on neuromorphic chips (e.g., Intel Loihi, SynSense Speck) for orders-of-magnitude energy reduction.
+Quantifying this potential is left to future work.
+
+
+% ============================================================
+% 7. Conclusion
+% ============================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We have presented \model{}, a 0.9B-parameter language model built entirely on spiking neural networks.
+By connecting SNN membrane dynamics to selective state space models and introducing leakage activation, PonderNet adaptive timesteps, and fused Triton PLIF kernels, we demonstrate that pure SNN architectures can learn language from scratch.
+
+All code, model weights, and training infrastructure are available at:
+\begin{itemize}
+    \item \textbf{Code}: \url{https://github.com/Brain2nd/NeuronSpark}
+    \item \textbf{Models}: \url{https://modelscope.ai/organization/Brain2nd}
+\end{itemize}
+
+
+% ============================================================
+% References
+% ============================================================
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+
+% ============================================================
+% Appendix
+% ============================================================
+\appendix
+
+\section{Model Configuration}
+\label{app:config}
+
+\begin{table}[h]
+\centering
+\caption{Detailed model configuration for \model{}-0.9B.}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hidden dimension ($D$) & 896 \\
+State expansion ($N$) & 8 \\
+Max SNN timesteps ($K$) & 16 \\
+Decoder layers ($L$) & 20 \\
+FFN dimension ($D_{\text{ff}}$) & 2688 \\
+Vocabulary size & 6144 \\
+Context length & 512 \\
+Total parameters & 874M \\
+\midrule
+Surrogate function & Sigmoid($\alpha$=4.0) \\
+Threshold minimum ($V_{\min}$) & 0.1 \\
+Neuron LR multiplier & 10$\times$ \\
+Ponder cost weight & 0.01 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Training Hyperparameters}
+\label{app:training}
+
+\begin{table}[h]
+\centering
+\caption{Training hyperparameters.}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Hyperparameter} & \textbf{Pretrain} & \textbf{SFT} \\
+\midrule
+Optimizer & Adam & AdamW \\
+Peak learning rate & $2 \times 10^{-4}$ & $5 \times 10^{-5}$ \\
+LR schedule & Warmup + Cosine & Warmup + Cosine \\
+Warmup steps & 1,000 & 100 \\
+Weight decay & 0 & 0.01 \\
+Batch size (effective) & 64 & 64 \\
+Gradient accumulation & 8 & 8 \\
+Gradient clipping & 1.0 & 1.0 \\
+Precision & bfloat16 & bfloat16 \\
+Epochs & 1 & 3 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}

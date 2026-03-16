@@ -120,7 +120,7 @@ class DistillDashboard:
         """训练标量: loss 组件 + 蒸馏权重 + 系统指标。"""
         w = self._writer
         scalar_keys = [
-            'loss', 'ce_loss', 'cosine_loss', 'ponder_cost', 'ek_floor_cost',
+            'loss', 'ce_loss', 'cosine_loss', 'ponder_cost', 'ek_floor_cost', 'ek_smooth_cost',
             'alpha_ce', 'beta_hidden',
             'lr', 'tps', 'tokens_seen', 'seq_len',
         ]

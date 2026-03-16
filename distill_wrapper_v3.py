@@ -95,6 +95,7 @@ class DistillOutput:
     hidden_loss: Optional[torch.Tensor] = None
     ponder_cost: Optional[torch.Tensor] = None
     ek_floor_cost: Optional[torch.Tensor] = None
+    ek_smooth_cost: Optional[torch.Tensor] = None
 
 
 # ============================================================
@@ -148,6 +149,7 @@ class DistillHybridModel(nn.Module):
         self._num_mamba = len(self.mamba_indices)
         self._mamba_set = set(self.mamba_indices)
         self._layer_cosine_dict = {}  # idx → cosine distance (供 dashboard 读取)
+        self._ek_ema = {}  # idx → float, 每层 E[K] 的 EMA
 
         # 在 Mamba mixer 上注册 forward hook, 捕获 mixer 输出用于 cosine alignment
         # hook 在 block() 内部触发, 此时 FSDP 已 all-gather 参数, 无需直接访问子组件
@@ -240,6 +242,7 @@ class DistillHybridModel(nn.Module):
         self._layer_cosine_dict = {}
         total_ponder = torch.tensor(0.0, device=hidden_states.device)
         total_ek_floor = torch.tensor(0.0, device=hidden_states.device)
+        total_ek_smooth = torch.tensor(0.0, device=hidden_states.device)
         self._mamba_mixer_outputs = {}
 
         for idx, block in enumerate(backbone.layers):
@@ -278,6 +281,14 @@ class DistillHybridModel(nn.Module):
 
                         if bio_mixer.ponder_cost is not None:
                             total_ponder = total_ponder + bio_mixer.ponder_cost
+                            # E[K] EMA 平滑: 惩罚 E[K] 偏离 EMA 的方差
+                            ek_val = bio_mixer.ponder_cost.detach().item()
+                            if idx in self._ek_ema:
+                                ema = self._ek_ema[idx]
+                                total_ek_smooth = total_ek_smooth + (bio_mixer.ponder_cost - ema).pow(2)
+                                self._ek_ema[idx] = 0.99 * ema + 0.01 * ek_val
+                            else:
+                                self._ek_ema[idx] = ek_val
                         if bio_mixer.ek_floor_cost is not None:
                             total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
 
@@ -348,10 +359,11 @@ class DistillHybridModel(nn.Module):
         if layer_cosine_losses:
             hidden_loss = sum(layer_cosine_losses) / len(layer_cosine_losses)
 
-        # Ponder / EK floor (平均: 所有层 × 所有 micro-batch)
+        # Ponder / EK floor / EK smooth (平均: 所有层 × 所有 micro-batch)
         n_total = max(self._num_mamba * accum, 1)
         ponder_cost = total_ponder / n_total
         ek_floor_cost = total_ek_floor / n_total
+        ek_smooth_cost = total_ek_smooth / n_total
 
         return DistillOutput(
             loss=None,
@@ -360,16 +372,42 @@ class DistillHybridModel(nn.Module):
             hidden_loss=hidden_loss,
             ponder_cost=ponder_cost,
             ek_floor_cost=ek_floor_cost,
+            ek_smooth_cost=ek_smooth_cost,
         )
 
-    def compensate_modulation_gradients(self):
-        """调制参数梯度补偿。"""
+    def compensate_modulation_gradients(self, max_comp: float = 100.0):
+        """Natural Gradient 补偿: sigmoid/softplus 饱和补偿。
+
+        β = sigmoid(b_beta), sigmoid 在高 β 区 (β=0.99, σ'=0.01) 梯度衰减 100x。
+        补偿: grad /= activation'(b), 等价于在 β/α 空间做梯度下降。
+        """
         for bio_mixer in self.bio_ssm_modules.values():
             snn_block = bio_mixer.bio_ssm.snn_block
-            for name in ['b_beta', 'b_alpha', 'b_th']:
-                param = getattr(snn_block, name)
-                if param.grad is not None:
-                    param.grad.data.mul_(10.0)
+
+            # b_beta: sigmoid 饱和补偿
+            if snn_block.b_beta.grad is not None:
+                with torch.no_grad():
+                    beta = torch.sigmoid(snn_block.b_beta.data)
+                    sigmoid_deriv = (beta * (1.0 - beta)).clamp(min=1.0 / max_comp)
+                    snn_block.b_beta.grad.div_(sigmoid_deriv)
+
+            # b_alpha: softplus 补偿 (softplus'(z) = sigmoid(z))
+            if snn_block.b_alpha.grad is not None:
+                with torch.no_grad():
+                    softplus_deriv = torch.sigmoid(snn_block.b_alpha.data).clamp(min=0.1)
+                    snn_block.b_alpha.grad.div_(softplus_deriv)
+
+            # b_th: |·| 导数为 ±1, 无衰减, 不需要补偿
+
+    def clip_halt_proj_gradients(self, max_norm: float = 0.5):
+        """halt_proj 独立梯度裁剪, 防止 PonderNet 梯度爆炸影响训练稳定性。"""
+        halt_params = []
+        for bio_mixer in self.bio_ssm_modules.values():
+            for p in bio_mixer.bio_ssm.halt_proj.parameters():
+                if p.grad is not None:
+                    halt_params.append(p)
+        if halt_params:
+            torch.nn.utils.clip_grad_norm_(halt_params, max_norm)
 
     def get_bio_ssm_param_groups(self, lr=2e-4, neuron_lr_mult=10.0, weight_decay=0.1):
         """只收集 BioSSM 的可训练参数, 分 decay/no_decay/neuron 三组。"""

@@ -106,16 +106,16 @@ def get_distill_schedule(step, total_steps):
     """3 阶段蒸馏权重。
 
     Returns: (alpha_ce, beta_hidden)
-      Phase 1 (0-30%):   强对齐 — α=0.3, β=2.0
+      Phase 1 (0-30%):   对齐+CE 并重 — α=0.7, β=2.0
       Phase 2 (30-70%):  过渡   — α→1.0, β→0.3
-      Phase 3 (70-100%): 自主   — α=1.0, β=0.1
+      Phase 3 (70-100%): CE 主导 — α=1.0, β=0.1
     """
     frac = step / max(total_steps, 1)
     if frac < 0.3:
-        return 0.3, 2.0
+        return 0.7, 2.0
     elif frac < 0.7:
         t = (frac - 0.3) / 0.4
-        return 0.3 + 0.7 * t, 2.0 - 1.7 * t
+        return 0.7 + 0.3 * t, 2.0 - 1.7 * t
     else:
         return 1.0, 0.1
 
@@ -124,14 +124,23 @@ def get_distill_schedule(step, total_steps):
 # 序列长度课程 (从 train_distill.py 移植)
 # ============================================================
 
+def get_adaptive_beta(cos_val, beta_base, cos_floor=0.15):
+    """cos 低于 floor 时线性放大 β, 强化 alignment 梯度信号。"""
+    if cos_val >= cos_floor:
+        return beta_base
+    ratio = 1.0 - cos_val / max(cos_floor, 1e-6)
+    boost = 1.0 + 2.0 * min(ratio, 1.0)  # 最高 3x
+    return beta_base * boost
+
+
 def get_curriculum_seq_len(step, total_steps, max_length):
-    """渐进式序列长度: 64 → 128 → 256 → max_length。"""
+    """渐进式序列长度: 64 → 128 → 256 → max_length (加速版)。"""
     frac = step / max(total_steps, 1)
-    if frac < 0.15:
+    if frac < 0.05:
         return min(64, max_length)
-    elif frac < 0.35:
+    elif frac < 0.15:
         return min(128, max_length)
-    elif frac < 0.60:
+    elif frac < 0.30:
         return min(256, max_length)
     return max_length
 
@@ -239,11 +248,11 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
         for pg in optimizer.param_groups:
             pg['lr'] = lr * pg.get('lr_mult', 1.0)
 
-        # 蒸馏调度
+        # 蒸馏调度 (基础 β, forward 后可能被 adaptive 放大)
         if args.alpha_ce is not None and args.beta_hidden is not None:
-            alpha_ce, beta_hidden = args.alpha_ce, args.beta_hidden
+            alpha_ce, beta_base = args.alpha_ce, args.beta_hidden
         else:
-            alpha_ce, beta_hidden = get_distill_schedule(
+            alpha_ce, beta_base = get_distill_schedule(
                 micro_step_base, total_iters)
 
         # 拼接所有 micro-batch (batch 维)
@@ -258,6 +267,12 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
                 X_cat, Y_cat, loss_mask=M_cat,
                 accumulation_steps=n_micro,
             )
+
+            # Adaptive β: 当前 cos 低于 floor 时放大
+            beta_hidden = beta_base
+            if out.hidden_loss is not None and args.cos_floor > 0:
+                beta_hidden = get_adaptive_beta(
+                    out.hidden_loss.item(), beta_base, args.cos_floor)
 
             loss = torch.tensor(0.0, device=device)
 
@@ -274,6 +289,8 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
                 loss = loss + args.ponder_weight * out.ponder_cost
             if out.ek_floor_cost is not None and args.ek_floor_weight > 0:
                 loss = loss + args.ek_floor_weight * out.ek_floor_cost
+            if out.ek_smooth_cost is not None and args.ek_smooth_weight > 0:
+                loss = loss + args.ek_smooth_weight * out.ek_smooth_cost
 
             # 注意: forward 内部已平均 (layers × micro-batches), 无需再除 accum
 
@@ -285,6 +302,7 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
             dashboard.cache_grad_norms(model)
 
         raw_model.compensate_modulation_gradients()
+        raw_model.clip_halt_proj_gradients(args.halt_grad_clip)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -308,6 +326,7 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
             hid_val = out.hidden_loss.item()
             pc_val = out.ponder_cost.item()
             ek_val = out.ek_floor_cost.item()
+            eks_val = out.ek_smooth_cost.item() if out.ek_smooth_cost is not None else 0.0
 
             dashboard.log_step(opt_step, {
                 'loss': batch_loss,
@@ -315,6 +334,7 @@ def train_epoch(model, raw_model, train_loader, sampler, optimizer, ctx,
                 'cosine_loss': hid_val,
                 'ponder_cost': pc_val,
                 'ek_floor_cost': ek_val,
+                'ek_smooth_cost': eks_val,
                 'alpha_ce': alpha_ce,
                 'beta_hidden': beta_hidden,
                 'lr': lr,
@@ -382,12 +402,14 @@ def main():
     parser.add_argument('--learning_rate', type=float, default=2e-4)
     parser.add_argument('--accumulation_steps', type=int, default=16)
     parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--halt_grad_clip', type=float, default=0.5,
+                        help='halt_proj 独立梯度裁剪 (防 PonderNet 梯度爆炸)')
     parser.add_argument('--warmup_iters', type=int, default=500)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
     parser.add_argument('--weight_decay', type=float, default=0.1)
 
     # SNN 正则
-    parser.add_argument('--ponder_weight', type=float, default=0.01)
+    parser.add_argument('--ponder_weight', type=float, default=0.1)
     parser.add_argument('--ek_floor_weight', type=float, default=0.1)
 
     # 蒸馏
@@ -397,6 +419,10 @@ def main():
                         help='固定 CE 权重 (覆盖自动调度)')
     parser.add_argument('--beta_hidden', type=float, default=None,
                         help='固定 cosine alignment 权重 (覆盖自动调度)')
+    parser.add_argument('--cos_floor', type=float, default=0.15,
+                        help='cosine loss 低于此值时自动放大 beta_hidden')
+    parser.add_argument('--ek_smooth_weight', type=float, default=0.05,
+                        help='E[K] EMA 平滑正则权重')
     # FSDP
     parser.add_argument('--sharding_strategy', type=str, default='full_shard',
                         choices=['full_shard', 'shard_grad_op', 'no_shard'])
@@ -628,7 +654,9 @@ def main():
         Log(f"  α/β 固定:     α={args.alpha_ce}, β={args.beta_hidden}", rank)
     else:
         Log(f"  α/β 调度:     3阶段自动 (0.3/2.0 → 1.0/0.1)", rank)
-    Log(f"  Curriculum:   {'OFF' if args.no_curriculum else '64→128→256→max'}", rank)
+    Log(f"  Curriculum:   {'OFF' if args.no_curriculum else '64→128→256→max (加速)'}", rank)
+    Log(f"  Cos floor:    {args.cos_floor} (adaptive β)", rank)
+    Log(f"  EK smooth:    {args.ek_smooth_weight}", rank)
     Log(f"  TensorBoard:  {args.log_dir or 'OFF'}", rank)
     Log(f"{'='*60}\n", rank)
 

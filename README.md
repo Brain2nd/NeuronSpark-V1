@@ -2,6 +2,8 @@
 
 A language model **built entirely on Spiking Neural Networks (SNNs)**. Hidden neurons with dynamic parameters β(t), α(t), V_th(t) serve as input-dependent modulation signals for selective information filtering. **The entire network is pure SNN — no standard ANN components.**
 
+> **Language**: Currently supports **Chinese only**, as the model was trained on Chinese corpora (Seq-Monkey + BelleGroup).
+
 > **Training data note**: Due to limited compute resources (single DGX Spark), both pretraining and SFT used only small subsets of their respective datasets (~1.4B of ~10B tokens for pretraining; ~6.5K steps for SFT). Despite this minimal data budget, the model demonstrates emergent language capabilities, validating the architectural viability of pure SNN language models. We plan to continue scaling with more data and compute.
 
 ## Model Downloads
@@ -22,8 +24,8 @@ model = AutoModelForCausalLM.from_pretrained(
 tokenizer = AutoTokenizer.from_pretrained("Brain2nd/NeuronSpark-0.9B-Chat")
 
 messages = [
-    {"role": "system", "content": "You are an AI assistant"},
-    {"role": "user", "content": "What is the capital of China?"},
+    {"role": "system", "content": "你是一个AI助手"},
+    {"role": "user", "content": "中国的首都是哪里？"},
 ]
 text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 input_ids = tokenizer(text, return_tensors="pt")["input_ids"]
@@ -31,7 +33,7 @@ output_ids = model.generate(input_ids, max_new_tokens=256, temperature=0.1, top_
                             eos_token_id=tokenizer.eos_token_id)
 response = tokenizer.decode(output_ids[0], skip_special_tokens=False)
 print(response.split("assistant\n")[-1].replace("<|im_end|>", "").strip())
-# Output: The capital of China is Beijing.
+# Output: 中国的首都在北京。
 ```
 
 

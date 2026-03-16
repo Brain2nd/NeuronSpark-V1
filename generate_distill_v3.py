@@ -1,16 +1,13 @@
 """
-蒸馏模型推理: 从合并目录加载 NVIDIA NemotronH + BioSSM 文本生成
+蒸馏模型推理: 从合并目录加载 NemotronH + BioSSM
+
+合并目录由 merge_distill_v3.py 生成, 包含 NVIDIA 完整权重 + BioSSM 权重,
+不依赖外部 teacher 路径。
 
 用法:
-    # 先合并
-    python scripts/merge_distill_v3.py \
-        --teacher_path /path/to/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16 \
-        --bio_ssm_ckpt checkpoints_distill_v3/distill_v3_step8015.pth \
-        --output_dir merged_model_v3
-
-    # 推理 (只需传合并目录)
     python generate_distill_v3.py --model_dir merged_model_v3 --interactive
     python generate_distill_v3.py --model_dir merged_model_v3 --prompt "人工智能的发展"
+    python generate_distill_v3.py --model_dir merged_model_v3  # 跑默认 prompts
 """
 
 import os
@@ -19,31 +16,31 @@ import json
 import argparse
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from distill_wrapper_v3 import DistillHybridModel, BioSSMConfig
 
 
 def load_merged_model(model_dir):
-    """从合并目录加载完整蒸馏模型 (device_map='auto' 多卡分布)。"""
-    # 读取配置
-    config_path = os.path.join(model_dir, 'config.json')
-    with open(config_path) as f:
-        config = json.load(f)
+    """从合并目录加载完整蒸馏模型。
 
-    teacher_path = config['teacher_path']
-    bio_cfg = config['bio_ssm']
-
-    # 加载 Teacher (多卡分布)
-    print(f"加载 Teacher: {teacher_path}")
-    sys.path.insert(0, teacher_path)
+    NVIDIA 模型通过 device_map='auto' 分布多卡,
+    每个 BioSSM 放到对应 Mamba block 所在的 GPU 上, 避免跨卡传输。
+    """
+    # 加载 NVIDIA 模型 (多卡分布)
+    print(f"加载 NVIDIA 模型: {model_dir}")
+    sys.path.insert(0, model_dir)
     nvidia_model = AutoModelForCausalLM.from_pretrained(
-        teacher_path, torch_dtype=torch.bfloat16, trust_remote_code=True,
+        model_dir, torch_dtype=torch.bfloat16, trust_remote_code=True,
         low_cpu_mem_usage=True, device_map='auto',
     )
-    print(f"  Teacher: {sum(p.numel() for p in nvidia_model.parameters())/1e9:.1f}B params")
+    print(f"  NVIDIA: {sum(p.numel() for p in nvidia_model.parameters())/1e9:.1f}B params")
 
-    # 构建蒸馏模型
+    # 加载 BioSSM 配置
+    bio_config_path = os.path.join(model_dir, 'bio_ssm_config.json')
+    with open(bio_config_path) as f:
+        bio_cfg = json.load(f)
+
     bio_config = BioSSMConfig(
         hidden_size=bio_cfg['hidden_size'],
         ssm_N=bio_cfg['ssm_N'],
@@ -52,29 +49,38 @@ def load_merged_model(model_dir):
         ssm_ek_floor=bio_cfg['ssm_ek_floor'],
         num_hidden_layers=bio_cfg['num_hidden_layers'],
     )
-    model = DistillHybridModel(nvidia_model, bio_config)
 
-    # 加载 BioSSM 权重
+    # 构建蒸馏模型 + 加载 BioSSM 权重
+    model = DistillHybridModel(nvidia_model, bio_config)
     bio_ssm_path = os.path.join(model_dir, 'bio_ssm.pth')
     print(f"加载 BioSSM: {bio_ssm_path}")
     bio_sd = torch.load(bio_ssm_path, map_location='cpu', weights_only=False)
     model.load_bio_ssm_state(bio_sd)
+    del bio_sd
+
     bio_params = sum(p.numel() for p in model.bio_ssm_modules.parameters())
     print(f"  BioSSM: {model._num_mamba} 层, {bio_params/1e6:.1f}M params")
 
-    # BioSSM 放到第一张卡
-    first_device = next(nvidia_model.parameters()).device
-    model.bio_ssm_modules.to(first_device)
+    # 每个 BioSSM 放到对应 Mamba block 的 GPU 上 (避免跨卡 RuntimeError)
+    for idx in model.mamba_indices:
+        block_device = next(nvidia_model.backbone.layers[idx].parameters()).device
+        model.bio_ssm_modules[str(idx)].to(block_device)
+    print(f"  BioSSM 设备对齐完成")
+
     model.eval()
 
-    # 读取合并信息
+    # 确定输入设备 (embedding 所在的卡)
+    input_device = next(nvidia_model.backbone.embeddings.parameters()).device
+    print(f"  输入设备: {input_device}")
+
+    # 元信息
     merge_info_path = os.path.join(model_dir, 'merge_info.json')
     if os.path.exists(merge_info_path):
         with open(merge_info_path) as f:
-            merge_info = json.load(f)
-        print(f"  Distill step: {merge_info.get('distill_step', '?')}")
+            info = json.load(f)
+        print(f"  Distill step: {info.get('distill_step', '?')}")
 
-    return model, first_device
+    return model, input_device
 
 
 @torch.no_grad()
@@ -92,7 +98,8 @@ def generate(model, tokenizer, prompt, max_new_tokens=256,
             print("  [警告] logits 为 None, 无法生成")
             break
 
-        next_logits = out.logits[:, -1, :].float()
+        # 取最后一个 token 的 logits (可能在不同卡上, 移到输入设备)
+        next_logits = out.logits[:, -1, :].float().to(device)
 
         if temperature > 0:
             next_logits = next_logits / temperature

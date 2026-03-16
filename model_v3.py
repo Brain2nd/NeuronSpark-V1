@@ -27,7 +27,7 @@ from torch.nn import CrossEntropyLoss
 import torch.nn.functional as F
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import DynamicCache  # we need __iter__ and __len__ of pkv
+# DynamicCache 不再继承 (新版 transformers 把 key_cache 改成只读属性)
 from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import (
@@ -174,87 +174,68 @@ class NeuronSparkConfig(PretrainedConfig):
 # ============================================================
 
 # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/jamba/modeling_jamba.py
-class NeuronSparkDynamicCache(DynamicCache):
-    """
-    A dynamic cache that can handle both the attention cache (which has a seq_len dimension) and the ssm cache.
+class NeuronSparkDynamicCache:
+    """KV cache for 异构模型 (BioSSM + MoE + Attention).
 
-    This cache has two sets of lists of tensors: `key_cache` and `value_cache` for attention cache and `conv_states`
-    and `ssm_states` for ssm cache. Each of these lists has `num_layers` tensors. The expected shape for each tensor
-    For attention layers, `key_cache` and `value_cache` have a shape of `(batch_size, num_heads, seq_len, head_dim)`,
-    while `conv_states` and `ssm_states` have a shape of `(batch_size, 0)` (empty tensors).
-    For ssm layers, `key_cache` and `value_cache` have a shape of `(batch_size, 0)` (empty tensors),
-    while `conv_states` and `ssm_states` are placeholders (empty tensors).
+    不继承 DynamicCache (新版 transformers 把 key_cache 改成了只读属性).
+    Attention 层存 KV cache, SSM/MoE 层占位空 tensor.
     """
 
     def __init__(self, config, batch_size, dtype=torch.float16, device=None):
-        super().__init__()
         self.dtype = dtype
         self.hybrid_override_pattern = config.hybrid_override_pattern
-        self.has_previous_state = False  # only used by ssm
-        self.conv_states = []
-        self.ssm_states = []
+        self.has_previous_state = False
         self.transformer_layers = []
-        for i in range(config.num_hidden_layers):
-            if self.hybrid_override_pattern[i] == "S":
-                # SSM layer — placeholder empty tensors (BioSSMLayer manages its own state)
-                self.conv_states += [torch.tensor([[]] * batch_size, device=device)]
-                self.ssm_states += [torch.tensor([[]] * batch_size, device=device)]
-            else:
-                # Attention or MLP/MoE layer
-                self.conv_states += [torch.tensor([[]] * batch_size, device=device)]
-                self.ssm_states += [torch.tensor([[]] * batch_size, device=device)]
-                if self.hybrid_override_pattern[i] == "*":
-                    self.transformer_layers.append(i)
 
-        self.key_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
-        self.value_cache = [torch.tensor([[]] * batch_size, device=device) for _ in range(config.num_hidden_layers)]
+        n = config.num_hidden_layers
+        empty = lambda: torch.tensor([[]] * batch_size, device=device)
 
-    def update(
-        self,
-        key_states: torch.Tensor,
-        value_states: torch.Tensor,
-        layer_idx: int,
-        cache_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Update the cache
+        self.key_cache = [empty() for _ in range(n)]
+        self.value_cache = [empty() for _ in range(n)]
+        self.conv_states = [empty() for _ in range(n)]
+        self.ssm_states = [empty() for _ in range(n)]
+
+        for i in range(n):
+            if self.hybrid_override_pattern[i] == "*":
+                self.transformer_layers.append(i)
+
+    def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if self.key_cache[layer_idx].shape[-1] == 0:
             self.key_cache[layer_idx] = key_states
             self.value_cache[layer_idx] = value_states
         else:
-            self.key_cache[layer_idx] = torch.cat([self.key_cache[layer_idx], key_states], dim=2)
-            self.value_cache[layer_idx] = torch.cat([self.value_cache[layer_idx], value_states], dim=2)
-
+            self.key_cache[layer_idx] = torch.cat(
+                [self.key_cache[layer_idx], key_states], dim=2)
+            self.value_cache[layer_idx] = torch.cat(
+                [self.value_cache[layer_idx], value_states], dim=2)
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
-    def reorder_cache(self, beam_idx: torch.LongTensor):
-        """Reorders the cache for beam search, given the selected beam indices."""
+    def reorder_cache(self, beam_idx):
         for layer_idx in range(len(self.key_cache)):
-            device = self.key_cache[layer_idx].device
-            self.key_cache[layer_idx] = self.key_cache[layer_idx].index_select(0, beam_idx.to(device))
-            device = self.value_cache[layer_idx].device
-            self.value_cache[layer_idx] = self.value_cache[layer_idx].index_select(0, beam_idx.to(device))
+            for cache_list in [self.key_cache, self.value_cache,
+                               self.conv_states, self.ssm_states]:
+                dev = cache_list[layer_idx].device
+                cache_list[layer_idx] = cache_list[layer_idx].index_select(
+                    0, beam_idx.to(dev))
 
-            device = self.conv_states[layer_idx].device
-            self.conv_states[layer_idx] = self.conv_states[layer_idx].index_select(0, beam_idx.to(device))
-            device = self.ssm_states[layer_idx].device
-            self.ssm_states[layer_idx] = self.ssm_states[layer_idx].index_select(0, beam_idx.to(device))
-
-    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
-        """Returns the sequence length of the cached states. A layer index can be optionally passed."""
-        # take any layer that contains cache and not empty tensor
+    def get_seq_length(self, layer_idx=0):
         if not self.transformer_layers:
             return 0
-        layer_idx = self.transformer_layers[0] if layer_idx not in self.transformer_layers else layer_idx
+        layer_idx = (self.transformer_layers[0]
+                     if layer_idx not in self.transformer_layers else layer_idx)
         if len(self.key_cache) <= layer_idx:
             return 0
         return self.key_cache[layer_idx].shape[-2]
 
-    def to_legacy_cache(self) -> Tuple[Tuple[torch.Tensor], Tuple[torch.Tensor]]:
-        raise NotImplementedError("NeuronSparkDynamicCache does not have a legacy cache equivalent.")
+    def __len__(self):
+        return len(self.key_cache)
 
-    @classmethod
-    def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCache":
-        raise NotImplementedError("NeuronSparkDynamicCache does not have a legacy cache equivalent.")
+    def __iter__(self):
+        for k, v in zip(self.key_cache, self.value_cache):
+            yield k, v
+
+    def __getitem__(self, idx):
+        return (self.key_cache[idx], self.value_cache[idx])
 
     def reset(self):
         for i in range(len(self.conv_states)):

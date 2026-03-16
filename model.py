@@ -7,7 +7,7 @@ SNNLanguageModel: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
   model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
 
 核心设计：
-  1. 全膜电位：所有神经元输出 V_post 而非 spike
+  1. 膜电位泄漏量：PLIFNode 输出 (1-β)·V_post（泄漏量），自然强调快响应神经元
   2. 动态 K：PonderNet 自适应停止，不同 token 不同有效步数
      - 每层每子层学习 halt_proj(D→1)，从 SNN 输出逐步计算停止概率
      - 几何分布权重加权聚合，替代 uniform mean
@@ -153,13 +153,13 @@ class SNNLanguageModel(nn.Module):
         return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
-        """输出 PLIF 神经元的 parallel scan 前向：连续 h → V_post 膜电位。
+        """输出 PLIF 神经元的 parallel scan 前向：连续 h → 膜电位泄漏量。
 
         Args:
             h: (TK, batch, D) 连续值（SNN 最后一层输出）
 
         Returns:
-            V_post: (TK, batch, D) 膜电位（连续激活值）
+            leak: (TK, batch, D) 膜电位泄漏量 (1-β)·V_post
         """
         TK, batch, D = h.shape
 
@@ -179,7 +179,7 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        return V_post  # 膜电位作为激活值
+        return (1.0 - beta) * V_post  # 膜电位泄漏量
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

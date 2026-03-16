@@ -145,14 +145,14 @@ class SNNFFN(base.MemoryModule):
             surrogate_function=surr,
         )
 
-        # 用 V_post（膜电位）作为激活值，非 spike
-        gate_v = V_post_merged[:, :, :D_ff]
-        up_v = V_post_merged[:, :, D_ff:]
+        # 膜电位泄漏量作为激活值: leak = (1-β) · V_post
+        gate_leak = V_post_merged[:, :, :D_ff] * (1.0 - beta_gate)   # (TK, batch, D_ff)
+        up_leak = V_post_merged[:, :, D_ff:] * (1.0 - beta_up)       # (TK, batch, D_ff)
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        # ====== Phase 3: 连续门控（V_post × V_post，对标 SwiGLU）+ 降维 ======
-        gated = gate_v * up_v  # (TK, batch, D_ff)
+        # ====== Phase 3: 连续门控（leak × leak，对标 SwiGLU）+ 降维 ======
+        gated = gate_leak * up_leak  # (TK, batch, D_ff)
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
@@ -169,16 +169,16 @@ class SNNFFN(base.MemoryModule):
         Returns:
             continuous_out: 连续输出, shape (batch, D)
         """
-        # 门控路径 — V_post 膜电位激活
+        # 门控路径 — 膜电位泄漏量激活
         _ = self.gate_neuron(self.gate_proj(spike_in))
-        gate_v = self.gate_neuron.v  # V_post
+        gate_leak = (1.0 - self.gate_neuron.beta) * self.gate_neuron.v  # leak
 
-        # 值路径 — V_post 膜电位激活
+        # 值路径 — 膜电位泄漏量激活
         _ = self.up_neuron(self.up_proj(spike_in))
-        up_v = self.up_neuron.v  # V_post
+        up_leak = (1.0 - self.up_neuron.beta) * self.up_neuron.v  # leak
 
         # 连续门控（对标 SwiGLU）
-        gated = gate_v * up_v
+        gated = gate_leak * up_leak
 
         # 降维 + 残差
         I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D

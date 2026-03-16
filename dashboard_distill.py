@@ -114,6 +114,69 @@ class DistillDashboard:
             return
         self._writer.close()
 
+    # ====== Stage 1/2 渐进蒸馏日志 ======
+
+    def log_stage1_step(self, step, mamba_idx, metrics):
+        """Stage 1 逐块对齐日志。"""
+        if not self._enabled:
+            return
+        w = self._writer
+        ssm_id = self._idx_to_ssm.get(mamba_idx, mamba_idx)
+        tag = f"ssm_{ssm_id:02d}"
+
+        for key in ['mse_loss', 'cos_loss', 'cos_sim', 'ponder_cost',
+                     'ek_floor_cost', 'loss', 'lr', 'tps']:
+            if key in metrics:
+                w.add_scalar(f"stage1/{tag}/{key}", metrics[key], step)
+
+        # 汇总
+        if 'cos_sim' in metrics:
+            w.add_scalar("stage1/active_cos_sim", metrics['cos_sim'], step)
+        if 'mse_loss' in metrics:
+            w.add_scalar("stage1/active_mse", metrics['mse_loss'], step)
+        if 'memory_peak_gb' in metrics:
+            w.add_scalar("stage1/memory_peak_gb", metrics['memory_peak_gb'], step)
+
+    def log_stage2_step(self, step, phase, metrics):
+        """Stage 2 端到端整合日志。"""
+        if not self._enabled:
+            return
+        w = self._writer
+
+        for key in ['kl_loss', 'ce_loss', 'mse_loss', 'ponder_cost',
+                     'ek_floor_cost', 'loss', 'alpha_ce', 'alpha_kl',
+                     'beta_mse', 'temperature', 'lr', 'tps']:
+            if key in metrics:
+                w.add_scalar(f"stage2/{key}", metrics[key], step)
+
+        if 'memory_peak_gb' in metrics:
+            w.add_scalar("stage2/memory_peak_gb", metrics['memory_peak_gb'], step)
+
+        # 逐块 cosine
+        per_block_cos = metrics.get('per_block_cosine', {})
+        if per_block_cos:
+            cos_vals = list(per_block_cos.values())
+            w.add_scalar("stage2/cos_mean", sum(cos_vals) / len(cos_vals), step)
+            w.add_scalar("stage2/cos_min", min(cos_vals), step)
+            w.add_scalar("stage2/cos_max", max(cos_vals), step)
+
+            for idx, cos_val in per_block_cos.items():
+                ssm_id = self._idx_to_ssm.get(idx, idx)
+                w.add_scalar(f"stage2/cos_per_block/ssm_{ssm_id:02d}", cos_val, step)
+
+        w.add_scalar("stage2/phase", phase, step)
+
+    def log_phase_transition(self, step, phase, active_blocks):
+        """标记阶段切换。"""
+        if not self._enabled:
+            return
+        w = self._writer
+        w.add_scalar("stage2/phase_transition", phase, step)
+        w.add_scalar("stage2/n_active_blocks", len(active_blocks), step)
+        # 以文本形式记录活跃块
+        block_str = ','.join(str(b) for b in sorted(active_blocks))
+        w.add_text("stage2/active_blocks", f"Phase {phase}: [{block_str}]", step)
+
     # ====== 训练标量 ======
 
     def _log_training_scalars(self, step, metrics):

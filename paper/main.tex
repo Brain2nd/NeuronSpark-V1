@@ -171,12 +171,9 @@ Each decoder layer follows a Pre-LN residual pattern matching Qwen3/LLaMA~\citep
 where $\text{center}(\mathbf{x}) = \mathbf{x} - \text{mean}(\mathbf{x})$ is residual centering (Section~\ref{sec:residual-centering}).
 The residual stream $\mathbf{h} \in \R^{TK \times B \times D}$ carries continuous values throughout; only the SNN sublayers operate on spike/membrane dynamics.
 
-\begin{figure}[t]
+\begin{figure}[H]
     \centering
-    \fbox{\parbox{0.9\textwidth}{\centering\vspace{2cm}
-    \textbf{[Architecture Diagram — to be drawn]}\\[0.5em]
-    Token $\to$ Embed $\to$ Repeat $K$ $\to$ $L \times$ (RMSNorm $\to$ PLIFLeak $\to$ SNNBlock/FFN $\to$ PonderNet $\to$ OutProj $\to$ Center $\to$ Residual) $\to$ RMSNorm $\to$ PLIFLeak $\to$ Mean$_K$ $\to$ Proj $\to$ LateralInhib $\to$ Logits
-    \vspace{2cm}}}
+    \includegraphics[width=\textwidth]{figures/Architrcture.png}
     \caption{\model{} architecture overview.
     The residual stream carries continuous values $\mathbf{h}$; PLIFLeak denotes PLIF neurons with leakage activation $(1-\beta)\cdot\vpost$.
     PonderNet aggregation (applied per sublayer) collapses $K$ frames per token with learned geometric-distribution weights.
@@ -422,7 +419,7 @@ The geometric mean (computed in log space) is robust to the exponential spread o
 All training is performed on a single NVIDIA DGX Spark (4$\times$ GB10 GPU, 128GB unified memory).
 Due to this limited compute budget, we train on \textbf{small subsets} of both datasets:
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Dataset utilization. Both pretraining and SFT use small fractions of available data.}
 \label{tab:data}
@@ -443,7 +440,7 @@ SFT uses AdamW ($\text{lr}=5\times10^{-5}$, weight decay 0.01), training only on
 
 \subsection{Results}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Training results for \model{}-0.9B.}
 \label{tab:results}
@@ -463,7 +460,7 @@ Peak memory / GPU & \multicolumn{2}{c}{$\sim$48 GB} \\
 \end{tabular}
 \end{table}
 
-\begin{figure}[t]
+\begin{figure}[H]
     \centering
     \includegraphics[width=\textwidth]{figures/loss_curve.pdf}
     \caption{Pretraining loss curve for \model{}-0.9B over 85K steps ($\sim$1.4B tokens).
@@ -493,9 +490,9 @@ Crucially, these results demonstrate that \emph{a pure SNN architecture can lear
 During development, we explored multiple architectural variants prior to the final design.
 Due to compute constraints, each variant was trained only once for 1K--12K steps rather than to full convergence.
 Nevertheless, the training loss trajectories reveal clear signals about which design decisions are critical.
-Table~\ref{tab:ablation} summarizes 6 meaningful architectural variants (excluding 3 engineering/debugging runs); Figure~\ref{fig:ablation} shows all loss curves.
+Table~\ref{tab:ablation} summarizes 7 architectural variants; Figure~\ref{fig:ablation} shows all loss curves.
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Architectural ablation variants. All variants stagnated above loss 7.0, while the final architecture reached 3.5.
 ``Diverged'' means loss increased above 7.5 and failed to recover.}
@@ -522,6 +519,9 @@ Table~\ref{tab:ablation} summarizes 6 meaningful architectural variants (excludi
 \midrule
 \multicolumn{4}{l}{\emph{Novel architectural components}} \\
 \quad Cortical lateral connections & 4,100 & 7.66 (diverged) & Added layer-internal causal spike propagation across tokens (inspired by cortical Layer II/III) \\
+\midrule
+\multicolumn{4}{l}{\emph{Numerical stability}} \\
+\quad No gradient sync fix & 630 & NaN & Missing proper gradient synchronization across GPUs; training exploded to NaN within 630 steps \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -530,9 +530,10 @@ Table~\ref{tab:ablation} summarizes 6 meaningful architectural variants (excludi
 (1)~\textbf{Removing Phase 2 gradient equalization} (MPD-AGL variant) produced the best ablation result (loss 7.21) but still far above V1's 3.5, suggesting that cross-layer gradient balance is necessary but not sufficient.
 (2)~\textbf{PonderNet modifications} (E[K] floor, bounded $\alpha$) both stagnated at 7.47, indicating that the original PonderNet design with unconstrained softplus $\alpha$ and no E[K] floor is already near-optimal.
 (3)~\textbf{Cortical lateral connections} --- the most biologically ambitious variant --- diverged quickly, suggesting that cross-token spike propagation introduces instability at this training scale.
-(4)~No single variant broke below loss 7.0; only the full combination of all design choices in V1 achieved continued loss decrease.
+(4)~\textbf{Removing gradient synchronization} caused immediate NaN divergence within 630 steps, highlighting the fragility of SNN training at scale.
+(5)~No single variant broke below loss 7.0; only the full combination of all design choices in V1 achieved continued loss decrease.
 
-\begin{figure}[t]
+\begin{figure}[H]
     \centering
     \includegraphics[width=\textwidth]{figures/ablation_runs.pdf}
     \caption{Training loss comparison: final V1 architecture (blue) vs.\ 9 ablation variants from earlier development.
@@ -544,7 +545,7 @@ Table~\ref{tab:ablation} summarizes 6 meaningful architectural variants (excludi
 
 \subsection{Comparison with Existing SNN Language Models}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Comparison with existing SNN language models.
 ``From scratch'' means no weights from pretrained ANNs.
@@ -663,7 +664,7 @@ Column $n$ of $W_{\text{out}}$ is scaled by $1/\sqrt{p_{\text{fire},\,n}}$ (norm
 \section{Model Configuration}
 \label{app:config}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Detailed model configuration for \model{}-0.9B.}
 \begin{tabular}{ll}
@@ -694,7 +695,7 @@ Halt proj init bias & $-3.5$ \\
 \section{Parameter Breakdown}
 \label{app:params}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Parameter breakdown by component.
 SNNBlock dominates (77.2\%) due to the 7 projection matrices operating in the expanded $D \times N$ space.}
@@ -737,7 +738,7 @@ The following optimizations reduce kernel launch overhead and memory traffic but
 \section{Training Hyperparameters}
 \label{app:training}
 
-\begin{table}[h]
+\begin{table}[H]
 \centering
 \caption{Training hyperparameters.}
 \begin{tabular}{lcc}

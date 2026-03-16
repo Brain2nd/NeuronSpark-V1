@@ -167,14 +167,16 @@ class SNNDecoderLayer(base.MemoryModule):
         输入 PLIF 神经元的 parallel scan 前向传播。
 
         完整 PLIF 动力学: V[t] = β·V[t-1] + (1-β)·x[t], spike = Θ(V-V_th), 软重置。
-        输出膜电位 V_post 作为激活值（保留完整 SNN 动力学，但传递连续信号）。
+        输出膜电位泄漏量 (1-β)·V_post 作为激活值——即每步因指数衰减将泄漏的量。
+        相比直接传递 V_post，泄漏量自然强调快响应神经元（大 1-β），
+        抑制慢记忆神经元（小 1-β），实现隐式的时间尺度加权。
 
         Args:
             input_neuron: PLIFNode 实例（D 维可学习 β 和 V_th）
             x: (TK, batch, D) — 连续值输入
 
         Returns:
-            V_post: (TK, batch, D) — 膜电位（连续激活值）
+            leak: (TK, batch, D) — 膜电位泄漏量 (1-β)·V_post
         """
         TK, batch, D = x.shape
 
@@ -194,7 +196,7 @@ class SNNDecoderLayer(base.MemoryModule):
         )
 
         input_neuron.v = V_post[-1].detach()
-        return V_post  # 膜电位作为激活值
+        return (1.0 - beta) * V_post  # 膜电位泄漏量
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
@@ -308,16 +310,16 @@ class SNNDecoderLayer(base.MemoryModule):
             h: (batch, D) — 连续值输出
             ponder_cost: scalar — 0.0（单步无 ponder cost）
         """
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → out_proj → 残差
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode(leak) → SNNBlock → out_proj → 残差
         _ = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
-        v_in = self.input_neuron1.v                  # V_post 膜电位作为激活值
+        v_in = (1.0 - self.input_neuron1.beta) * self.input_neuron1.v  # 膜电位泄漏量
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
         h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → out_proj → 残差
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode(leak) → SNNFFN → out_proj → 残差
         _ = self.input_neuron2(self.ffn_norm(h))
-        v_in2 = self.input_neuron2.v
+        v_in2 = (1.0 - self.input_neuron2.beta) * self.input_neuron2.v  # 膜电位泄漏量
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
         h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)

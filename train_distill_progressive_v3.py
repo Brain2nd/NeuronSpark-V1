@@ -298,8 +298,14 @@ def stage1_train_all(fsdp_model, raw_model, train_loader, sampler, ctx,
 
             del X_cat, out
 
-            # 提前结束
-            if cos_sim > args.stage1_cos_threshold:
+            # 提前结束 (所有 rank 同步决策, 防止 NCCL 死锁)
+            # 各 rank 数据不同 → cos_sim 不同, 必须广播统一决策
+            should_stop = torch.tensor(
+                [1 if cos_sim > args.stage1_cos_threshold else 0],
+                device=device, dtype=torch.int32)
+            if world_size > 1:
+                dist.broadcast(should_stop, src=0)
+            if should_stop.item():
                 Log(f'  cos_sim={cos_sim:.4f} > {args.stage1_cos_threshold}, '
                     f'提前结束 (step {opt_step})', rank)
                 break

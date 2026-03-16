@@ -4,58 +4,52 @@
 
 ## 模型下载
 
-预训练权重托管在 HuggingFace: [LumenscopeAI/NeuronSpark](https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre)
+| 模型 | HuggingFace | ModelScope | 说明 |
+|------|-------------|------------|------|
+| NeuronSpark-0.9B | [Brain2nd/NeuronSpark-0.9B](https://huggingface.co/Brain2nd/NeuronSpark-0.9B) | [Brain2nd/NeuronSpark-0.9B](https://www.modelscope.ai/models/Brain2nd/NeuronSpark-0.9B) | 预训练 85K 步 |
+| NeuronSpark-0.9B-Chat | [Brain2nd/NeuronSpark-0.9B-Chat](https://huggingface.co/Brain2nd/NeuronSpark-0.9B-Chat) | [Brain2nd/NeuronSpark-0.9B-Chat](https://www.modelscope.ai/models/Brain2nd/NeuronSpark-0.9B-Chat) | SFT 对话版 |
 
-| Checkpoint | 说明 | 大小 |
-|------------|------|------|
-| `checkpoints/ckpt_step85000.pth` | 预训练 85000 步，loss ~3.6 | 9.8 GB |
-| `checkpoints_sft/ckpt_step6500.pth` | SFT 6500 步，基础对话能力 | 9.8 GB |
+### 快速推理（HuggingFace 标准接口）
 
-### 快速下载
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-```bash
-# 方法1: 使用 huggingface_hub (推荐)
-pip install huggingface_hub
-python -c "
-from huggingface_hub import hf_hub_download
-repo_id = 'LumenscopeAI/NeuronSpark'
+model = AutoModelForCausalLM.from_pretrained(
+    "Brain2nd/NeuronSpark-0.9B-Chat", trust_remote_code=True,
+)
+tokenizer = AutoTokenizer.from_pretrained("Brain2nd/NeuronSpark-0.9B-Chat")
 
-# 下载预训练 checkpoint
-hf_hub_download(repo_id=repo_id, filename='checkpoints/ckpt_step85000.pth', local_dir='.')
-
-# 下载 SFT checkpoint
-hf_hub_download(repo_id=repo_id, filename='checkpoints_sft/ckpt_step6500.pth', local_dir='.')
-"
-
-# 方法2: 使用 curl 直接下载
-mkdir -p checkpoints checkpoints_sft
-curl -L -C - -o checkpoints/ckpt_step85000.pth \
-    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints/ckpt_step85000.pth"
-curl -L -C - -o checkpoints_sft/ckpt_step6500.pth \
-    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints_sft/ckpt_step6500.pth"
+messages = [
+    {"role": "system", "content": "你是一个AI助手"},
+    {"role": "user", "content": "中国的首都是哪里？"},
+]
+text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+input_ids = tokenizer(text, return_tensors="pt")["input_ids"]
+output_ids = model.generate(input_ids, max_new_tokens=256, temperature=0.1, top_k=10,
+                            eos_token_id=tokenizer.eos_token_id)
+response = tokenizer.decode(output_ids[0], skip_special_tokens=False)
+print(response.split("assistant\n")[-1].replace("<|im_end|>", "").strip())
 ```
 
-### 快速推理
+**示例输出:**
+```
+Q: 中国的首都是哪里？
+A: 中国的首都在北京。
+```
+
+### 本地脚本推理
 
 ```bash
-# SFT 对话模式 (推荐 temperature=0.1~0.3)
+# SFT 对话模式
 python generate_sample.py \
     --checkpoint checkpoints_sft/ckpt_step6500.pth \
-    --mode sft \
-    --prompt "中国的首都是哪里？" \
+    --mode sft --prompt "中国的首都是哪里？" \
     --temperature 0.1 --top_k 10
 
 # 预训练续写模式
 python generate_sample.py \
     --checkpoint checkpoints/ckpt_step85000.pth \
-    --mode pretrain \
-    --prompt "人工智能的发展"
-```
-
-**示例输出 (SFT, temp=0.1):**
-```
-Q: 中国的首都是哪里？
-A: 中国的首都在北京。
+    --mode pretrain --prompt "人工智能的发展"
 ```
 
 ## 致谢与参考

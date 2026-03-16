@@ -491,8 +491,11 @@ NeuronSpark/
 | Batch size | 8 × accum 8 = 64 effective |
 | 学习率 | 2e-4 (warmup 1000 → cosine → 2e-5) |
 | 精度 | bfloat16 |
-| 数据集 | Seq-Monkey (29M 样本) |
+| 数据集 | Seq-Monkey (小子集，约 1.4B token / 全量 10B) |
+| SFT 数据 | BelleGroup (约 6.5K 步 / 全量 350 万条) |
 | 硬件 | NVIDIA GB10 (DGX Spark, 128GB 统一内存) |
+
+> **关于训练数据量**：受计算资源限制（单台 DGX Spark），预训练和 SFT 均仅使用了各自数据集的极小子集。即便如此，模型已展现出初步的语言生成和对话能力，充分验证了纯 SNN 架构用于语言建模的可行性。我们计划在后续工作中使用更多数据和算力持续训练。
 
 ## 环境
 

@@ -68,7 +68,7 @@ Our architecture introduces three key innovations:
 (2)~\textbf{Membrane potential leakage activation}, where PLIFNode neurons output $(1-\beta)\cdot\vpost$ --- the leak current --- as inter-layer signals, naturally weighting fast-responding neurons over slow-memory neurons;
 (3)~\textbf{PonderNet adaptive timesteps}, allowing each token to dynamically decide its effective SNN computation depth $K_{\text{eff}} \in [1, K_{\max}]$ via learned geometric-distribution halt probabilities.
 
-\model{}-0.9B, trained on 10B Chinese tokens with custom Triton-fused PLIF kernels on a single NVIDIA DGX Spark, achieves a pretraining loss of 3.6 and demonstrates basic dialogue capability after supervised fine-tuning.
+\model{}-0.9B, trained on a \emph{small subset} ($\sim$1.4B tokens) of a 10B-token Chinese corpus with custom Triton-fused PLIF kernels on a single NVIDIA DGX Spark, achieves a pretraining loss of 3.6 and demonstrates basic dialogue capability after supervised fine-tuning on $\sim$6.5K instruction samples.
 To our knowledge, this is the largest SNN language model trained from scratch to date.
 We release all code, weights, and training infrastructure under Apache~2.0.
 
@@ -315,12 +315,12 @@ We normalize each layer's modulation parameter gradients to the geometric mean a
 \model{}-0.9B has $D=896$, $N=8$, $K=16$, $L=20$, $D_{\text{ff}}=2688$, and a 6144-token BPE vocabulary, totaling 874M trainable parameters.
 
 \paragraph{Training.}
-We train on the Seq-Monkey corpus~\citep{seqmonkey2023} ($\sim$10B Chinese tokens, 29M samples at 512 token length) for 85,000 steps with 4-GPU DDP on a single NVIDIA DGX Spark (GB10, 128GB unified memory).
+Due to compute constraints (single DGX Spark), we train on a \textbf{small subset} of the Seq-Monkey corpus~\citep{seqmonkey2023} for 85,000 steps ($\sim$1.4B tokens of $\sim$10B available) with 4-GPU DDP on a single NVIDIA DGX Spark (GB10, 128GB unified memory).
 Training uses Adam~\citep{loshchilov2019decoupled} with $\text{lr}=2\times10^{-4}$, warmup 1,000 steps + cosine decay, gradient accumulation 8, bfloat16 mixed precision, and gradient checkpointing~\citep{chen2016training}.
 Neuron parameters receive 10$\times$ base learning rate to compensate for surrogate gradient sparsity.
 
 \paragraph{SFT.}
-We fine-tune on BelleGroup 3.5M Chinese instructions~\citep{bellegroup2023} for 6,500 steps with $\text{lr}=5\times10^{-5}$, AdamW with weight decay 0.01, training only on assistant response tokens (ChatML format).
+We fine-tune on a \textbf{small subset} of BelleGroup 3.5M Chinese instructions~\citep{bellegroup2023} for only 6,500 steps ($\sim$0.4B tokens) with $\text{lr}=5\times10^{-5}$, AdamW with weight decay 0.01, training only on assistant response tokens (ChatML format).
 
 \subsection{Results}
 
@@ -335,7 +335,7 @@ We fine-tune on BelleGroup 3.5M Chinese instructions~\citep{bellegroup2023} for 
 Training loss & 3.6 & 2.1 \\
 Parameters & \multicolumn{2}{c}{874M} \\
 Training steps & 85,000 & 6,500 \\
-Tokens seen & $\sim$10B & $\sim$0.4B \\
+Tokens seen & $\sim$1.4B (of $\sim$10B avail.) & $\sim$0.4B (of $\sim$3.5M samples) \\
 Hardware & \multicolumn{2}{c}{1$\times$ DGX Spark (4$\times$ GB10 GPU)} \\
 Peak memory & \multicolumn{2}{c}{$\sim$48 GB / GPU} \\
 \bottomrule
@@ -388,6 +388,11 @@ Whether this discrete dynamics provides computational benefits beyond continuous
 \paragraph{Leakage vs.\ membrane potential.}
 Using $(1-\beta) \cdot \vpost$ instead of $\vpost$ as inter-layer activation is mathematically equivalent (with weight compensation) but distributes signal magnitudes more uniformly across neurons with different time constants.
 Empirically, both produce identical outputs under greedy decoding.
+
+\paragraph{Data efficiency.}
+A notable observation is that \model{} acquires basic language capabilities with only $\sim$1.4B pretraining tokens and $\sim$6.5K SFT steps --- a fraction of the available data.
+This suggests that the SNN selective state space architecture may have favorable inductive biases for language, though we caution against strong conclusions given the limited scale of our experiments.
+We plan to train on the full dataset in future work to determine the architecture's scaling behavior.
 
 \paragraph{Limitations.}
 At 0.9B parameters and 512-token context, \model{} is significantly smaller than state-of-the-art LLMs.

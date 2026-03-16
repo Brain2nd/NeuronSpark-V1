@@ -34,20 +34,6 @@ print(response.split("assistant\n")[-1].replace("<|im_end|>", "").strip())
 # Output: The capital of China is Beijing.
 ```
 
-### Local Script Inference
-
-```bash
-# SFT chat mode
-python generate_sample.py \
-    --checkpoint checkpoints_sft/ckpt_step6500.pth \
-    --mode sft --prompt "What is the capital of China?" \
-    --temperature 0.1 --top_k 10
-
-# Pretrain completion mode
-python generate_sample.py \
-    --checkpoint checkpoints/ckpt_step85000.pth \
-    --mode pretrain --prompt "Artificial intelligence"
-```
 
 ## Architecture
 

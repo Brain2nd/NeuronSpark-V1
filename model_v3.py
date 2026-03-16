@@ -1125,9 +1125,9 @@ class NeuronSparkModel(NeuronSparkPreTrainedModel):
             # Collect ponder_cost and ek_floor_cost from SSM layers
             if mixer_block.block_type == "ssm":
                 if mixer_block.mixer.ponder_cost is not None:
-                    total_ponder_cost = total_ponder_cost + mixer_block.mixer.ponder_cost
+                    total_ponder_cost = total_ponder_cost.to(hidden_states.device) + mixer_block.mixer.ponder_cost
                 if mixer_block.mixer.ek_floor_cost is not None:
-                    total_ek_floor_cost = total_ek_floor_cost + mixer_block.mixer.ek_floor_cost
+                    total_ek_floor_cost = total_ek_floor_cost.to(hidden_states.device) + mixer_block.mixer.ek_floor_cost
                 ssm_count += 1
 
         hidden_states = self.norm_f(hidden_states)

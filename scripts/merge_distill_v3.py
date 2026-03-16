@@ -96,14 +96,18 @@ def map_nvidia_to_neuronspark(nvidia_sd, mamba_indices):
 def map_bio_ssm_to_neuronspark(bio_sd, mamba_indices):
     """映射 BioSSM state dict → NeuronSpark state dict。
 
-    蒸馏 checkpoint 的 key 格式: {layer_idx}.bio_ssm.xxx
-    NeuronSpark 的 key 格式: backbone.layers.{layer_idx}.mixer.bio_ssm.xxx
+    蒸馏 checkpoint key: {layer_idx}.bio_ssm.xxx
+      (bio_ssm_modules 是 ModuleDict, key=str(layer_idx), 如 "0", "2", "4"...)
+    NeuronSpark 目标 key: backbone.layers.{layer_idx}.mixer.bio_ssm.xxx
+      (NeuronSparkBlock.mixer = BioSSMMixer, BioSSMMixer.bio_ssm = BioSSMLayer)
     """
     mapped = {}
     for k, v in bio_sd.items():
-        # bio_sd key: "{layer_idx}.bio_ssm.xxx" (来自 bio_ssm_modules 的 state_dict)
-        # 目标: "backbone.layers.{layer_idx}.mixer.bio_ssm.xxx"
-        mapped[f'backbone.layers.{k}'] = v
+        # k = "{layer_idx}.bio_ssm.xxx" → 拆出 layer_idx 和 rest
+        parts = k.split('.', 1)  # ["0", "bio_ssm.xxx"]
+        layer_idx = parts[0]
+        rest = parts[1]
+        mapped[f'backbone.layers.{layer_idx}.mixer.{rest}'] = v
 
     return mapped
 

@@ -165,7 +165,7 @@ class NeuronSparkConfig(PretrainedConfig):
 
     @property
     def layers_block_type(self):
-        mapping = {'S': 'ssm', 'E': 'moe', '*': 'attention', '-': 'mlp'}
+        mapping = {'S': 'ssm', 'M': 'ssm', 'E': 'moe', '*': 'attention', '-': 'mlp'}
         return [mapping[c] for c in self.hybrid_override_pattern]
 
 

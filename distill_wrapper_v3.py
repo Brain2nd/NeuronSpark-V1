@@ -244,56 +244,59 @@ class DistillHybridModel(nn.Module):
 
         for idx, block in enumerate(backbone.layers):
             if idx in self._mamba_set:
-                # ===== Mamba 位置 =====
-                # Teacher: 拼接 batch 一次 forward (1 次 FSDP all-gather)
-                with torch.no_grad():
-                    block(
-                        hidden_states,
-                        cache_params=None,
-                        cache_position=cache_position,
-                        attention_mask=mamba_mask,
-                    )
-                mamba_out = self._mamba_mixer_outputs.pop(idx)
-
-                # BioSSM: 逐 micro-batch (控制显存, K=16 展开占大量显存)
                 bio_mixer = self.bio_ssm_modules[str(idx)]
-                h_chunks = hidden_states.chunk(accum, dim=0)
-                m_chunks = mamba_out.chunk(accum, dim=0)
-                del mamba_out
 
-                bio_outs = []
-                layer_cos_sum = 0.0
-                for i in range(accum):
-                    # 每个 micro-batch 重置神经元膜电位
-                    bio_mixer.bio_ssm.input_neuron.v = 0.
-                    bio_mixer.bio_ssm.snn_block.hidden_neuron.v = 0.
+                if self.training:
+                    # ===== 训练: Mamba teacher + cosine alignment =====
+                    with torch.no_grad():
+                        block(
+                            hidden_states,
+                            cache_params=None,
+                            cache_position=cache_position,
+                            attention_mask=mamba_mask,
+                        )
+                    mamba_out = self._mamba_mixer_outputs.pop(idx)
 
-                    if self.training:
+                    h_chunks = hidden_states.chunk(accum, dim=0)
+                    m_chunks = mamba_out.chunk(accum, dim=0)
+                    del mamba_out
+
+                    bio_outs = []
+                    layer_cos_sum = 0.0
+                    for i in range(accum):
+                        bio_mixer.bio_ssm.input_neuron.v = 0.
+                        bio_mixer.bio_ssm.snn_block.hidden_neuron.v = 0.
+
                         bo = ckpt_fn(bio_mixer, h_chunks[i],
                                      use_reentrant=False)
+                        bio_outs.append(bo)
+
+                        cos_loss = compute_layer_cosine_loss(
+                            bo, m_chunks[i].detach())
+                        layer_cosine_losses.append(cos_loss)
+                        layer_cos_sum += cos_loss.detach().item()
+
+                        if bio_mixer.ponder_cost is not None:
+                            total_ponder = total_ponder + bio_mixer.ponder_cost
+                        if bio_mixer.ek_floor_cost is not None:
+                            total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
+
+                    self._layer_cosine_dict[idx] = layer_cos_sum / accum
+
+                    if accum > 1:
+                        bio_out_cat = torch.cat(bio_outs, dim=0)
                     else:
-                        bo = bio_mixer(h_chunks[i])
-                    bio_outs.append(bo)
+                        bio_out_cat = bio_outs[0]
+                    hidden_states = hidden_states + bio_out_cat
+                    del h_chunks, m_chunks, bio_outs, bio_out_cat
 
-                    cos_loss = compute_layer_cosine_loss(
-                        bo, m_chunks[i].detach())
-                    layer_cosine_losses.append(cos_loss)
-                    layer_cos_sum += cos_loss.detach().item()
-
-                    if bio_mixer.ponder_cost is not None:
-                        total_ponder = total_ponder + bio_mixer.ponder_cost
-                    if bio_mixer.ek_floor_cost is not None:
-                        total_ek_floor = total_ek_floor + bio_mixer.ek_floor_cost
-
-                self._layer_cosine_dict[idx] = layer_cos_sum / accum
-
-                # 重组 bio_out 到拼接 batch 维
-                if accum > 1:
-                    bio_out_cat = torch.cat(bio_outs, dim=0)
                 else:
-                    bio_out_cat = bio_outs[0]
-                hidden_states = hidden_states + bio_out_cat
-                del h_chunks, m_chunks, bio_outs, bio_out_cat
+                    # ===== 推理: 只跑 BioSSM, 不需要 Mamba teacher =====
+                    bio_mixer.bio_ssm.input_neuron.v = 0.
+                    bio_mixer.bio_ssm.snn_block.hidden_neuron.v = 0.
+                    bio_out = bio_mixer(hidden_states)
+                    hidden_states = hidden_states + bio_out
+                    del bio_out
 
             else:
                 # ===== 冻结层: gradient checkpointing 省激活显存 =====

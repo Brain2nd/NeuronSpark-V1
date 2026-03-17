@@ -116,6 +116,7 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
             'K': raw_model.K,
             'num_layers': raw_model.num_layers,
             'D_ff': raw_model.D_ff,
+            'activation_mode': raw_model.activation_mode,
         },
     }, path)
     print(f"  → Checkpoint saved: {path}")
@@ -173,6 +174,7 @@ def init_model(args, local_rank, rank):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
+        activation_mode=args.activation_mode,
     )
 
     device = torch.device(f"cuda:{local_rank}")
@@ -189,7 +191,7 @@ def init_model(args, local_rank, rank):
 # ============================================================
 
 def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
-                iter_per_epoch, tokens_seen, rank, world_size):
+                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None):
     """训练一个 epoch（DDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
     sampler.set_epoch(epoch)
@@ -227,6 +229,23 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+
+            # Dashboard
+            if dashboard and is_main_process(rank):
+                raw_model = model.module if isinstance(model, DDP) else model
+                batch_loss_db = loss.item() * args.accumulation_steps
+                spend_time_db = time.time() - start_time
+                dashboard.log_step(step, {
+                    'loss': batch_loss_db,
+                    'ppl': math.exp(min(batch_loss_db, 20.0)),
+                    'lr': lr,
+                    'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
+                    'tokens_seen': tokens_seen,
+                    'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                    'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
+                    'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
+                }, raw_model, log_params=(step % args.log_interval == 0))
+
             optimizer.zero_grad(set_to_none=True)
 
         # 有效 token 数（汇总所有卡）
@@ -258,6 +277,9 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                 global_step = epoch * iter_per_epoch + step + 1
                 save_checkpoint(args.save_dir, model, optimizer, scaler,
                                 global_step, epoch, batch_loss, tokens_seen)
+                if dashboard:
+                    raw_model = model.module if isinstance(model, DDP) else model
+                    dashboard.log_save_point(global_step, raw_model)
                 model.train()
             if world_size > 1:
                 dist.barrier()
@@ -280,6 +302,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=20)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
+    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
+                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
 
     # 训练参数
     parser.add_argument("--out_dir", type=str, default="checkpoints")
@@ -307,6 +331,10 @@ if __name__ == "__main__":
 
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
+
+    # TensorBoard 看板
+    parser.add_argument('--dashboard_dir', type=str, default=None,
+                        help="TensorBoard 日志目录，例如 runs/pretrain")
 
     args = parser.parse_args()
 
@@ -390,13 +418,24 @@ if __name__ == "__main__":
     Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline (GPU {local_rank})", rank)
     Logger(f"{'='*60}\n", rank)
 
+    # ==================== TensorBoard 看板 ====================
+    if args.dashboard_dir:
+        from dashboard import SNNDashboard
+        raw_model = model.module if isinstance(model, DDP) else model
+        dashboard = SNNDashboard(args.dashboard_dir, raw_model, rank)
+    else:
+        dashboard = None
+
     # ==================== 训练 ====================
     for epoch in range(start_epoch, args.epochs):
         model.train()
         tokens_seen = train_epoch(
             epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
-            iter_per_epoch, tokens_seen, rank, world_size,
+            iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
         )
+
+    if dashboard:
+        dashboard.close()
 
     # 最终保存
     if is_main_process(rank):

@@ -49,6 +49,7 @@ def load_model(checkpoint_path, device):
         K=config.get('K', 16),
         num_layers=config.get('num_layers', 20),
         D_ff=config.get('D_ff', 3072),
+        activation_mode=config.get('activation_mode', 'v2'),
     )
 
     if 'model_state_dict' in ckpt:

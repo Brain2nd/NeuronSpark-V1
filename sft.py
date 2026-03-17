@@ -89,6 +89,7 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
             'K': raw.K,
             'num_layers': raw.num_layers,
             'D_ff': raw.D_ff,
+            'activation_mode': raw.activation_mode,
         },
     }, path)
     Logger(f"  → Checkpoint saved: {path}")
@@ -159,6 +160,7 @@ def init_model(args):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
+        activation_mode=args.activation_mode,
     )
 
     model = model.to(args.device)
@@ -170,7 +172,8 @@ def init_model(args):
 # 训练循环
 # ============================================================
 
-def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen):
+def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen,
+                dashboard=None):
     """训练一个 epoch（SFT 版本，与预训练逻辑完全一致）。"""
     start_time = time.time()
 
@@ -202,6 +205,21 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+
+            # Dashboard
+            if dashboard:
+                batch_loss_db = loss.item() * args.accumulation_steps
+                spend_time_db = time.time() - start_time
+                dashboard.log_step(step, {
+                    'loss': batch_loss_db,
+                    'ppl': math.exp(min(batch_loss_db, 20.0)),
+                    'lr': lr,
+                    'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
+                    'tokens_seen': tokens_seen,
+                    'memory_current_gb': torch.cuda.memory_allocated() / 1e9 if args.device != 'cpu' else 0,
+                    'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9 if args.device != 'cpu' else 0,
+                }, model, log_params=(step % args.log_interval == 0))
+
             optimizer.zero_grad(set_to_none=True)
 
         valid_tokens = int(loss_mask_flat.sum().item())
@@ -231,6 +249,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             global_step = epoch * iter_per_epoch + step + 1
             save_checkpoint(args.save_dir, model, optimizer, scaler,
                             global_step, epoch, batch_loss, tokens_seen)
+            if dashboard:
+                dashboard.log_save_point(global_step, model)
             model.train()
 
     return tokens_seen
@@ -251,6 +271,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=20)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
+    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
+                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
 
     # SFT 特有参数
     parser.add_argument('--pretrained_ckpt', type=str, default=None,
@@ -286,6 +308,10 @@ if __name__ == "__main__":
 
     # 断续训练
     parser.add_argument('--resume', type=str, default=None, help='从 SFT checkpoint 恢复')
+
+    # TensorBoard 看板
+    parser.add_argument('--dashboard_dir', type=str, default=None,
+                        help="TensorBoard 日志目录，例如 runs/sft")
 
     args = parser.parse_args()
 
@@ -365,12 +391,22 @@ if __name__ == "__main__":
         Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline")
     Logger(f"{'='*60}\n")
 
+    # ==================== TensorBoard 看板 ====================
+    if args.dashboard_dir:
+        from dashboard import SNNDashboard
+        dashboard = SNNDashboard(args.dashboard_dir, model)
+    else:
+        dashboard = None
+
     # ==================== 训练 ====================
     for epoch in range(start_epoch, args.epochs):
         tokens_seen = train_epoch(
             epoch, model, train_loader, optimizer, scaler, ctx, args,
-            iter_per_epoch, tokens_seen,
+            iter_per_epoch, tokens_seen, dashboard=dashboard,
         )
+
+    if dashboard:
+        dashboard.close()
 
     Logger(f"\nSFT finished. Total tokens seen: {tokens_seen:,}")
     if args.device != 'cpu':

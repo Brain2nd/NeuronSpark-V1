@@ -66,6 +66,7 @@ class SNNLanguageModel(nn.Module):
         num_layers: int = 20,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
+        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -74,6 +75,7 @@ class SNNLanguageModel(nn.Module):
         self.K = K
         self.num_layers = num_layers
         self.D_ff = D_ff
+        self.activation_mode = activation_mode
 
         # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
@@ -99,6 +101,7 @@ class SNNLanguageModel(nn.Module):
                 K=K,
                 num_layers=num_layers,
                 layer_idx=i,
+                activation_mode=activation_mode,
             )
             for i in range(num_layers)
         ])
@@ -179,7 +182,9 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        return (1.0 - beta) * V_post  # 膜电位泄漏量
+        if self.activation_mode == 'v2':
+            return (1.0 - beta) * V_post  # 膜电位泄漏量
+        return V_post  # 膜电位
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

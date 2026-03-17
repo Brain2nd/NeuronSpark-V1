@@ -59,15 +59,19 @@ if __name__ == "__main__":
     ckpt = torch.load(args.input, map_location='cpu', weights_only=False)
     config = ckpt.get('model_config', {})
 
+    # V1 checkpoint → 用 v1 模式加载
     model = SNNLanguageModel(
         vocab_size=config.get('vocab_size', 6144),
         D=config.get('D', 1024), N=config.get('N', 8), K=config.get('K', 32),
         num_layers=config.get('num_layers', 20), D_ff=config.get('D_ff', 3072),
+        activation_mode='v2',
     )
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
     adapt_weights(model)
 
     ckpt['model_state_dict'] = model.state_dict()
+    config['activation_mode'] = 'v2'
+    ckpt['model_config'] = config
     torch.save(ckpt, args.output)
     print(f"Saved: {args.output}")

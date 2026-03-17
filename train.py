@@ -110,6 +110,7 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
             'K': raw.K,
             'num_layers': raw.num_layers,
             'D_ff': raw.D_ff,
+            'activation_mode': raw.activation_mode,
         },
     }, path)
     Logger(f"  → Checkpoint saved: {path}")
@@ -175,6 +176,7 @@ def init_model(args):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
+        activation_mode=args.activation_mode,
     )
 
     # 将模型移动到指定设备
@@ -188,7 +190,8 @@ def init_model(args):
 # 训练循环（对齐教程 train_epoch）
 # ============================================================
 
-def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen):
+def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen,
+                dashboard=None):
     """
     训练一个 epoch（对齐教程训练循环，使用标准反向传播）。
 
@@ -234,6 +237,23 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
+
+            # Dashboard: optimizer.step() 后记录
+            if dashboard:
+                raw_model = model.module if hasattr(model, 'module') else model
+                batch_loss_db = loss.item() * args.accumulation_steps
+                spend_time_db = time.time() - start_time
+                dashboard.log_step(step, {
+                    'loss': batch_loss_db,
+                    'ppl': math.exp(min(batch_loss_db, 20.0)),
+                    'lr': lr,
+                    'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
+                    'tokens_seen': tokens_seen,
+                    'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
+                    'memory_current_gb': torch.cuda.memory_allocated() / 1e9 if args.device != 'cpu' else 0,
+                    'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9 if args.device != 'cpu' else 0,
+                }, raw_model, log_params=(step % args.log_interval == 0))
+
             optimizer.zero_grad(set_to_none=True)
 
         # 有效 token 数
@@ -283,6 +303,9 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             global_step = epoch * iter_per_epoch + step + 1
             save_checkpoint(args.save_dir, model, optimizer, scaler,
                             global_step, epoch, batch_loss, tokens_seen)
+            if dashboard:
+                raw_model = model.module if hasattr(model, 'module') else model
+                dashboard.log_save_point(global_step, raw_model)
             model.train()
 
     return tokens_seen
@@ -304,6 +327,8 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
     parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
+    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
+                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
 
     # 基础训练参数（对齐教程）
     parser.add_argument("--out_dir", type=str, default="checkpoints", help="模型输出目录")
@@ -337,6 +362,10 @@ if __name__ == "__main__":
 
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None, help='从 checkpoint 恢复')
+
+    # TensorBoard 看板
+    parser.add_argument('--dashboard_dir', type=str, default=None,
+                        help="TensorBoard 日志目录，例如 runs/pretrain")
 
     args = parser.parse_args()
 
@@ -416,9 +445,20 @@ if __name__ == "__main__":
         Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline")
     Logger(f"{'='*60}\n")
 
+    # ==================== TensorBoard 看板 ====================
+    if args.dashboard_dir:
+        from dashboard import SNNDashboard
+        dashboard = SNNDashboard(args.dashboard_dir, model)
+    else:
+        dashboard = None
+
     # ==================== 开始训练 ====================
     for epoch in range(start_epoch, args.epochs):
-        tokens_seen = train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen)
+        tokens_seen = train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen,
+                                  dashboard=dashboard)
+
+    if dashboard:
+        dashboard.close()
 
     # 训练结束，保存最终 checkpoint
     Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}")

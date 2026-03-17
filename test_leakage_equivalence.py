@@ -34,6 +34,7 @@ def load_model(ckpt_path, device='cpu'):
         K=config.get('K', 32),
         num_layers=config.get('num_layers', 20),
         D_ff=config.get('D_ff', 3072),
+        activation_mode=config.get('activation_mode', 'v2'),
     )
     model.load_state_dict(ckpt['model_state_dict'], strict=False)
     model = model.to(device).eval()

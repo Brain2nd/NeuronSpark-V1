@@ -47,10 +47,12 @@ class SNNFFN(base.MemoryModule):
         num_layers: int = 1,
         layer_idx: int = 0,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.D_ff = D_ff
+        self.activation_mode = activation_mode
 
         # ====== 三条投影路径（对标 SwiGLU: gate_proj, up_proj, down_proj） ======
         self.gate_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
@@ -145,14 +147,18 @@ class SNNFFN(base.MemoryModule):
             surrogate_function=surr,
         )
 
-        # 膜电位泄漏量作为激活值: leak = (1-β) · V_post
-        gate_leak = V_post_merged[:, :, :D_ff] * (1.0 - beta_gate)   # (TK, batch, D_ff)
-        up_leak = V_post_merged[:, :, D_ff:] * (1.0 - beta_up)       # (TK, batch, D_ff)
+        # 激活值: v2=(1-β)·V_post (泄漏量), v1=V_post (膜电位)
+        gate_v = V_post_merged[:, :, :D_ff]
+        up_v = V_post_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        # ====== Phase 3: 连续门控（leak × leak，对标 SwiGLU）+ 降维 ======
-        gated = gate_leak * up_leak  # (TK, batch, D_ff)
+        if self.activation_mode == 'v2':
+            gate_v = gate_v * (1.0 - beta_gate)
+            up_v = up_v * (1.0 - beta_up)
+
+        # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
+        gated = gate_v * up_v  # (TK, batch, D_ff)
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
@@ -169,16 +175,20 @@ class SNNFFN(base.MemoryModule):
         Returns:
             continuous_out: 连续输出, shape (batch, D)
         """
-        # 门控路径 — 膜电位泄漏量激活
+        # 门控路径
         _ = self.gate_neuron(self.gate_proj(spike_in))
-        gate_leak = (1.0 - self.gate_neuron.beta) * self.gate_neuron.v  # leak
+        gate_v = self.gate_neuron.v
 
-        # 值路径 — 膜电位泄漏量激活
+        # 值路径
         _ = self.up_neuron(self.up_proj(spike_in))
-        up_leak = (1.0 - self.up_neuron.beta) * self.up_neuron.v  # leak
+        up_v = self.up_neuron.v
+
+        if self.activation_mode == 'v2':
+            gate_v = (1.0 - self.gate_neuron.beta) * gate_v
+            up_v = (1.0 - self.up_neuron.beta) * up_v
 
         # 连续门控（对标 SwiGLU）
-        gated = gate_leak * up_leak
+        gated = gate_v * up_v
 
         # 降维 + 残差
         I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D

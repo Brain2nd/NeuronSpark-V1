@@ -21,7 +21,6 @@
 """
 
 import os
-import glob
 import time
 import math
 import argparse
@@ -39,6 +38,7 @@ from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
 from dataset import PretrainDataset
+from checkpoint_utils import save_checkpoint, load_checkpoint
 
 warnings.filterwarnings('ignore')
 
@@ -91,71 +91,8 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-# ============================================================
-# Checkpoint
-# ============================================================
-
-def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    max_keep=5):
-    """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
-    os.makedirs(save_dir, exist_ok=True)
-    raw_model = model.module if isinstance(model, DDP) else model
-    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
-    torch.save({
-        'model_state_dict': raw_model.state_dict(),
-        'optimizer_state': optimizer.state_dict(),
-        'scaler_state': scaler.state_dict(),
-        'step': step,
-        'epoch': epoch,
-        'best_loss': best_loss,
-        'tokens_seen': tokens_seen,
-        'model_config': {
-            'vocab_size': raw_model.vocab_size,
-            'D': raw_model.D,
-            'N': raw_model.N,
-            'K': raw_model.K,
-            'num_layers': raw_model.num_layers,
-            'D_ff': raw_model.D_ff,
-            'activation_mode': raw_model.activation_mode,
-        },
-    }, path)
-    print(f"  → Checkpoint saved: {path}")
-
-    # 清理旧 checkpoint，仅保留最新 max_keep 个
-    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-    while len(ckpts) > max_keep:
-        old = ckpts.pop(0)
-        os.remove(old)
-        print(f"  → Removed old checkpoint: {old}")
 
 
-def load_checkpoint(path, model, optimizer, scaler, device, rank):
-    """加载 checkpoint，恢复训练状态。"""
-    Logger(f"Loading checkpoint from {path}...", rank)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    raw_model = model.module if isinstance(model, DDP) else model
-
-    if 'model_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    elif 'trainable_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
-
-    if 'optimizer_state' in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt['optimizer_state'])
-        except (ValueError, KeyError):
-            Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
-
-    if 'scaler_state' in ckpt:
-        scaler.load_state_dict(ckpt['scaler_state'])
-
-    step = ckpt.get('step', 0)
-    epoch = ckpt.get('epoch', 0)
-    best_loss = ckpt.get('best_loss', float('inf'))
-    tokens_seen = ckpt.get('tokens_seen', 0)
-    Logger(f"  Resumed: step={step}, epoch={epoch}, tokens={tokens_seen:,}", rank)
-    return step, epoch, best_loss, tokens_seen
 
 
 # ============================================================
@@ -392,7 +329,7 @@ if __name__ == "__main__":
     start_epoch = 0
     if args.resume:
         start_step, start_epoch, best_loss, tokens_seen = load_checkpoint(
-            args.resume, model, optimizer, scaler, device, rank,
+            args.resume, model, optimizer, scaler, device,
         )
 
     # ==================== 训练信息 ====================

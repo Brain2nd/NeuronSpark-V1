@@ -18,7 +18,6 @@
 """
 
 import os
-import glob
 import time
 import math
 import argparse
@@ -36,6 +35,7 @@ from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
 from dataset import SFTDataset
+from checkpoint_utils import save_checkpoint, load_checkpoint, load_model_weights
 
 warnings.filterwarnings('ignore')
 
@@ -81,79 +81,8 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-# ============================================================
-# Checkpoint
-# ============================================================
-
-def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    max_keep=5):
-    os.makedirs(save_dir, exist_ok=True)
-    raw_model = model.module if isinstance(model, DDP) else model
-    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
-    torch.save({
-        'model_state_dict': raw_model.state_dict(),
-        'optimizer_state': optimizer.state_dict(),
-        'scaler_state': scaler.state_dict(),
-        'step': step,
-        'epoch': epoch,
-        'best_loss': best_loss,
-        'tokens_seen': tokens_seen,
-        'model_config': {
-            'vocab_size': raw_model.vocab_size,
-            'D': raw_model.D,
-            'N': raw_model.N,
-            'K': raw_model.K,
-            'num_layers': raw_model.num_layers,
-            'D_ff': raw_model.D_ff,
-            'activation_mode': raw_model.activation_mode,
-        },
-    }, path)
-    print(f"  → Checkpoint saved: {path}")
-
-    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-    while len(ckpts) > max_keep:
-        old = ckpts.pop(0)
-        os.remove(old)
-        print(f"  → Removed old checkpoint: {old}")
 
 
-def load_pretrained(path, model, device, rank):
-    Logger(f"Loading pretrained weights from {path}...", rank)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    raw_model = model.module if isinstance(model, DDP) else model
-    if 'model_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    elif 'trainable_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
-
-    pretrain_step = ckpt.get('step', '?')
-    Logger(f"  Loaded pretrained model (step={pretrain_step})", rank)
-
-
-def load_checkpoint(path, model, optimizer, scaler, device, rank):
-    Logger(f"Loading SFT checkpoint from {path}...", rank)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-
-    raw_model = model.module if isinstance(model, DDP) else model
-    if 'model_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-
-    if 'optimizer_state' in ckpt:
-        try:
-            optimizer.load_state_dict(ckpt['optimizer_state'])
-        except (ValueError, KeyError):
-            Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
-
-    if 'scaler_state' in ckpt:
-        scaler.load_state_dict(ckpt['scaler_state'])
-
-    step = ckpt.get('step', 0)
-    epoch = ckpt.get('epoch', 0)
-    best_loss = ckpt.get('best_loss', float('inf'))
-    tokens_seen = ckpt.get('tokens_seen', 0)
-    Logger(f"  Resumed: step={step}, epoch={epoch}, tokens={tokens_seen:,}", rank)
-    return step, epoch, best_loss, tokens_seen
 
 
 # ============================================================
@@ -345,7 +274,7 @@ if __name__ == "__main__":
 
     # 加载预训练权重（DDP 包装前加载）
     if args.pretrained_ckpt and not args.resume:
-        load_pretrained(args.pretrained_ckpt, model, device, rank)
+        load_model_weights(args.pretrained_ckpt, model, device)
 
     # DDP 包装
     model = DDP(model, device_ids=[local_rank])
@@ -383,7 +312,7 @@ if __name__ == "__main__":
     start_epoch = 0
     if args.resume:
         start_step, start_epoch, best_loss, tokens_seen = load_checkpoint(
-            args.resume, model, optimizer, scaler, device, rank,
+            args.resume, model, optimizer, scaler, device,
         )
 
     # ==================== 训练信息 ====================

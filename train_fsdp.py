@@ -27,9 +27,11 @@
 """
 
 import os
+import json
 import glob
 import time
 import math
+import shutil
 import argparse
 import warnings
 import functools
@@ -51,6 +53,7 @@ from torch.distributed.fsdp import (
 )
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
+from safetensors.torch import save_file, load_file
 from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
@@ -122,9 +125,9 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 
 def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tokens_seen,
                          rank, max_keep=5):
-    """保存 FSDP checkpoint（FULL_STATE_DICT 模式，兼容单卡加载）。"""
+    """保存 FSDP checkpoint（safetensors 格式，兼容单卡加载）。"""
     os.makedirs(save_dir, exist_ok=True)
-    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
+    ckpt_dir = os.path.join(save_dir, f'ckpt_step{step}')
 
     # 收集完整模型状态到 rank 0 CPU
     save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
@@ -135,66 +138,93 @@ def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tok
     full_optim_state = FSDP.full_optim_state_dict(model, optimizer)
 
     if is_main_process(rank):
-        # 从 FSDP 包装中获取模型配置
+        os.makedirs(ckpt_dir, exist_ok=True)
         raw_model = model.module
+
+        # 1. 模型权重 → safetensors
+        tensor_dict = {k: v.contiguous().cpu() for k, v in model_state.items()
+                       if isinstance(v, torch.Tensor)}
+        save_file(tensor_dict, os.path.join(ckpt_dir, 'model.safetensors'))
+
+        # 2. 模型配置 → config.json
+        config = {
+            'vocab_size': raw_model.vocab_size,
+            'D': raw_model.D,
+            'N': raw_model.N,
+            'K': raw_model.K,
+            'num_layers': raw_model.num_layers,
+            'D_ff': raw_model.D_ff,
+            'activation_mode': raw_model.activation_mode,
+        }
+        with open(os.path.join(ckpt_dir, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=2)
+
+        # 3. 训练状态 → training_state.pth
         torch.save({
-            'model_state_dict': model_state,
             'optimizer_state': full_optim_state,
             'step': step,
             'epoch': epoch,
             'best_loss': best_loss,
             'tokens_seen': tokens_seen,
-            'model_config': {
-                'vocab_size': raw_model.vocab_size,
-                'D': raw_model.D,
-                'N': raw_model.N,
-                'K': raw_model.K,
-                'num_layers': raw_model.num_layers,
-                'D_ff': raw_model.D_ff,
-                'activation_mode': raw_model.activation_mode,
-            },
-        }, path)
-        print(f"  → Checkpoint saved: {path}")
+        }, os.path.join(ckpt_dir, 'training_state.pth'))
 
-        # 清理旧 checkpoint，仅保留最新 max_keep 个
-        ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
-        while len(ckpts) > max_keep:
-            old = ckpts.pop(0)
-            os.remove(old)
+        print(f"  → Checkpoint saved: {ckpt_dir}")
+
+        # 清理旧 checkpoint 目录
+        ckpt_dirs = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*')))
+        while len(ckpt_dirs) > max_keep:
+            old = ckpt_dirs.pop(0)
+            shutil.rmtree(old)
             print(f"  → Removed old checkpoint: {old}")
 
     dist.barrier()
 
 
 def load_checkpoint_fsdp(path, model, optimizer, device, rank):
-    """加载 checkpoint 恢复训练（所有 rank 加载 full state dict，FSDP 自动分片）。"""
+    """加载 checkpoint 恢复训练（支持 safetensors 目录和旧格式 .pth）。"""
     Logger(f"Loading checkpoint from {path}...", rank)
 
-    # 所有 rank 加载完整 state dict
-    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    # 判断格式
+    if os.path.isdir(path):
+        # safetensors 目录格式
+        state_dict = load_file(os.path.join(path, 'model.safetensors'), device='cpu')
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            model.load_state_dict(state_dict)
 
-    # 加载模型权重
-    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
-        if 'model_state_dict' in ckpt:
-            model.load_state_dict(ckpt['model_state_dict'])
-        elif 'trainable_state_dict' in ckpt:
-            model.load_state_dict(ckpt['trainable_state_dict'])
+        ts_path = os.path.join(path, 'training_state.pth')
+        if os.path.exists(ts_path):
+            ts = torch.load(ts_path, map_location='cpu', weights_only=False)
+            if 'optimizer_state' in ts:
+                try:
+                    sharded = FSDP.shard_full_optim_state_dict(ts['optimizer_state'], model)
+                    optimizer.load_state_dict(sharded)
+                except (ValueError, KeyError, RuntimeError):
+                    Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
+            step = ts.get('step', 0)
+            epoch = ts.get('epoch', 0)
+            best_loss = ts.get('best_loss', float('inf'))
+            tokens_seen = ts.get('tokens_seen', 0)
+        else:
+            step, epoch, best_loss, tokens_seen = 0, 0, float('inf'), 0
+    else:
+        # 旧格式 .pth
+        ckpt = torch.load(path, map_location='cpu', weights_only=False)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            elif 'trainable_state_dict' in ckpt:
+                model.load_state_dict(ckpt['trainable_state_dict'])
+        if 'optimizer_state' in ckpt:
+            try:
+                sharded = FSDP.shard_full_optim_state_dict(ckpt['optimizer_state'], model)
+                optimizer.load_state_dict(sharded)
+            except (ValueError, KeyError, RuntimeError):
+                Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
+        step = ckpt.get('step', 0)
+        epoch = ckpt.get('epoch', 0)
+        best_loss = ckpt.get('best_loss', float('inf'))
+        tokens_seen = ckpt.get('tokens_seen', 0)
 
-    # 加载优化器状态
-    if 'optimizer_state' in ckpt:
-        try:
-            full_optim_state = ckpt['optimizer_state']
-            sharded_optim_state = FSDP.shard_full_optim_state_dict(
-                full_optim_state, model
-            )
-            optimizer.load_state_dict(sharded_optim_state)
-        except (ValueError, KeyError, RuntimeError):
-            Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
-
-    step = ckpt.get('step', 0)
-    epoch = ckpt.get('epoch', 0)
-    best_loss = ckpt.get('best_loss', float('inf'))
-    tokens_seen = ckpt.get('tokens_seen', 0)
     Logger(f"  Resumed: step={step}, epoch={epoch}, tokens={tokens_seen:,}", rank)
     return step, epoch, best_loss, tokens_seen
 

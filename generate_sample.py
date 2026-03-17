@@ -33,15 +33,14 @@ import torch
 from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
+from checkpoint_utils import load_config, load_model_weights
 
 
 def load_model(checkpoint_path, device):
-    """从 checkpoint 加载模型。"""
+    """从 checkpoint 加载模型（支持 safetensors 目录和旧格式 .pth）。"""
     print(f"Loading model from {checkpoint_path}...")
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
-    # 从 checkpoint 中读取模型配置
-    config = ckpt.get('model_config', {})
+    config = load_config(checkpoint_path)
     model = SNNLanguageModel(
         vocab_size=config.get('vocab_size', 6144),
         D=config.get('D', 1024),
@@ -52,14 +51,10 @@ def load_model(checkpoint_path, device):
         activation_mode=config.get('activation_mode', 'v2'),
     )
 
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    elif 'trainable_state_dict' in ckpt:
-        model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
+    load_model_weights(checkpoint_path, model, device)
 
     model = model.to(device).eval()
-    step = ckpt.get('step', '?')
-    print(f"  Model loaded (step={step}, D={config.get('D')}, Layers={config.get('num_layers')})")
+    print(f"  Model loaded (D={config.get('D')}, Layers={config.get('num_layers')})")
     return model
 
 

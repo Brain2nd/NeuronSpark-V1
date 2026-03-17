@@ -444,17 +444,38 @@ SpikeGPT & 216M & \ding{51} & \ding{51} & \ding{51} & \ding{55} \\
 \label{sec:discussion}
 
 Our central claim is that large-scale language modeling in a pure SNN regime is not only conceptually plausible but empirically attainable when the architectural design directly addresses the optimization and expressivity gaps left by prior SNN language studies.
+Beyond feasibility, our interpretability analyses (Appendix~\ref{app:interpretability}) reveal that the trained model develops computational strategies with striking parallels to biological neural processing.
 
 \paragraph{SNN--SSM duality.}
 The selective PLIF dynamics establish a direct correspondence with Mamba's selective SSM:
 $\beta(t) \leftrightarrow \bar{A}(t)$, $\alpha(t) \leftrightarrow \bar{B}(t)$, $V[t] \leftrightarrow h[t]$.
 The spike-and-reset mechanism introduces a hard, input-dependent nonlinearity absent in continuous SSMs.
 
+\paragraph{Biological interpretability: structure before semantics.}
+Three complementary experiments (Appendix~\ref{app:interpretability}) paint a coherent picture of what the model learns and how it allocates neural resources:
+
+\emph{(1)~Resource allocation mirrors syntactic role, not predictive difficulty.}
+PonderNet assigns systematically fewer SNN steps to punctuation and function words than to content words (nouns, verbs, adjectives), mirroring how biological cortical circuits allocate differential processing effort based on stimulus structural complexity rather than statistical surprise~\citep{carandini2012normalization}.
+Critically, E[K] is uncorrelated with token surprisal ($r = -0.12$ after excluding the BOS sentinel), confirming that adaptive computation is governed by syntactic role rather than prediction error --- a pattern consistent with neurolinguistic findings that neural processing load correlates more with syntactic complexity than with information-theoretic surprisal.
+
+\emph{(2)~Hierarchical computation depth resembles cortical processing.}
+Deeper layers allocate progressively more SNN timesteps (SNNBlock E[K] increases from $\sim$4 at layer~2 to $\sim$12.7 at layer~19), while SNNFFN E[K] remains stable ($\sim$7--8).
+This asymmetry parallels the cortical hierarchy where higher-order areas exhibit longer temporal integration windows, and point-wise transformations (analogous to SNNFFN) saturate at a fixed processing depth.
+
+\emph{(3)~Multi-timescale neuron specialization.}
+The 143,360 hidden neurons self-organize into fast-responding ($\beta < 0.9$, 67.3\%) and slow-memory ($\beta \geq 0.9$, 32.7\%) populations, reminiscent of the coexistence of fast-spiking interneurons and regular-spiking pyramidal cells in biological cortex.
+
+\emph{(4)~Structural competence without reasoning.}
+The model achieves fluent Chinese generation (6/6 coherence) but fails at arithmetic (0/8), with E[K] flat across all task categories ($\sim$7.6).
+This dissociation between structural fluency and reasoning ability, combined with the structure-driven (not difficulty-driven) computation allocation, suggests that the model has acquired a ``structural backbone'' of language --- analogous to early stages of biological language acquisition where grammatical patterns precede semantic understanding.
+Continued training on more data would be needed to progress from structural pattern learning to genuine semantic reasoning.
+
 \paragraph{Data efficiency.}
-\model{} acquires basic language capabilities with $\sim$14\% of pretraining data and $\sim$1.2\% of SFT data, suggesting favorable inductive biases, though controlled Transformer baselines are needed.
+\model{} acquires basic language capabilities with $\sim$14\% of pretraining data and $\sim$1.2\% of SFT data.
+The biological interpretability findings above suggest this efficiency may arise from the SNN architecture's inductive bias toward structural pattern extraction, though controlled Transformer baselines are needed to confirm this hypothesis.
 
 \paragraph{Limitations.}
-(1) 0.9B parameters, 512-token context. (2) No quantitative benchmarks (C-Eval, CMMLU). (3) Chinese only. (4) Repetition artifacts.
+(1) 0.9B parameters, 512-token context. (2) No quantitative benchmarks (C-Eval, CMMLU) or Transformer baselines. (3) Chinese only. (4) Repetition artifacts and no reasoning capability. (5) Interpretability analyses are correlational, not causal.
 
 \paragraph{Energy efficiency.}
 The spike-based hidden computation may be amenable to deployment on neuromorphic platforms (e.g., Intel Loihi~\citep{davies2018loihi}), which could yield substantial energy savings. A rigorous quantitative evaluation remains future work.
@@ -465,6 +486,9 @@ The spike-based hidden computation may be amenable to deployment on neuromorphic
 
 We presented \model{}, a 0.9B-parameter spiking language model that jointly addresses three persistent gaps in prior work: distillation dependence, partially non-spiking pipelines, and limited model scale.
 By connecting SNN membrane dynamics to selective state space models and introducing leakage-current inter-layer signaling, PonderNet adaptive timesteps, fused Triton PLIF kernels, residual centering, lateral inhibition normalization, and natural-gradient compensation, we show that pure SNN architectures can learn non-trivial language behavior from random initialization under limited training data.
+
+Beyond architectural feasibility, our interpretability analyses reveal that the trained model develops biologically plausible computational strategies: structure-driven (not difficulty-driven) resource allocation, hierarchical depth-dependent processing, multi-timescale neuron specialization, and a ``structure before semantics'' learning progression that parallels biological language acquisition.
+These findings suggest that SNN architectures may offer not only energy-efficiency potential but also a path toward more interpretable language models grounded in neuroscience principles.
 
 Code, weights, and training infrastructure are publicly available\footnote{Code: \url{https://github.com/Brain2nd/NeuronSpark}; HuggingFace: \url{https://huggingface.co/Brain2nd}; ModelScope: \url{https://modelscope.ai/organization/Brain2nd}.}.
 

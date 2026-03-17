@@ -375,8 +375,10 @@ Hardware & \multicolumn{2}{c}{8$\times$ NVIDIA RTX 4090} \\
 After SFT, the model demonstrates basic Chinese dialogue (translated; model outputs in Chinese):
 
 \begin{quote}
-\textbf{Q:} What is the capital of China? \quad \textbf{A:} The capital of China is Beijing.\\
-\textbf{Q:} Hello! \quad \textbf{A:} How can I help you?
+\begin{tabular}{@{}l l@{}}
+\textbf{Q:} What is the capital of China? & \textbf{A:} The capital of China is Beijing.\\
+\textbf{Q:} Hello! & \textbf{A:} How can I help you?
+\end{tabular}
 \end{quote}
 
 These observations suggest that a pure SNN architecture can support coherent language generation from random initialization, even under limited-data training.
@@ -563,5 +565,38 @@ Precision & bf16 & bf16 \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+\section{Biological Interpretability Analysis}
+\label{app:interpretability}
+
+We analyze the trained \model{}-0.9B-Chat model to examine whether its learned SNN dynamics exhibit linguistically and biologically meaningful patterns.
+All analyses are conducted on 40 Chinese sentences spanning science, daily life, education, economics, and complex multi-clause constructions.
+Figure~\ref{fig:interpretability} presents the four main findings.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/interpretability.png}
+    \caption{Biological interpretability analysis of \model{}-0.9B-Chat on Chinese text (token labels shown in pinyin transliteration).
+    \textbf{(a)}~Per-token E[K] for the sentence ``The capital of China is Beijing, located in the northern part of the North China Plain''; punctuation tokens (red) receive notably fewer SNN steps than content words.
+    \textbf{(b)}~E[K] grouped by part-of-speech category (jieba Chinese POS tagger, 40 test sentences); function words and punctuation allocate $\sim$0.7 fewer steps than nouns, verbs, and adjectives.
+    \textbf{(c)}~Per-layer E[K] for SNNBlock vs.\ SNNFFN; Block E[K] increases monotonically in deeper layers (up to 12.7 at L19), while FFN E[K] remains stable around 7--8.
+    \textbf{(d)}~Distribution of learned $\beta$ (membrane decay rate) across all 143,360 hidden neurons; 67.3\% are fast-responding ($\beta < 0.9$) and 32.7\% are slow-memory neurons.}
+    \label{fig:interpretability}
+\end{figure}
+
+\paragraph{Adaptive computation aligns with linguistic complexity.}
+Panel~(a) shows that PonderNet assigns systematically fewer SNN timesteps to punctuation (E[K]$\approx$5.7) and function words (E[K]$\approx$7.4) than to content words (nouns 8.0, verbs 8.0, adjectives 8.2).
+This pattern --- emerging without any explicit linguistic supervision --- mirrors the intuition that structurally predictable tokens require less neural computation.
+The BOS token receives the fewest steps (E[K]=3.2), consistent with it being a fixed sentinel requiring no contextual processing.
+
+\paragraph{Depth-dependent computation budget.}
+Panel~(c) reveals a striking asymmetry: SNNBlock E[K] increases monotonically with layer depth (from $\sim$4 at layer~2 to $\sim$12.7 at layer~19), while SNNFFN E[K] remains relatively flat ($\sim$7--8).
+This suggests that deeper layers require more SNN timesteps for the attention-analogue computation (SNNBlock) but not for the feed-forward transformation (SNNFFN).
+A possible interpretation is that deeper layers perform more complex contextual integration, requiring longer membrane-potential evolution, while the point-wise nonlinear transformation in SNNFFN saturates at a fixed computation depth.
+
+\paragraph{Multi-timescale neuron specialization.}
+Panel~(d) shows that the 143,360 hidden neurons self-organize into fast-responding ($\beta < 0.9$, 67.3\%) and slow-memory ($\beta \geq 0.9$, 32.7\%) populations.
+This is reminiscent of biological cortical circuits where fast-spiking interneurons coexist with regular-spiking pyramidal cells operating at different timescales.
+The distribution is unimodal with a long right tail, indicating that the model learns a continuum of timescales rather than a sharp dichotomy, with a preference for faster dynamics.
 
 \end{document}

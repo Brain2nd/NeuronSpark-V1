@@ -109,14 +109,51 @@ def classify_pos(flag):
 # ============================================================
 
 test_texts = [
+    # 科技
     "中国的首都是北京，位于华北平原的北部。",
     "人工智能是计算机科学的一个重要分支。",
-    "今天天气很好，我们去公园散步吧。",
     "深度学习在自然语言处理领域取得了显著进展。",
-    "数学是科学的基础，也是工程技术的重要工具。",
-    "春天来了，花儿开了，小鸟在树上唱歌。",
     "量子计算可能在未来改变密码学的格局。",
+    "机器学习算法可以从大量数据中自动发现规律。",
+    "神经网络的训练需要大量的计算资源和数据。",
+    "自动驾驶技术正在快速发展，但安全问题仍需解决。",
+    "云计算为企业提供了灵活的基础设施服务。",
+    "大数据分析帮助企业做出更好的商业决策。",
+    "物联网将各种设备连接到互联网，实现智能控制。",
+    # 日常
+    "今天天气很好，我们去公园散步吧。",
+    "春天来了，花儿开了，小鸟在树上唱歌。",
     "他喜欢读书，尤其是历史和哲学方面的著作。",
+    "这家餐厅的菜做得非常好吃，价格也很合理。",
+    "周末我们一家人去郊外野餐，孩子们玩得很开心。",
+    "早上起来先喝一杯温水，对身体有好处。",
+    "下雨了，记得带伞出门，注意安全。",
+    "图书馆里很安静，适合读书和学习。",
+    # 知识/教育
+    "数学是科学的基础，也是工程技术的重要工具。",
+    "地球围绕太阳运转，一年大约需要三百六十五天。",
+    "水在零度以下会结冰，在一百度以上会沸腾。",
+    "光速是宇宙中最快的速度，约为每秒三十万公里。",
+    "历史的发展是一个不断前进的过程。",
+    "教育是国家发展的根本，人才是最重要的资源。",
+    "读万卷书不如行万里路，实践出真知。",
+    # 社会/经济
+    "经济全球化促进了国际贸易的快速增长。",
+    "城市化进程加快，越来越多的人涌入大城市。",
+    "环境保护是全人类共同的责任和义务。",
+    "医疗技术的进步延长了人类的平均寿命。",
+    "互联网改变了人们的生活方式和工作方式。",
+    "文化交流有助于增进不同国家之间的相互理解。",
+    "可持续发展是当今世界面临的重要课题。",
+    # 长句/复杂句
+    "虽然这个项目面临很多困难，但是团队成员都非常努力，最终取得了成功。",
+    "随着科技的不断发展，人们的生活水平得到了显著提高，但同时也带来了一些新的问题。",
+    "在过去的几十年里，中国经济取得了举世瞩目的成就，成为世界第二大经济体。",
+    "人工智能不仅可以帮助我们解决复杂的问题，还可以提高工作效率和生活质量。",
+    "教育改革的目标是培养具有创新精神和实践能力的高素质人才。",
+    "全球气候变化已经成为影响人类生存和发展的重大挑战。",
+    "科学研究需要严谨的态度和坚持不懈的精神。",
+    "互联网的普及使得信息传播的速度和范围大大增加。",
 ]
 
 pos_ek = defaultdict(list)
@@ -196,11 +233,23 @@ for tok in example_tokens:
     else:
         colors_tok.append('#3498db')
 
+# Token labels: index + transliteration (no raw Chinese in figure)
+token_labels_en = [
+    'zhongguo-de', 'shou', 'du-shi', 'beijing',
+    ',', 'weiyu', 'hua', 'bei',
+    'ping', 'yuan', 'de', 'bei',
+    'bu', '.'
+]
+# pad or truncate to match
+while len(token_labels_en) < len(example_tokens):
+    token_labels_en.append(f't{len(token_labels_en)}')
+token_labels_en = token_labels_en[:len(example_tokens)]
+
 bars = ax1.bar(range(len(example_ek)), example_ek, color=colors_tok, alpha=0.8, edgecolor='white', linewidth=0.5)
 ax1.set_xticks(range(len(example_tokens)))
-ax1.set_xticklabels(example_tokens, rotation=45, ha='right', fontsize=8)
+ax1.set_xticklabels(token_labels_en, rotation=45, ha='right', fontsize=8)
 ax1.set_ylabel('E[K] (expected SNN steps)')
-ax1.set_title('(a) Per-Token E[K]: "' + test_texts[0][:12] + '..."')
+ax1.set_title('(a) Per-Token E[K]: "The capital of China is Beijing..."')
 ax1.axhline(y=np.mean(example_ek), color='gray', ls='--', alpha=0.5, label=f'mean={np.mean(example_ek):.1f}')
 ax1.legend()
 ax1.grid(axis='y', alpha=0.3)

@@ -115,7 +115,7 @@ def init_model(args, local_rank, rank):
     )
 
     device = torch.device(f"cuda:{local_rank}")
-    model = model.to(device)
+    model = model.to(device=device, dtype=torch.bfloat16)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f'SNN LM 总参数量：{total_params / 1e6:.3f} 百万', rank)
@@ -127,7 +127,7 @@ def init_model(args, local_rank, rank):
 # 训练循环
 # ============================================================
 
-def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
+def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
                 iter_per_epoch, tokens_seen, rank, world_size, dashboard=None):
     """训练一个 epoch（DDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
@@ -147,25 +147,28 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
 
-        # 前向传播
-        with ctx:
-            out = model(X, Y)
-            loss = out.last_loss / args.accumulation_steps
-            loss_mask_flat = loss_mask.view(-1)
-            loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
+        # no_sync: 非边界步跳过 all-reduce，节省通信
+        is_boundary = (step + 1) % args.accumulation_steps == 0
+        sync_ctx = nullcontext() if is_boundary else model.no_sync()
 
-        # 反向传播
-        scaler.scale(loss).backward()
+        with sync_ctx:
+            # 前向传播
+            with ctx:
+                out = model(X, Y)
+                loss = out.last_loss / args.accumulation_steps
+                loss_mask_flat = loss_mask.view(-1)
+                loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
 
-        # 梯度累积
-        if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
+            # 反向传播（bf16 不需要 GradScaler）
+            loss.backward()
+
+        # 梯度累积到边界步时更新
+        if is_boundary:
             # Natural Gradient: 补偿 b_beta/b_alpha 的 sigmoid/softplus 梯度衰减
             raw_model = model.module if isinstance(model, DDP) else model
             raw_model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
 
             # Dashboard
             if dashboard and is_main_process(rank):
@@ -212,7 +215,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             if is_main_process(rank):
                 model.eval()
                 global_step = epoch * iter_per_epoch + step + 1
-                save_checkpoint(args.save_dir, model, optimizer, scaler,
+                save_checkpoint(args.save_dir, model, optimizer, None,
                                 global_step, epoch, batch_loss, tokens_seen)
                 if dashboard:
                     raw_model = model.module if isinstance(model, DDP) else model
@@ -246,7 +249,6 @@ if __name__ == "__main__":
     parser.add_argument("--out_dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=8, help="每卡 batch size")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=512)
 
@@ -284,15 +286,15 @@ if __name__ == "__main__":
     # 种子：每卡不同（保证数据不同），但可复现
     torch.manual_seed(42 + rank)
 
-    # 混合精度
-    ctx = torch.amp.autocast('cuda',
-                             dtype=torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16)
+    # bf16 autocast（模型已是 bf16，autocast 确保中间计算也是 bf16）
+    ctx = torch.amp.autocast('cuda', dtype=torch.bfloat16)
 
     # ==================== 模型初始化 ====================
     model, tokenizer, device = init_model(args, local_rank, rank)
 
-    # DDP 包装
-    model = DDP(model, device_ids=[local_rank])
+    # DDP 包装（gradient_as_bucket_view 复用通信 buffer 省显存）
+    model = DDP(model, device_ids=[local_rank],
+                gradient_as_bucket_view=True)
 
     # ==================== 数据加载 ====================
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_length)
@@ -310,8 +312,6 @@ if __name__ == "__main__":
     )
 
     # ==================== 优化器 ====================
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
-
     # 通过 .module 访问原始模型方法
     _pg = model.module.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
@@ -329,7 +329,7 @@ if __name__ == "__main__":
     start_epoch = 0
     if args.resume:
         start_step, start_epoch, best_loss, tokens_seen = load_checkpoint(
-            args.resume, model, optimizer, scaler, device,
+            args.resume, model, optimizer, None, device,
         )
 
     # ==================== 训练信息 ====================
@@ -349,7 +349,7 @@ if __name__ == "__main__":
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})", rank)
     Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)", rank)
     Logger(f"  Grad clip:   {args.grad_clip}", rank)
-    Logger(f"  Precision:   {args.dtype}", rank)
+    Logger(f"  Precision:   bfloat16", rank)
     Logger(f"  Save every:  {args.save_interval} steps", rank)
     mem_baseline = torch.cuda.memory_allocated() / 1e9
     Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline (GPU {local_rank})", rank)
@@ -367,7 +367,7 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         model.train()
         tokens_seen = train_epoch(
-            epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
+            epoch, model, train_loader, sampler, optimizer, ctx, args,
             iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
         )
 
@@ -378,7 +378,7 @@ if __name__ == "__main__":
     if is_main_process(rank):
         Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}", rank)
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
-        save_checkpoint(args.save_dir, model, optimizer, scaler,
+        save_checkpoint(args.save_dir, model, optimizer, None,
                         args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
 
     cleanup_distributed()

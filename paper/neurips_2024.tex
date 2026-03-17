@@ -602,6 +602,28 @@ This is consistent with biological findings that neural processing effort correl
     \label{fig:surprisal}
 \end{figure}
 
+\paragraph{Reasoning capability assessment.}
+To further characterize what the model has and has not learned, we test on 28 questions across four categories: arithmetic (8), logical reasoning (6), commonsense (8), and dialogue coherence (6).
+Figure~\ref{fig:reasoning} summarizes the results.
+
+The model achieves \textbf{0\% on arithmetic} (unable to perform any calculation), \textbf{25\% on commonsense} (mostly coincidental keyword matches), and \textbf{83\% on logic} (though inspection reveals many ``correct'' answers arise from the expected keyword appearing in repetitive output rather than genuine inference).
+By contrast, \textbf{all 6 coherence tests produce fluent, grammatical Chinese responses}, confirming that the model has acquired surface-level language generation ability.
+
+Critically, panel~(b) shows that \textbf{E[K] is flat ($\sim$7.6) across all categories}, regardless of task difficulty.
+The model does not allocate additional SNN computation for harder reasoning tasks, further confirming that PonderNet's adaptive computation is driven by structural token properties (Section~\ref{sec:leakage}) rather than semantic reasoning demands.
+
+These results are consistent with the limited training budget: the model has learned structural language patterns (fluency, POS-dependent computation) but has not yet acquired the factual knowledge or compositional reasoning that would require substantially more training data.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{figures/reasoning_test.png}
+    \caption{Reasoning capability assessment (28 questions).
+    \textbf{(a)}~Accuracy by category: arithmetic 0\%, logic 83\% (superficial), commonsense 25\%, coherence 6/6.
+    \textbf{(b)}~E[K] and surprisal are flat across categories, indicating no adaptive computation increase for harder tasks.
+    The model has learned structural language patterns but not reasoning.}
+    \label{fig:reasoning}
+\end{figure}
+
 \paragraph{Adaptive computation aligns with linguistic complexity.}
 Panel~(a) shows that PonderNet assigns systematically fewer SNN timesteps to punctuation (E[K]$\approx$5.7) and function words (E[K]$\approx$7.4) than to content words (nouns 8.0, verbs 8.0, adjectives 8.2).
 This pattern --- emerging without any explicit linguistic supervision --- mirrors the intuition that structurally predictable tokens require less neural computation.

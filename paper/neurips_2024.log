@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.3.16)  16 MAR 2026 21:16
+This is pdfTeX, Version 3.141592653-2.6-1.40.29 (TeX Live 2026) (preloaded format=pdflatex 2026.3.16)  16 MAR 2026 22:18
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -613,8 +613,14 @@ File: figures/surprisal_vs_ek.png Graphic file (type png)
 <use figures/surprisal_vs_ek.png>
 Package pdftex.def Info: figures/surprisal_vs_ek.png  used on input line 598.
 (pdftex.def)             Requested size: 397.48499pt x 148.7474pt.
- [13 <./figures/interpretability.png>] [14 <./figures/surprisal_vs_ek.png>]
-(./neurips_2024.aux)
+ [13 <./figures/interpretability.png>]
+<figures/reasoning_test.png, id=551, 858.5676pt x 317.5062pt>
+File: figures/reasoning_test.png Graphic file (type png)
+<use figures/reasoning_test.png>
+Package pdftex.def Info: figures/reasoning_test.png  used on input line 619.
+(pdftex.def)             Requested size: 397.48499pt x 146.98964pt.
+ [14 <./figures/surprisal_vs_ek.png> <./figures/reasoning_test.png>] [15] (./ne
+urips_2024.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2026-01-19>
@@ -623,10 +629,10 @@ Package rerunfilecheck Info: File `neurips_2024.out' has not changed.
 (rerunfilecheck)             Checksum: D04C37944A10C8ABD6F7913AB7AD359A;5099.
  ) 
 Here is how much of TeX's memory you used:
- 13801 strings out of 467525
- 214772 string characters out of 5418982
- 644345 words of memory out of 5000000
- 42340 multiletter control sequences out of 15000+600000
+ 13812 strings out of 467525
+ 215052 string characters out of 5418982
+ 644710 words of memory out of 5000000
+ 42348 multiletter control sequences out of 15000+600000
  690364 words of font info for 112 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
  75i,14n,79p,1622b,607s stack positions out of 10000i,1000n,20000p,200000b,200000s
@@ -652,10 +658,10 @@ xmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/local/texlive/2026/texmf-dist/f
 onts/type1/urw/times/utmr8a.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1
 /urw/times/utmri8a.pfb></usr/local/texlive/2026/texmf-dist/fonts/type1/urw/zapf
 ding/uzdr.pfb>
-Output written on neurips_2024.pdf (14 pages, 2102951 bytes).
+Output written on neurips_2024.pdf (15 pages, 2172444 bytes).
 PDF statistics:
- 682 PDF objects out of 1000 (max. 8388607)
- 488 compressed objects within 5 object streams
- 143 named destinations out of 1000 (max. 500000)
- 242 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 694 PDF objects out of 1000 (max. 8388607)
+ 497 compressed objects within 5 object streams
+ 146 named destinations out of 1000 (max. 500000)
+ 247 words of extra memory for PDF output out of 10000 (max. 10000000)
 

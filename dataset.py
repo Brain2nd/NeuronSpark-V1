@@ -1,42 +1,61 @@
 import json
-import random
-import re
-import pandas as pd
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-import torch
 import os
 
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+
 class PretrainDataset(Dataset):
-    def __init__(self, data_path, tokenizer, max_length=512):
+    """预训练数据集，支持 JSONL 和 HF Datasets (Arrow/Parquet) 两种格式。
+
+    格式自动判断：
+      - 目录路径 → HF Datasets (load_from_disk)
+      - .jsonl 文件 → byte-offset 随机访问 JSONL
+    """
+
+    def __init__(self, data_path, tokenizer, max_length=2048):
         super().__init__()
-        self.data_path = data_path
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = 0
-        # 预计算每行的起始字节偏移量
-        self._offsets = []
-        with open(data_path, 'rb') as f:
-            self._offsets.append(0)
-            while f.readline():
-                self._offsets.append(f.tell())
-        self._total_lines = len(self._offsets) - 1  # 最后一个 tell() 是 EOF
+
+        if os.path.isdir(data_path):
+            # HF Datasets Arrow 格式
+            from datasets import load_from_disk
+            self._hf_dataset = load_from_disk(data_path)
+            self._mode = 'hf'
+        else:
+            # JSONL 格式（向后兼容）
+            self._hf_dataset = None
+            self._mode = 'jsonl'
+            self.data_path = data_path
+            self._offsets = []
+            with open(data_path, 'rb') as f:
+                self._offsets.append(0)
+                while f.readline():
+                    self._offsets.append(f.tell())
+            self._total_lines = len(self._offsets) - 1
 
     def __len__(self):
+        if self._mode == 'hf':
+            return len(self._hf_dataset)
         return self._total_lines
 
     def __getitem__(self, index: int):
-        with open(self.data_path, 'rb') as f:
-            f.seek(self._offsets[index])
-            line = f.readline().decode('utf-8')
-        sample = json.loads(line)
-        text = f"{self.tokenizer.bos_token}{sample['text']}"
+        if self._mode == 'hf':
+            text_raw = self._hf_dataset[index]['text']
+        else:
+            with open(self.data_path, 'rb') as f:
+                f.seek(self._offsets[index])
+                line = f.readline().decode('utf-8')
+            text_raw = json.loads(line)['text']
+
+        text = f"{self.tokenizer.bos_token}{text_raw}"
         input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
         text_len = len(input_id)
-        # 没满最大长度的剩余部分
         padding_len = self.max_length - text_len
         input_id = input_id + [self.padding] * padding_len
-        # 0表示不计算损失
         loss_mask = [1] * text_len + [0] * padding_len
 
         input_id = np.array(input_id)

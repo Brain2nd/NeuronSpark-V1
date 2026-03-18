@@ -194,8 +194,8 @@ if __name__ == "__main__":
     parser.add_argument('--vocab_size', type=int, default=6144)
     parser.add_argument('--D', type=int, default=1024)
     parser.add_argument('--N', type=int, default=8)
-    parser.add_argument('--K', type=int, default=32)
-    parser.add_argument('--num_layers', type=int, default=20)
+    parser.add_argument('--K', type=int, default=12)
+    parser.add_argument('--num_layers', type=int, default=24)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
     parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
@@ -216,7 +216,7 @@ if __name__ == "__main__":
                         default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--max_length", type=int, default=2048)
 
     # 优化参数（SFT 默认更低的 lr）
     parser.add_argument('--learning_rate', type=float, default=5e-5,

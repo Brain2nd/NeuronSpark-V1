@@ -416,8 +416,8 @@ if __name__ == "__main__":
     parser.add_argument('--vocab_size', type=int, default=6144)
     parser.add_argument('--D', type=int, default=1024)
     parser.add_argument('--N', type=int, default=8)
-    parser.add_argument('--K', type=int, default=32)
-    parser.add_argument('--num_layers', type=int, default=20)
+    parser.add_argument('--K', type=int, default=12)
+    parser.add_argument('--num_layers', type=int, default=24)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
     parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
@@ -428,7 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4, help="每卡 batch size")
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--max_length", type=int, default=512)
+    parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--prefetch_factor", type=int, default=2,
                         help="DataLoader prefetch_factor")
 

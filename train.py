@@ -259,8 +259,8 @@ if __name__ == "__main__":
     parser.add_argument('--vocab_size', type=int, default=6144, help='词表大小')
     parser.add_argument('--D', type=int, default=1024, help='隐层维度')
     parser.add_argument('--N', type=int, default=8, help='状态扩展因子')
-    parser.add_argument('--K', type=int, default=32, help='每 token 最大 SNN 时间步数（K_max），PonderNet 动态决定有效步数')
-    parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
+    parser.add_argument('--K', type=int, default=12, help='每 token 最大 SNN 时间步数（K_max），PonderNet 动态决定有效步数')
+    parser.add_argument('--num_layers', type=int, default=24, help='SNN 解码层数')
     parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
     parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
@@ -275,7 +275,7 @@ if __name__ == "__main__":
                         help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型（对齐教程）")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载的工作进程数")
-    parser.add_argument("--max_length", type=int, default=512, help="最大序列长度")
+    parser.add_argument("--max_length", type=int, default=2048, help="最大序列长度")
 
     # 训练优化参数（对齐教程）
     parser.add_argument('--learning_rate', type=float, default=2e-4, help='学习率（对齐教程）')

@@ -1,5 +1,9 @@
 # NeuronSpark — SNN Hidden State Space Language Model
 
+[![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
+
+**NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**
+
 一个**完全基于脉冲神经网络 (SNN)** 构建的语言模型。隐层神经元的动态参数 β(t), α(t), V_th(t) 作为输入依赖的调制信号，实现选择性信息过滤。**整个网络是纯 SNN —— 不包含任何标准 ANN 组件**。
 
 ## 模型下载
@@ -67,16 +71,16 @@ A: 中国的首都在北京。
 ## 核心架构
 
 ```
-token → Embedding(D=1024) → repeat K=32 帧
-  → L=20 × SNNDecoderLayer:
-      RMSNorm(h) → PLIFNode(V_post) → SNNBlock → PonderNet动态K聚合 → out_proj → 残差
-      RMSNorm(h) → PLIFNode(V_post) → SNNFFN  → PonderNet动态K聚合 → out_proj → 残差
-  → RMSNorm → PLIFNode(V_post) → K帧mean → decode_proj → LateralInhibition → Embedding^T (tied) → logits
+token → Embedding(D=1024) → repeat K=12 帧
+  → L=24 × SNNDecoderLayer:
+      RMSNorm(h) → PLIFNode(leak) → SNNBlock → PonderNet动态K聚合 → out_proj → 残差
+      RMSNorm(h) → PLIFNode(leak) → SNNFFN  → PonderNet动态K聚合 → out_proj → 残差
+  → RMSNorm → PLIFNode(leak) → K帧mean → decode_proj → LateralInhibition → Embedding^T (tied) → logits
 ```
 
 ### 架构要点
 
-- **全膜电位输出**: 所有神经元输出 V_post（连续膜电位），层间传递连续值
+- **膜电位泄漏量输出**: 所有神经元输出 (1-β)·V_post（泄漏量），隐式时间尺度加权，支持 V1(V_post)/V2(泄漏量) 模式切换
 - **动态 K (PonderNet)**: 每层每子层学习停止概率，几何分布加权聚合 K 帧，不同 token 有效步数 ∈ [1, K_max]
 - **基础神经元**: PLIF (Parametric LIF)，动态 β(t), α(t), V_th(t) 由调制网络生成
 - **连续残差流**: 层间传递连续值 h，仅 SNN 子层内部使用 spike，解决深层梯度消失
@@ -126,12 +130,12 @@ token → Embedding(D=1024) → repeat K=32 帧
 | 参数 | happy-llm (LLaMA2) | NeuronSpark (SNN) |
 |------|-------------------|-------------------|
 | 架构 | Transformer (Attention + MLP) | SNN (SNNBlock + SNNFFN) |
-| 参数量 | 215M | 874M |
+| 参数量 | 215M | 1.37B |
 | 隐藏维度 | 1024 | 1024 |
-| 层数 | 18 | 20 |
+| 层数 | 18 | 24 |
 | 词表 | 6144 | 6144 |
-| 序列长度 | 512 | 512 |
-| SNN 时间步 K | — | 32 (PonderNet 动态) |
+| 序列长度 | 512 | 2048 |
+| SNN 时间步 K | — | 12 (PonderNet 动态) |
 | 优化器 | Adam | Adam |
 | 学习率 | 2e-4 | 2e-4 |
 | LR 调度 | Warmup + Cosine | Warmup + Cosine |
@@ -365,8 +369,8 @@ python generate_sample.py \
 |------|--------|------|
 | `--D` | 1024 | 隐藏维度 |
 | `--N` | 8 | 神经元分组数（状态扩展因子） |
-| `--K` | 32 | 每 token 最大 SNN 时间步（PonderNet 动态决定有效步数） |
-| `--num_layers` | 20 | SNN 解码层数 |
+| `--K` | 12 | 每 token 最大 SNN 时间步（PonderNet 动态决定有效步数） |
+| `--num_layers` | 24 | SNN 解码层数 |
 | `--D_ff` | 3072 | FFN 中间维度 (通常 3×D) |
 | `--vocab_size` | 6144 | 词表大小 |
 
@@ -431,11 +435,15 @@ Step 6: 推理生成
 NeuronSpark/
 ├── model.py                        # SNNLanguageModel (三段式 encode/snn_forward/decode + generate)
 ├── train.py                        # 预训练脚本-单卡 (对齐 happy-llm ddp_pretrain.py)
-├── train_ddp.py                    # 预训练脚本-多卡 DDP (torchrun)
+├── train_ddp.py                    # 预训练脚本-多卡 DDP (torchrun, bf16, no_sync)
+├── train_fsdp.py                   # 预训练脚本-多卡 FSDP (全分片数据并行)
 ├── sft.py                          # SFT 微调脚本-单卡 (对齐 happy-llm ddp_sft_full.py)
 ├── sft_ddp.py                      # SFT 微调脚本-多卡 DDP
 ├── generate_sample.py              # 推理生成脚本 (对齐 happy-llm model_sample.py)
 ├── dataset.py                      # 数据集加载 (对齐 happy-llm dataset.py)
+├── checkpoint_utils.py             # Checkpoint 工具 (HF safetensors 格式保存/加载)
+├── dashboard.py                    # TensorBoard 训练看板 (参数/梯度/神经元动力学监控)
+├── convert_to_leakage.py           # V1→V2 权重适配工具 (V_post → 泄漏量激活)
 ├── atomic_ops/                     # SNN 核心算子（独创）
 │   ├── __init__.py
 │   ├── selective_plif.py           # SelectivePLIFNode: 动态参数 PLIF 神经元
@@ -480,19 +488,20 @@ NeuronSpark/
 
 | 参数 | 值 |
 |------|-----|
-| 参数量 | 874M |
+| 参数量 | 1.37B |
 | D (隐藏维度) | 1024 |
 | N (神经元分组) | 8 |
-| K (最大 SNN 步数) | 32 (PonderNet 动态决定有效步数) |
-| Layers | 20 |
+| K (最大 SNN 步数) | 12 (PonderNet 动态决定有效步数) |
+| Layers | 24 |
 | D_ff (FFN 维度) | 3072 |
 | Vocab | 6144 |
-| 序列长度 | 512 |
-| Batch size | 8 × accum 8 = 64 effective |
-| 学习率 | 2e-4 (warmup 1000 → cosine → 2e-5) |
+| 序列长度 | 2048 |
+| 激活模式 | V2 ((1-β)·V_post 泄漏量) |
+| Batch size | 1/gpu × 4 gpus × accum 32 = 128 effective |
+| 学习率 | 2e-4 (warmup 500 → cosine → 2e-5) |
 | 精度 | bfloat16 |
 | 数据集 | Seq-Monkey (29M 样本) |
-| 硬件 | NVIDIA GB10 (DGX Spark, 128GB 统一内存) |
+| 硬件 | 4 × NVIDIA RTX 4090D (48GB) DDP |
 
 ## 环境
 
@@ -502,6 +511,17 @@ conda activate SNN
 # 数据下载: modelscope, huggingface_hub
 # 硬件: NVIDIA GPU (推荐 Blackwell/Ampere 架构, 24GB+ 显存)
 # DGX Spark 需配置: export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+```
+
+## Citation
+
+```bibtex
+@article{tang2025neuronspark,
+  title={NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics},
+  author={Tang, Zhengzheng},
+  journal={arXiv preprint arXiv:2603.16148},
+  year={2025}
+}
 ```
 
 ## License

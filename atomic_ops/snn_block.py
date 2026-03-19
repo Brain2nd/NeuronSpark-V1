@@ -65,6 +65,17 @@ class SNNBlock(base.MemoryModule):
         self.v_th_min = v_th_min
         DN = D * N
 
+        # ====== 因果卷积：局部上下文预混合（参考 Qwen3.5 GatedDeltaNet） ======
+        self.conv_kernel_size = 4
+        self.conv1d = nn.Conv1d(
+            in_channels=D,
+            out_channels=D,
+            kernel_size=self.conv_kernel_size,
+            groups=D,  # 深度卷积
+            padding=self.conv_kernel_size - 1,  # causal padding
+            bias=False,
+        )
+
         # ====== 六条并行输入投影（SNN 突触：spike 输入） ======
         self.W_in = layer.Linear(D, DN, bias=False, step_mode='s')
         self.W_beta_x = layer.Linear(D, DN, bias=False, step_mode='s')
@@ -97,8 +108,9 @@ class SNNBlock(base.MemoryModule):
         D, N = self.D, self.N
         K_ref = 16
 
-        # 目标 β 分布：多时间尺度 [0.80, 0.99]
-        beta_values = torch.linspace(0.80, 0.99, N)
+        # 目标 β 分布：多时间尺度 [0.80, 0.9999]
+        # 最后几组为长程记忆通道 (β>0.999, L_eff>1000 帧 ≈ 83 token)
+        beta_values = torch.linspace(0.80, 0.9999, N)
 
         # ====== 1. β 偏置：logit-spaced + 维度间随机扰动 ======
         b_beta_per_n = torch.log(beta_values / (1.0 - beta_values))
@@ -133,7 +145,7 @@ class SNNBlock(base.MemoryModule):
         sigma_V_per_n = sigma_I_base * torch.sqrt(
             1.0 - beta_values ** (2 * K_ref)
         )
-        target_p_fire = torch.linspace(0.25, 0.08, N)
+        target_p_fire = torch.linspace(0.25, 0.05, N)
         z_scores = math.sqrt(2.0) * torch.erfinv(
             2.0 * (1.0 - target_p_fire) - 1.0
         )
@@ -162,6 +174,11 @@ class SNNBlock(base.MemoryModule):
         """
         TK, batch, D = spike_in_seq.shape
         DN = self.D * self.N
+
+        # ====== Phase 0: 因果卷积预混合（局部上下文） ======
+        conv_in = spike_in_seq.permute(1, 2, 0)  # (batch, D, TK)
+        conv_out = self.conv1d(conv_in)[:, :, :TK]  # causal: 截断未来
+        spike_in_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
 
         # ====== Phase 1: 批量投影（全部 TK 帧同时计算）======
         flat = spike_in_seq.reshape(TK * batch, D)

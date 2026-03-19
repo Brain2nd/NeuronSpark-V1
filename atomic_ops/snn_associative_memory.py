@@ -34,6 +34,21 @@ from .rms_norm import RMSNorm
 from .parallel_scan import plif_rowparam_forward
 
 
+def _precompute_rope_freqs(dim, max_seq_len=8192, base=10000.0):
+    """预计算 RoPE 的 cos/sin 频率表。"""
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len)
+    freqs = torch.outer(t, freqs)
+    return freqs.cos(), freqs.sin()
+
+
+def _apply_rope(x, cos, sin):
+    """对 q 或 k 应用 RoPE 旋转位置编码。x: (..., dim)"""
+    d = x.shape[-1]
+    x1, x2 = x[..., :d // 2], x[..., d // 2:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
 class SNNAssociativeMemoryLayer(base.MemoryModule):
     """
     SNN 联想记忆层 — 无衰减累积 + content-based 分离。
@@ -53,6 +68,8 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         D_key: int = 64,
         D_value: int = 64,
         K: int = 12,
+        max_seq_len: int = 8192,
+        rope_base: float = 10000.0,
         num_layers: int = 1,
         activation_mode: str = 'v2',
     ):
@@ -62,6 +79,12 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         self.D_value = D_value
         self.K = K
         self.activation_mode = activation_mode
+
+        # RoPE 预计算（D_key 必须为偶数）
+        assert D_key % 2 == 0, f"D_key must be even for RoPE, got {D_key}"
+        rope_cos, rope_sin = _precompute_rope_freqs(D_key, max_seq_len, rope_base)
+        self.register_buffer('rope_cos', rope_cos, persistent=False)
+        self.register_buffer('rope_sin', rope_sin, persistent=False)
 
         # 输入归一化
         self.norm = RMSNorm(D)
@@ -117,6 +140,12 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         q = q.reshape(seq_len, batch, self.D_key)
         k = k.reshape(seq_len, batch, self.D_key)
         v = v.reshape(seq_len, batch, self.D_value)
+
+        # ====== RoPE: 旋转位置编码应用于 q, k ======
+        rope_cos = self.rope_cos[:seq_len].unsqueeze(1)  # (seq_len, 1, D_key//2)
+        rope_sin = self.rope_sin[:seq_len].unsqueeze(1)  # (seq_len, 1, D_key//2)
+        q = _apply_rope(q, rope_cos, rope_sin)
+        k = _apply_rope(k, rope_cos, rope_sin)
 
         # PLIFNode gate: 连续泄漏量输出，跨 token 累积动力学
         gate_input = h_normed  # (seq_len, batch, D)

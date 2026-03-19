@@ -47,21 +47,52 @@ for perm in itertools.permutations(_neuron_keys_list):
         print(f"\nFOUND: {perm}")
         found = True
 
-        # 重建正确的 optimizer 并保存修复后的 training_state
+        # 用找到的 perm 顺序加载 state 到临时 optimizer（验证可加载）
         from torch.optim import Adam
         all_other = [p for k, ps in _pg.items() if k not in set(_neuron_keys_list) for p in ps]
-        all_neuron = neuron_params
-        opt = Adam([
+        all_neuron_old_order = neuron_params  # perm 顺序
+        opt_old = Adam([
             {"params": all_other, "lr": 2e-4, "lr_mult": 1.0},
-            {"params": all_neuron, "lr": 2e-3, "lr_mult": 10.0},
+            {"params": all_neuron_old_order, "lr": 2e-3, "lr_mult": 10.0},
         ])
-        opt.load_state_dict(saved_state)
-        print("Optimizer state loaded successfully!")
+        opt_old.load_state_dict(saved_state)
+        print("Optimizer state loaded with original order!")
 
-        # 保存修复后的 training_state
-        ts["optimizer_state"] = opt.state_dict()
+        # 重新用 tuple 固定顺序创建 optimizer，逐参数迁移 state
+        _neuron_keys_tuple = ("input_neurons", "b_beta", "b_alpha", "b_th",
+                              "block_output_neuron", "ffn_neurons", "output_neuron")
+        all_neuron_new_order = [p for k in _neuron_keys_tuple for p in _pg[k]]
+        opt_new = Adam([
+            {"params": all_other, "lr": 2e-4, "lr_mult": 1.0},
+            {"params": all_neuron_new_order, "lr": 2e-3, "lr_mult": 10.0},
+        ])
+        # 做一步 dummy 让 opt_new 初始化 state 结构
+        for p in list(all_other) + list(all_neuron_new_order):
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+        opt_new.step()
+        opt_new.zero_grad()
+
+        # 用 param data_ptr 做映射：old optimizer 的 state → new optimizer
+        old_ptr_to_state = {}
+        for pg in opt_old.param_groups:
+            for p in pg["params"]:
+                if p.data_ptr() in dict(opt_old.state):
+                    pass
+                st = opt_old.state.get(p, None)
+                if st is not None:
+                    old_ptr_to_state[p.data_ptr()] = st
+
+        for pg in opt_new.param_groups:
+            for p in pg["params"]:
+                old_st = old_ptr_to_state.get(p.data_ptr())
+                if old_st is not None:
+                    opt_new.state[p] = old_st
+
+        # 保存修复后的 training_state（tuple 顺序）
+        ts["optimizer_state"] = opt_new.state_dict()
         torch.save(ts, "checkpoints/ckpt_step9000/training_state.pth")
-        print("Fixed training_state.pth saved!")
+        print("Fixed training_state.pth saved (tuple order)!")
         break
 
 if not found:

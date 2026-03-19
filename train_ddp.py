@@ -117,8 +117,14 @@ def init_model(args, local_rank, rank):
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device=device, dtype=torch.bfloat16)
 
+    # 神经元参数提升到 fp32（b_beta/b_alpha/b_th/PLIFNode.w/v_th 梯度小，bf16 会截断更新）
+    for name, param in model.named_parameters():
+        if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+            param.data = param.data.float()
+
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    Logger(f'SNN LM 总参数量：{total_params / 1e6:.3f} 百万', rank)
+    fp32_count = sum(p.numel() for p in model.parameters() if p.dtype == torch.float32)
+    Logger(f'SNN LM 总参数量：{total_params / 1e6:.3f} 百万 (fp32: {fp32_count / 1e6:.3f}M)', rank)
 
     return model, tokenizer, device
 

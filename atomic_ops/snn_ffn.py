@@ -108,6 +108,7 @@ class SNNFFN(base.MemoryModule):
             continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出
         """
         TK, batch, D = spike_in_seq.shape
+        input_dtype = spike_in_seq.dtype
         D_ff = self.D_ff
         flat = spike_in_seq.reshape(TK * batch, D)
 
@@ -163,7 +164,7 @@ class SNNFFN(base.MemoryModule):
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
         # output_neuron 已移除：连续值由层级 K 帧聚合处理
-        return I_out  # (TK, batch, D), 连续值
+        return I_out.to(input_dtype)  # (TK, batch, D), 连续值
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """

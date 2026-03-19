@@ -185,13 +185,14 @@ class SNNLanguageModel(nn.Module):
             leak: (TK, batch, D) 膜电位泄漏量 (1-β)·V_post
         """
         TK, batch, D = h.shape
+        input_dtype = h.dtype
 
         beta = self.output_neuron.beta  # (D,)
         u = (1.0 - beta) * h  # PLIF: u = (1-β) · x
 
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=h.device, dtype=h.dtype)
+            v_init = torch.zeros(batch, D, device=h.device, dtype=u.dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
@@ -203,8 +204,8 @@ class SNNLanguageModel(nn.Module):
 
         self.output_neuron.v = V_post[-1].detach()
         if self.activation_mode == 'v2':
-            return (1.0 - beta) * V_post  # 膜电位泄漏量
-        return V_post  # 膜电位
+            return ((1.0 - beta) * V_post).to(input_dtype)
+        return V_post.to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

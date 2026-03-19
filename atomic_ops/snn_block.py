@@ -175,7 +175,8 @@ class SNNBlock(base.MemoryModule):
         DN = self.D * self.N
 
         # ====== Phase 0: 因果卷积预混合（局部上下文） ======
-        conv_in = spike_in_seq.permute(1, 2, 0)  # (batch, D, TK)
+        conv_dtype = self.conv1d.weight.dtype
+        conv_in = spike_in_seq.to(conv_dtype).permute(1, 2, 0)  # (batch, D, TK)
         conv_out = self.conv1d(conv_in)[:, :, :TK]  # causal: 截断未来
         spike_in_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
 

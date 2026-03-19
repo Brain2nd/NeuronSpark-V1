@@ -130,12 +130,13 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
     def _input_neuron_parallel(self, input_neuron, x):
         """PLIFNode parallel scan, 返回激活值。复用 SNNDecoderLayer 的逻辑。"""
         TK, batch, D = x.shape
+        input_dtype = x.dtype
         beta = input_neuron.beta
         u = (1.0 - beta) * x
 
         v_init = input_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=x.device, dtype=x.dtype)
+            v_init = torch.zeros(batch, D, device=x.device, dtype=u.dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
@@ -146,18 +147,19 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         )
         input_neuron.v = V_post[-1].detach()
         if self.activation_mode == 'v2':
-            return (1.0 - beta) * V_post
-        return V_post
+            return ((1.0 - beta) * V_post).to(input_dtype)
+        return V_post.to(input_dtype)
 
     def _gate_neuron_parallel(self, h_normed):
         """PLIFNode gate 的 parallel scan, 返回标量门控。"""
         seq_len, batch, D = h_normed.shape
+        input_dtype = h_normed.dtype
         beta_g = self.gate_neuron.beta
         u_g = (1.0 - beta_g) * h_normed
 
         v_init_g = self.gate_neuron.v
         if isinstance(v_init_g, float):
-            v_init_g = torch.zeros(batch, D, device=h_normed.device, dtype=h_normed.dtype)
+            v_init_g = torch.zeros(batch, D, device=h_normed.device, dtype=u_g.dtype)
 
         beta_row = beta_g.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.gate_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
@@ -167,8 +169,8 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
             surrogate_function=self.gate_neuron.surrogate_function,
         )
         self.gate_neuron.v = V_post_g[-1].detach()
-        gate_activation = (1.0 - beta_g) * V_post_g  # (seq_len, batch, D)
-        return gate_activation.mean(dim=-1, keepdim=True)  # (seq_len, batch, 1)
+        gate_activation = (1.0 - beta_g) * V_post_g
+        return gate_activation.mean(dim=-1, keepdim=True).to(input_dtype)
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """复用 SNNDecoderLayer 的 PonderNet 聚合。"""

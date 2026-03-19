@@ -180,6 +180,7 @@ class SNNDecoderLayer(base.MemoryModule):
             leak: (TK, batch, D) — 膜电位泄漏量 (1-β)·V_post
         """
         TK, batch, D = x.shape
+        input_dtype = x.dtype  # 记录输入 dtype，输出保持一致
 
         beta = input_neuron.beta  # (D,)
         u = (1.0 - beta) * x  # (D,) broadcast → (TK, batch, D)
@@ -198,8 +199,8 @@ class SNNDecoderLayer(base.MemoryModule):
 
         input_neuron.v = V_post[-1].detach()
         if self.activation_mode == 'v2':
-            return (1.0 - beta) * V_post  # 膜电位泄漏量
-        return V_post  # 膜电位
+            return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
+        return V_post.to(input_dtype)  # 膜电位
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """

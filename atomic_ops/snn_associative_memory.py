@@ -27,9 +27,11 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base
+from spikingjelly.activation_based import base, surrogate
 
+from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
+from .parallel_scan import plif_rowparam_forward
 
 
 class SNNAssociativeMemoryLayer(base.MemoryModule):
@@ -67,8 +69,13 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         # 投影: D → q(D_key) + k(D_key) + v(D_value)
         self.qkv_proj = nn.Linear(D, D_key * 2 + D_value, bias=False)
 
-        # 写入门控 (初始化偏负 → 大部分 token 不写入)
-        self.gate_proj = nn.Linear(D, 1, bias=True)
+        # 写入门控: PLIFNode (SNN 神经元驱动，输出连续泄漏量)
+        self.gate_neuron = PLIFNode(
+            dim=D,
+            init_tau=2.0,
+            v_threshold=0.8,  # 高阈值 → 选择性写入
+            surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        )
 
         # 输出归一化 + 投影
         self.out_norm = RMSNorm(D_value)
@@ -83,9 +90,7 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         nn.init.xavier_uniform_(self.qkv_proj.weight)
         std = 0.02 / math.sqrt(2 * num_layers)
         nn.init.normal_(self.out_proj.weight, std=std)
-        nn.init.constant_(self.gate_proj.bias, -2.0)
-        nn.init.xavier_uniform_(self.gate_proj.weight)
-        self.gate_proj.weight.data.mul_(0.01)
+        # gate_neuron 参数由 PLIFNode 自初始化
 
     def forward_parallel(self, h):
         """
@@ -113,7 +118,25 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         k = k.reshape(seq_len, batch, self.D_key)
         v = v.reshape(seq_len, batch, self.D_value)
 
-        gate = torch.sigmoid(self.gate_proj(flat)).reshape(seq_len, batch, 1)
+        # PLIFNode gate: 连续泄漏量输出，跨 token 累积动力学
+        gate_input = h_normed  # (seq_len, batch, D)
+        beta_g = self.gate_neuron.beta
+        u_g = (1.0 - beta_g) * gate_input
+
+        v_init_g = self.gate_neuron.v
+        if isinstance(v_init_g, float):
+            v_init_g = torch.zeros(batch, D, device=h.device, dtype=h.dtype)
+
+        beta_row_g = beta_g.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row_g = self.gate_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+
+        _, V_post_g = plif_rowparam_forward(
+            beta_row_g, u_g, v_th_row_g, v_init_g,
+            surrogate_function=self.gate_neuron.surrogate_function,
+        )
+        self.gate_neuron.v = V_post_g[-1].detach()
+        gate_activation = (1.0 - beta_g) * V_post_g  # (seq_len, batch, D), 连续泄漏量
+        gate = gate_activation.mean(dim=-1, keepdim=True)  # (seq_len, batch, 1), D 维均值做标量门控
 
         # L2 归一化 k（稳定外积，确保 ||k·vᵀ|| 有界）
         k = F.normalize(k, dim=-1)

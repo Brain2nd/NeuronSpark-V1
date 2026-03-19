@@ -1,18 +1,25 @@
 """
 SNNAssociativeMemoryLayer: 基于短时突触可塑性的脉冲联想记忆
 
-数学定义:
-  写入: M[t] = β_M · M[t-1] + write_gate[t] · k[t] · v[t]ᵀ
-  读出: output[t] = q[t]ᵀ · M[t]
+在 TOKEN 级别操作（非帧级别），使用 parallel scan 并行化。
 
-所有控制信号由 PLIFNode 产生:
-  x → PLIFNode_k → (1-β_k)·V_post → W_k → k
-  x → PLIFNode_v → (1-β_v)·V_post → W_v → v
-  x → PLIFNode_q → (1-β_q)·V_post → W_q → q
-  x → PLIFNode_g → spike → write_gate (spike 门控: 只有发放时才写入)
+数学定义:
+  M[t] = β_M · M[t-1] + write_gate[t] · k[t] · v[t]ᵀ   // 矩阵状态递推
+  output[t] = q[t]ᵀ · M[t]                                // 线性读出
+
+M 展平为 (D_key × D_value) 维向量后，递推退化为标量 β_M 的线性扫描，
+可复用 PLIF parallel scan 基础设施并行求解。
+
+计算流:
+  (TK, batch, D) → K帧平均 → (seq_len, batch, D)
+    → PLIFNode → q, k, v, gate (token 级)
+    → parallel scan (β_M, gate·k⊗v) → M states
+    → q · M → output → repeat K → (TK, batch, D)
+
+复杂度: O(seq_len × D_key²), 显存 O(seq_len × D_key²)
+对比 attention: O(seq_len² × D), 当 D_key << seq_len 时远优于 attention
 
 生物对应: 短时突触可塑性 (Short-Term Synaptic Plasticity)
-参考: Qwen3.5 GatedDeltaNet, DeltaNet 线性注意力
 """
 
 import math
@@ -28,27 +35,25 @@ from .parallel_scan import plif_rowparam_forward
 
 class SNNAssociativeMemoryLayer(base.MemoryModule):
     """
-    SNN 联想记忆层 — spike 驱动的矩阵状态读写。
-
-    替代标准注意力的全局感知层，O(n) 复杂度，O(1) 状态大小。
+    SNN 联想记忆层 — spike 驱动的矩阵状态读写（parallel scan 并行化）。
 
     Args:
         D: 可见维度
-        D_key: 键/查询维度 (控制记忆"槽位"数)
-        D_value: 值维度 (每个槽位存储的信息量)
-        num_memory_groups: 多时间尺度记忆组数 (不同 β_M)
-        beta_M_range: 记忆衰减率范围 (min, max)
-        num_layers: 总层数 (用于输出缩放)
+        D_key: 键/查询维度
+        D_value: 值维度
+        K: 每 token 的 SNN 帧数（用于聚合/广播）
+        beta_M: 记忆衰减率
+        num_layers: 总层数（用于输出缩放）
         activation_mode: v1/v2 激活模式
     """
 
     def __init__(
         self,
         D: int,
-        D_key: int = 128,
-        D_value: int = 128,
-        num_memory_groups: int = 3,
-        beta_M_range: tuple = (0.95, 0.9999),
+        D_key: int = 64,
+        D_value: int = 64,
+        K: int = 12,
+        beta_M: float = 0.999,
         num_layers: int = 1,
         activation_mode: str = 'v2',
     ):
@@ -56,64 +61,36 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
         self.D = D
         self.D_key = D_key
         self.D_value = D_value
-        self.num_memory_groups = num_memory_groups
+        self.K = K
         self.activation_mode = activation_mode
+        self.M_dim = D_key * D_value  # 展平的矩阵状态维度
 
-        # ====== 输入 PLIFNode（产生 spike 驱动的 k/v/q/gate） ======
-        self.neuron_k = PLIFNode(dim=D, init_tau=2.0, v_threshold=0.5)
-        self.neuron_v = PLIFNode(dim=D, init_tau=2.0, v_threshold=0.5)
-        self.neuron_q = PLIFNode(dim=D, init_tau=2.0, v_threshold=0.3)
-        self.neuron_gate = PLIFNode(dim=D, init_tau=2.0, v_threshold=0.8)  # 高阈值：严格筛选
+        # β_M: 标量衰减率
+        self.register_buffer('beta_M', torch.tensor(beta_M))
 
-        # ====== 投影 ======
-        self.W_k = nn.Linear(D, D_key, bias=False)
-        self.W_v = nn.Linear(D, D_value, bias=False)
-        self.W_q = nn.Linear(D, D_key, bias=False)
-        self.W_out = nn.Linear(D_value * num_memory_groups, D, bias=False)
-
-        # ====== 输入/输出归一化 ======
+        # 输入归一化
         self.norm = RMSNorm(D)
 
-        # ====== 多时间尺度记忆衰减率 β_M ======
-        beta_M_values = torch.linspace(beta_M_range[0], beta_M_range[1], num_memory_groups)
-        self.register_buffer('beta_M', beta_M_values)  # (num_memory_groups,)
+        # 投影: D → D_key (q, k) + D_value (v) + 1 (gate logit)
+        self.qkv_proj = nn.Linear(D, D_key * 2 + D_value, bias=False)
+        self.gate_proj = nn.Linear(D, 1, bias=True)
 
-        # ====== 记忆矩阵 M: (num_groups, D_key, D_value) ======
-        self.register_memory('M', 0.)
+        # 输出投影
+        self.out_proj = nn.Linear(D_value, D, bias=False)
 
-        # ====== 初始化 ======
+        # 持久状态: 展平的 M 矩阵
+        self.register_memory('M_state', 0.)
+
         self._init_weights(num_layers)
 
     def _init_weights(self, num_layers):
-        nn.init.xavier_uniform_(self.W_k.weight)
-        nn.init.xavier_uniform_(self.W_v.weight)
-        nn.init.xavier_uniform_(self.W_q.weight)
-        # 输出投影缩放（GPT-2 style）
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
         std = 0.02 / math.sqrt(2 * num_layers)
-        nn.init.normal_(self.W_out.weight, std=std)
-
-    def _neuron_parallel(self, neuron, x):
-        """PLIFNode parallel scan 前向，返回激活值。"""
-        TK, batch, D = x.shape
-        beta = neuron.beta
-        u = (1.0 - beta) * x
-
-        v_init = neuron.v
-        if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=x.device, dtype=x.dtype)
-
-        beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_row = neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
-
-        spike, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
-            surrogate_function=neuron.surrogate_function,
-        )
-        neuron.v = V_post[-1].detach()
-
-        if self.activation_mode == 'v2':
-            return (1.0 - beta) * V_post, spike
-        return V_post, spike
+        nn.init.normal_(self.out_proj.weight, std=std)
+        # gate 偏置初始化为负值 → sigmoid ≈ 0.1 → 大部分 token 不写入
+        nn.init.constant_(self.gate_proj.bias, -2.0)
+        nn.init.xavier_uniform_(self.gate_proj.weight)
+        self.gate_proj.weight.data.mul_(0.01)
 
     def forward_parallel(self, h):
         """
@@ -123,68 +100,85 @@ class SNNAssociativeMemoryLayer(base.MemoryModule):
             h: (TK, batch, D) — 连续值输入
 
         Returns:
-            output: (TK, batch, D) — 联想记忆输出
+            output: (TK, batch, D) — 联想记忆输出（用于残差连接）
         """
         TK, batch, D = h.shape
-        h_normed = self.norm(h)
+        K = self.K
+        seq_len = TK // K
 
-        # ====== 1. PLIFNode 产生 k/v/q 激活 + gate spike ======
-        act_k, _ = self._neuron_parallel(self.neuron_k, h_normed)
-        act_v, _ = self._neuron_parallel(self.neuron_v, h_normed)
-        act_q, _ = self._neuron_parallel(self.neuron_q, h_normed)
-        _, spike_gate = self._neuron_parallel(self.neuron_gate, h_normed)
-        # spike_gate: (TK, batch, D), 二值
+        # ====== 1. K 帧平均聚合 → token 级表示 ======
+        h_token = h.view(seq_len, K, batch, D).mean(dim=1)  # (seq_len, batch, D)
+        h_normed = self.norm(h_token)
 
-        # ====== 2. 投影到 key/value/query 空间 ======
-        k = self.W_k(act_k.reshape(TK * batch, D)).reshape(TK, batch, self.D_key)
-        v = self.W_v(act_v.reshape(TK * batch, D)).reshape(TK, batch, self.D_value)
-        q = self.W_q(act_q.reshape(TK * batch, D)).reshape(TK, batch, self.D_key)
+        # ====== 2. 投影 q, k, v + gate ======
+        flat = h_normed.reshape(seq_len * batch, D)
+        qkv = self.qkv_proj(flat)  # (seq_len*batch, D_key*2 + D_value)
+        q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
+        q = q.reshape(seq_len, batch, self.D_key)
+        k = k.reshape(seq_len, batch, self.D_key)
+        v = v.reshape(seq_len, batch, self.D_value)
 
-        # ====== 3. Write gate: spike 均值作为标量门控 ======
-        # 对 D 维取均值得到标量门控 (TK, batch, 1)
-        write_gate = spike_gate.mean(dim=-1, keepdim=True)  # (TK, batch, 1)
+        gate_logit = self.gate_proj(flat).reshape(seq_len, batch, 1)
+        gate = torch.sigmoid(gate_logit)  # (seq_len, batch, 1)
 
-        # ====== 4. 归一化 k (L2 norm，稳定外积) ======
+        # L2 归一化 k（稳定外积）
         k = F.normalize(k, dim=-1)
 
-        # ====== 5. 递推更新多组记忆矩阵 M ======
-        # M: (num_groups, batch, D_key, D_value)
-        if isinstance(self.M, float):
-            self.M = torch.zeros(
-                self.num_memory_groups, batch, self.D_key, self.D_value,
-                device=h.device, dtype=h.dtype,
-            )
+        # ====== 3. 构造 parallel scan 输入 ======
+        # 外积 k ⊗ v: (seq_len, batch, D_key, D_value) → 展平 (seq_len, batch, M_dim)
+        kv_outer = (k.unsqueeze(-1) * v.unsqueeze(-2))  # (seq_len, batch, D_key, D_value)
+        kv_flat = kv_outer.reshape(seq_len, batch, self.M_dim)  # (seq_len, batch, M_dim)
+        b_scan = gate * kv_flat  # gate 调制的写入信号
 
-        outputs = []
-        for t in range(TK):
-            k_t = k[t]  # (batch, D_key)
-            v_t = v[t]  # (batch, D_value)
-            q_t = q[t]  # (batch, D_key)
-            g_t = write_gate[t]  # (batch, 1)
+        # a_scan: 常量 β_M 扩展到 (seq_len, batch, M_dim)
+        a_scan = self.beta_M.expand(seq_len, batch, self.M_dim)
 
-            # 外积: k_t · v_t^T → (batch, D_key, D_value)
-            kv_outer = k_t.unsqueeze(-1) * v_t.unsqueeze(-2)  # (batch, D_key, D_value)
-            kv_gated = g_t.unsqueeze(-1) * kv_outer  # (batch, D_key, D_value)
+        # ====== 4. Linear recurrence via cumulative scan ======
+        # M[t] = β_M · M[t-1] + b[t]
+        # 用 log-space cumsum 实现并行扫描（β_M 是常量，简化为指数加权累积和）
+        # M[T] = Σ_{t=0}^{T} β_M^{T-t} · b[t]
 
-            # 更新所有记忆组
-            group_outputs = []
-            for g in range(self.num_memory_groups):
-                self.M[g] = self.beta_M[g] * self.M[g] + kv_gated
-                # 读出: q · M → (batch, D_value)
-                out_g = torch.bmm(q_t.unsqueeze(1), self.M[g]).squeeze(1)  # (batch, D_value)
-                group_outputs.append(out_g)
+        # 初始状态
+        if isinstance(self.M_state, float):
+            M_init = torch.zeros(batch, self.M_dim, device=h.device, dtype=h.dtype)
+        else:
+            M_init = self.M_state
 
-            # 拼接多组输出
-            out_t = torch.cat(group_outputs, dim=-1)  # (batch, D_value * num_groups)
-            outputs.append(out_t)
+        # 指数加权累积和（parallel）
+        # weights[t, s] = β_M^{t-s} for s <= t
+        # M[t] = β_M^{t+1} · M_init + Σ_{s=0}^{t} β_M^{t-s} · b[s]
+        log_beta = torch.log(self.beta_M.clamp(min=1e-8))
+        # 构造 decay 权重: β_M^0, β_M^1, ..., β_M^{seq_len-1}
+        decay_powers = torch.arange(seq_len, device=h.device, dtype=h.dtype)
+        decay = torch.exp(log_beta * decay_powers)  # (seq_len,)
 
-        # (TK, batch, D_value * num_groups)
-        output = torch.stack(outputs, dim=0)
+        # b_scan 按 decay 加权后做 cumsum
+        # b_weighted[t] = b[t] / β_M^t
+        # cumsum → M_raw[T] = Σ_{t=0}^{T} b[t] / β_M^t
+        # M[T] = β_M^T · (M_init + M_raw[T])
+        inv_decay = 1.0 / (decay + 1e-12)  # (seq_len,)
+        b_weighted = b_scan * inv_decay[:, None, None]  # (seq_len, batch, M_dim)
+        M_raw_cumsum = torch.cumsum(b_weighted, dim=0)  # (seq_len, batch, M_dim)
 
-        # ====== 6. 输出投影 ======
-        output = self.W_out(output.reshape(TK * batch, -1)).reshape(TK, batch, D)
+        # 加上初始状态并乘以 decay
+        M_init_expanded = M_init.unsqueeze(0)  # (1, batch, M_dim)
+        M_all = (M_init_expanded + M_raw_cumsum) * decay[:, None, None]  # (seq_len, batch, M_dim)
 
-        # detach M 防止梯度穿越 token 边界
-        self.M = self.M.detach()
+        # 保存最终状态
+        self.M_state = M_all[-1].detach()
+
+        # ====== 5. 读出: output[t] = q[t]ᵀ · M[t] ======
+        # M_all: (seq_len, batch, D_key, D_value) reshaped
+        M_matrix = M_all.reshape(seq_len, batch, self.D_key, self.D_value)
+        # q: (seq_len, batch, D_key) → (seq_len, batch, 1, D_key)
+        # output = q @ M: (seq_len, batch, 1, D_value) → (seq_len, batch, D_value)
+        output = torch.einsum('sbk,sbkv->sbv', q, M_matrix)  # (seq_len, batch, D_value)
+
+        # ====== 6. 输出投影 + 广播回 K 帧 ======
+        output = self.out_proj(output.reshape(seq_len * batch, self.D_value))
+        output = output.reshape(seq_len, batch, D)
+
+        # 广播回 TK 帧: (seq_len, batch, D) → (seq_len, K, batch, D) → (TK, batch, D)
+        output = output.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
 
         return output

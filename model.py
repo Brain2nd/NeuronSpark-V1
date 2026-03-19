@@ -67,7 +67,7 @@ class SNNLanguageModel(nn.Module):
         D_ff: int = 3072,
         v_th_min: float = 0.1,
         activation_mode: str = 'v2',
-        memory_layer_interval: int = 0,  # 0=禁用联想记忆层
+        memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
         num_memory_groups: int = 3,
@@ -109,7 +109,7 @@ class SNNLanguageModel(nn.Module):
                     D=D,
                     D_key=D_key,
                     D_value=D_value,
-                    num_memory_groups=num_memory_groups,
+                    K=K,
                     num_layers=num_layers,
                     activation_mode=activation_mode,
                 ))

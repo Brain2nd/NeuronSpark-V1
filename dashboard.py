@@ -50,7 +50,10 @@ class SNNDashboard:
             local_sq = param.grad.data.norm().square()
             if use_dist:
                 dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
+            # 剥离 DDP 的 module. 前缀和 FSDP 的 _fsdp_wrapped_module 前缀
             clean_name = name.replace("._fsdp_wrapped_module", "")
+            if clean_name.startswith("module."):
+                clean_name = clean_name[len("module."):]
             cache[clean_name] = local_sq.sqrt().item()
         self._grad_cache = cache
 

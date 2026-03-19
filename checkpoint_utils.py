@@ -101,10 +101,7 @@ def load_checkpoint(path, model, optimizer, scaler, device):
         ts = torch.load(training_state_path, map_location=device, weights_only=False)
 
         if 'optimizer_state' in ts and optimizer is not None:
-            try:
-                optimizer.load_state_dict(ts['optimizer_state'])
-            except (ValueError, KeyError, RuntimeError):
-                print("  Warning: Optimizer state incompatible, starting fresh.")
+            optimizer.load_state_dict(ts['optimizer_state'])
 
         if 'scaler_state' in ts and scaler is not None and ts['scaler_state'] is not None:
             scaler.load_state_dict(ts['scaler_state'])
@@ -171,10 +168,7 @@ def _load_legacy_checkpoint(path, model, optimizer, scaler, device):
         raw.load_state_dict(ckpt['trainable_state_dict'], strict=False)
 
     if 'optimizer_state' in ckpt and optimizer is not None:
-        try:
-            optimizer.load_state_dict(ckpt['optimizer_state'])
-        except (ValueError, KeyError):
-            print("  Warning: Optimizer state incompatible, starting fresh.")
+        optimizer.load_state_dict(ckpt['optimizer_state'])
 
     if 'scaler_state' in ckpt and scaler is not None:
         scaler.load_state_dict(ckpt['scaler_state'])

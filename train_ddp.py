@@ -349,11 +349,8 @@ if __name__ == "__main__":
 
     # 恢复 optimizer state（optimizer 创建后加载，参数引用已绑定）
     if _resume_optim_state is not None:
-        try:
-            optimizer.load_state_dict(_resume_optim_state)
-            Logger("  Optimizer state restored.", rank)
-        except (ValueError, KeyError, RuntimeError) as e:
-            Logger(f"  Warning: Optimizer state incompatible ({e}), starting fresh.", rank)
+        optimizer.load_state_dict(_resume_optim_state)
+        Logger("  Optimizer state restored.", rank)
 
     # ==================== 训练信息 ====================
     iter_per_epoch = len(train_loader)

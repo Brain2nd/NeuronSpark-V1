@@ -38,7 +38,7 @@ from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
 from dataset import PretrainDataset
-from checkpoint_utils import save_checkpoint, load_checkpoint
+from checkpoint_utils import save_checkpoint, load_checkpoint, load_model_weights
 
 warnings.filterwarnings('ignore')
 
@@ -299,14 +299,11 @@ if __name__ == "__main__":
     start_step = 0
     _resume_optim_state = None
     if args.resume:
-        from checkpoint_utils import load_config
         # 加载模型权重（DDP 包装前，参数 in-place）
         load_model_weights(args.resume, model, device)
         # 读取训练状态（step/epoch/tokens），optimizer state 暂存
-        import os as _os
-        _ts_path = _os.path.join(args.resume, 'training_state.pth') if _os.path.isdir(args.resume) else args.resume
-        if _os.path.isdir(args.resume):
-            _ts = torch.load(_os.path.join(args.resume, 'training_state.pth'), map_location=device, weights_only=False)
+        if os.path.isdir(args.resume):
+            _ts = torch.load(os.path.join(args.resume, 'training_state.pth'), map_location=device, weights_only=False)
         else:
             _ts = torch.load(args.resume, map_location=device, weights_only=False)
         start_step = _ts.get('step', 0)

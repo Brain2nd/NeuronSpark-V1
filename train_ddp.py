@@ -128,7 +128,8 @@ def init_model(args, local_rank, rank):
 # ============================================================
 
 def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
-                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None):
+                iter_per_epoch, tokens_seen, rank, world_size, dashboard=None,
+                start_step=0):
     """训练一个 epoch（DDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
     sampler.set_epoch(epoch)
@@ -137,12 +138,13 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
     local_rank = int(os.environ["LOCAL_RANK"])
 
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        global_step = start_step + step
         X = X.to(f"cuda:{local_rank}")
         Y = Y.to(f"cuda:{local_rank}")
         loss_mask = loss_mask.to(f"cuda:{local_rank}")
 
-        # 学习率调度
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch,
+        # 学习率调度（用 global_step 保证 resume 后 lr 连续）
+        lr = get_lr(global_step, args.epochs * iter_per_epoch,
                      args.learning_rate, args.warmup_iters)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
@@ -175,7 +177,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
                 raw_model = model.module if isinstance(model, DDP) else model
                 batch_loss_db = loss.item() * args.accumulation_steps
                 spend_time_db = time.time() - start_time
-                dashboard.log_step(step, {
+                dashboard.log_step(global_step, {
                     'loss': batch_loss_db,
                     'ppl': math.exp(min(batch_loss_db, 20.0)),
                     'lr': lr,
@@ -195,7 +197,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
         tokens_seen += int(valid_tokens.item())
 
         # 日志（仅主进程）
-        if step % args.log_interval == 0 and is_main_process(rank):
+        if global_step % args.log_interval == 0 and is_main_process(rank):
             batch_loss = loss.item() * args.accumulation_steps
             batch_ppl = math.exp(min(batch_loss, 20.0))
             spend_time = time.time() - start_time
@@ -205,18 +207,17 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
             print(
                 'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} '
                 'epoch_Time:{}min | Mem {:.1f}/{:.1f}GB | GPUs:{}'.format(
-                    epoch + 1, args.epochs, step, iter_per_epoch,
+                    epoch + 1, args.epochs, global_step, iter_per_epoch,
                     batch_loss, batch_ppl, lr, tps,
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_cur, mem_peak, world_size))
 
         # 定期保存（仅主进程，带步数，保留最新 5 个）
-        if (step + 1) % args.save_interval == 0:
+        if (global_step + 1) % args.save_interval == 0:
             if is_main_process(rank):
                 model.eval()
-                global_step = epoch * iter_per_epoch + step + 1
                 save_checkpoint(args.save_dir, model, optimizer, None,
-                                global_step, epoch, batch_loss, tokens_seen)
+                                global_step + 1, epoch, batch_loss, tokens_seen)
                 if dashboard:
                     raw_model = model.module if isinstance(model, DDP) else model
                     dashboard.log_save_point(global_step, raw_model)
@@ -292,6 +293,28 @@ if __name__ == "__main__":
     # ==================== 模型初始化 ====================
     model, tokenizer, device = init_model(args, local_rank, rank)
 
+    # 恢复 checkpoint（DDP 包装前加载模型权重，确保参数引用一致）
+    tokens_seen = 0
+    start_epoch = 0
+    start_step = 0
+    _resume_optim_state = None
+    if args.resume:
+        from checkpoint_utils import load_config
+        # 加载模型权重（DDP 包装前，参数 in-place）
+        load_model_weights(args.resume, model, device)
+        # 读取训练状态（step/epoch/tokens），optimizer state 暂存
+        import os as _os
+        _ts_path = _os.path.join(args.resume, 'training_state.pth') if _os.path.isdir(args.resume) else args.resume
+        if _os.path.isdir(args.resume):
+            _ts = torch.load(_os.path.join(args.resume, 'training_state.pth'), map_location=device, weights_only=False)
+        else:
+            _ts = torch.load(args.resume, map_location=device, weights_only=False)
+        start_step = _ts.get('step', 0)
+        start_epoch = _ts.get('epoch', 0)
+        tokens_seen = _ts.get('tokens_seen', 0)
+        _resume_optim_state = _ts.get('optimizer_state', None)
+        Logger(f"  Resumed model: step={start_step}, epoch={start_epoch}, tokens={tokens_seen:,}", rank)
+
     # DDP 包装（gradient_as_bucket_view 复用通信 buffer 省显存）
     model = DDP(model, device_ids=[local_rank],
                 gradient_as_bucket_view=True)
@@ -324,13 +347,13 @@ if __name__ == "__main__":
          'lr_mult': float(args.neuron_lr_mult)},
     ])
 
-    # 恢复 checkpoint
-    tokens_seen = 0
-    start_epoch = 0
-    if args.resume:
-        start_step, start_epoch, best_loss, tokens_seen = load_checkpoint(
-            args.resume, model, optimizer, None, device,
-        )
+    # 恢复 optimizer state（optimizer 创建后加载，参数引用已绑定）
+    if _resume_optim_state is not None:
+        try:
+            optimizer.load_state_dict(_resume_optim_state)
+            Logger("  Optimizer state restored.", rank)
+        except (ValueError, KeyError, RuntimeError) as e:
+            Logger(f"  Warning: Optimizer state incompatible ({e}), starting fresh.", rank)
 
     # ==================== 训练信息 ====================
     iter_per_epoch = len(train_loader)
@@ -369,6 +392,7 @@ if __name__ == "__main__":
         tokens_seen = train_epoch(
             epoch, model, train_loader, sampler, optimizer, ctx, args,
             iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
+            start_step=start_step,
         )
 
     if dashboard:

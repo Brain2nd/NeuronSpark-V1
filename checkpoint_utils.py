@@ -103,7 +103,7 @@ def load_checkpoint(path, model, optimizer, scaler, device):
         if 'optimizer_state' in ts and optimizer is not None:
             try:
                 optimizer.load_state_dict(ts['optimizer_state'])
-            except (ValueError, KeyError):
+            except (ValueError, KeyError, RuntimeError):
                 print("  Warning: Optimizer state incompatible, starting fresh.")
 
         if 'scaler_state' in ts and scaler is not None and ts['scaler_state'] is not None:

@@ -187,15 +187,15 @@ class SNNLanguageModel(nn.Module):
         TK, batch, D = h.shape
         input_dtype = h.dtype
 
-        beta = self.output_neuron.beta  # (D,)
-        u = (1.0 - beta) * h  # PLIF: u = (1-β) · x
+        beta = self.output_neuron.beta.to(input_dtype)
+        u = (1.0 - beta) * h
 
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=h.device, dtype=u.dtype)
+            v_init = torch.zeros(batch, D, device=h.device, dtype=input_dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
         spike, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,

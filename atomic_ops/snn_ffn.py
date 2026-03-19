@@ -118,8 +118,8 @@ class SNNFFN(base.MemoryModule):
         I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
 
         # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======
-        beta_gate = self.gate_neuron.beta  # (D_ff,)
-        beta_up = self.up_neuron.beta      # (D_ff,)
+        beta_gate = self.gate_neuron.beta.to(input_dtype)  # (D_ff,)
+        beta_up = self.up_neuron.beta.to(input_dtype)      # (D_ff,)
         surr = self.gate_neuron.surrogate_function
 
         # u_merged: 向量缩放（D_ff 维 β 直接 cat，无需 expand）
@@ -130,7 +130,8 @@ class SNNFFN(base.MemoryModule):
         beta_row = torch.cat([beta_gate, beta_up])  # (2*D_ff,)
         beta_row = beta_row.unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
 
-        v_th_row = torch.cat([self.gate_neuron.v_th, self.up_neuron.v_th])  # (2*D_ff,)
+        v_th_row = torch.cat([self.gate_neuron.v_th.to(input_dtype),
+                              self.up_neuron.v_th.to(input_dtype)])  # (2*D_ff,)
         v_th_row = v_th_row.unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
 
         # v_init_merged: (batch, 2*D_ff)

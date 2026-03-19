@@ -180,17 +180,17 @@ class SNNDecoderLayer(base.MemoryModule):
             leak: (TK, batch, D) — 膜电位泄漏量 (1-β)·V_post
         """
         TK, batch, D = x.shape
-        input_dtype = x.dtype  # 记录输入 dtype，输出保持一致
+        input_dtype = x.dtype
 
-        beta = input_neuron.beta  # (D,)
-        u = (1.0 - beta) * x  # (D,) broadcast → (TK, batch, D)
+        beta = input_neuron.beta.to(input_dtype)  # fp32→bf16 for compute
+        u = (1.0 - beta) * x
 
         v_init = input_neuron.v
         if isinstance(v_init, float):
             v_init = torch.zeros(batch, D, device=x.device, dtype=x.dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_row = input_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
         spike, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,

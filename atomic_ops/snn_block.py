@@ -193,9 +193,13 @@ class SNNBlock(base.MemoryModule):
         I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
         # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
+        # 神经元参数可能是 fp32 (master weights)，计算时转为输入 dtype
+        compute_dtype = spike_in_seq.dtype
         beta_all, u_hidden, v_th_all = _fused_modulation(
-            raw_beta, self.b_beta, raw_alpha, self.b_alpha,
-            raw_th, self.b_th, self.v_th_min, I_all,
+            raw_beta, self.b_beta.to(compute_dtype),
+            raw_alpha, self.b_alpha.to(compute_dtype),
+            raw_th, self.b_th.to(compute_dtype),
+            self.v_th_min, I_all,
         )
 
         # 获取隐神经元初始状态

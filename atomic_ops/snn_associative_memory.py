@@ -131,15 +131,15 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         """PLIFNode parallel scan, 返回激活值。复用 SNNDecoderLayer 的逻辑。"""
         TK, batch, D = x.shape
         input_dtype = x.dtype
-        beta = input_neuron.beta
+        beta = input_neuron.beta.to(input_dtype)
         u = (1.0 - beta) * x
 
         v_init = input_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=x.device, dtype=u.dtype)
+            v_init = torch.zeros(batch, D, device=x.device, dtype=input_dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_row = input_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
         spike, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
@@ -154,15 +154,15 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         """PLIFNode gate 的 parallel scan, 返回标量门控。"""
         seq_len, batch, D = h_normed.shape
         input_dtype = h_normed.dtype
-        beta_g = self.gate_neuron.beta
+        beta_g = self.gate_neuron.beta.to(input_dtype)
         u_g = (1.0 - beta_g) * h_normed
 
         v_init_g = self.gate_neuron.v
         if isinstance(v_init_g, float):
-            v_init_g = torch.zeros(batch, D, device=h_normed.device, dtype=u_g.dtype)
+            v_init_g = torch.zeros(batch, D, device=h_normed.device, dtype=input_dtype)
 
         beta_row = beta_g.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_row = self.gate_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row = self.gate_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
         _, V_post_g = plif_rowparam_forward(
             beta_row, u_g, v_th_row, v_init_g,

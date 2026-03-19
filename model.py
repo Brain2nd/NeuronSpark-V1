@@ -67,7 +67,7 @@ class SNNLanguageModel(nn.Module):
         D_ff: int = 3072,
         v_th_min: float = 0.1,
         activation_mode: str = 'v2',
-        memory_layer_interval: int = 4,
+        memory_layer_interval: int = 0,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
         num_memory_groups: int = 3,
@@ -104,7 +104,7 @@ class SNNLanguageModel(nn.Module):
         self.layers = nn.ModuleList()
         self.layer_types = []  # 'snn' or 'memory'
         for i in range(num_layers):
-            if (i + 1) % memory_layer_interval == 0:
+            if memory_layer_interval > 0 and (i + 1) % memory_layer_interval == 0:
                 self.layers.append(SNNAssociativeMemoryLayer(
                     D=D,
                     D_key=D_key,

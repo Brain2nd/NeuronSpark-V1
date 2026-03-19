@@ -331,6 +331,106 @@ Pass 2 把稀疏的重要 token 连续排列，token 间衰减从 β^gap 变为 
 
 ---
 
+## 9. SNN 联想记忆层的上下文推广
+
+> 前提：架构中引入了 SNNAssociativeMemoryLayer（见 `ARCHITECTURE_IMPROVEMENTS.md` 改进四）。
+> 本节讨论该层的长上下文推广手段。
+
+### 联想记忆 vs 注意力的位置编码问题
+
+标准注意力的上下文推广核心是处理 RoPE 的位置 OOD（PI/NTK/YaRN）。
+
+联想记忆 M 的递推：
+```
+M[t] = β_M · M[t-1] + write_gate · k[t] · v[t]ᵀ
+output[t] = q[t]ᵀ · M[t]
+```
+
+**M 没有位置编码**。位置信息完全隐含在 β_M^(t2-t1) 的时序衰减中。
+不存在"位置 OOD"问题——不需要 RoPE 插值。
+
+M 的唯一长上下文瓶颈和 PLIF 神经元一样：β_M 累积衰减。
+
+### 手段一：β_M 校准
+
+和 §3 的 PLIF β 校准完全对称：
+
+```
+β_M_ext = β_M^(L_train/L_target)
+```
+
+如果使用多时间尺度记忆组（M_fast/M_medium/M_slow），只需校准 M_slow 的 β。
+
+### 手段二：写入门控阈值提升（M 独有优势）
+
+spike 门控 write_gate 意味着只有发放的 token 才写入 M。
+对更长序列，提高 PLIFNode_g 的阈值：
+
+```
+V_th_g_ext = V_th_g × (L_target / L_train)^0.5
+```
+
+更严格的写入筛选 → 更少 token 写入 M → M 的有效容量相对于重要信息比例增大。
+
+**这是 M 相对注意力的独特优势**：注意力的 KV cache 无差别存储所有 token，
+M 通过 spike 门控只存重要的。长序列时提高门控阈值就能自然扩展。
+
+### 手段三：推理时扩展 M 的维度
+
+训练时 M ∈ R^{D_key × D_value}（例如 128×128）。
+推理时零填充扩展维度：
+
+```
+M_ext = [M,  0]     W_k_ext = [W_k, 0]
+        [0,  0]     W_v_ext = [W_v, 0]
+                    W_q_ext = [W_q, 0]
+```
+
+新维度从零开始累积，不影响已学习的前 D_key 维行为。
+更多维度 = 更多独立"记忆槽位" = 更大容量。
+
+状态大小仍然是 O(1)（固定矩阵），不随序列长度增长。
+
+### 手段四：记忆凝练（神经科学类比：海马体记忆巩固）
+
+周期性地对 M 做低秩近似，压缩主要信息：
+
+```
+运行期: M_working 正常递推更新
+凝练期（每 N 步）:
+  U, S, V = SVD(M_working)
+  M_long_term += U[:, :r] · diag(S[:r]) · V[:r, :]   // 保留 top-r 奇异值
+  M_working = 0                                        // 清空工作记忆
+```
+
+不需要重跑前向，直接在 M 矩阵上做代数操作。
+这和 ReMamba 的两次前向是同一思想但更高效。
+
+### 手段五：多时间尺度β_M 分组的差异化校准
+
+如果使用了 M_fast/M_medium/M_slow：
+
+| 记忆组 | 训练 β_M | 校准策略 |
+|---|---|---|
+| M_fast | 0.95 | 不校准（局部上下文不需要延长） |
+| M_medium | 0.999 | β_M_ext = 0.999^(L_train/L_target) |
+| M_slow | 0.9999 | β_M_ext = 0.9999^(L_train/L_target) |
+
+只校准慢组，快组和中组保持不变。
+
+### M vs Attention 的上下文推广对比
+
+| 维度 | Attention + RoPE | SNN 联想记忆 M |
+|---|---|---|
+| 位置编码 | 有（需 PI/NTK/YaRN） | **无**，天然位置无关 |
+| 状态大小 | O(n) KV cache | **O(1)** 固定矩阵 |
+| 推广瓶颈 | 位置 OOD + 显存增长 | 仅 β_M 衰减 |
+| 推广手段 | 修改位置编码（数学复杂） | β_M 校准 + 门控阈值（简单） |
+| 信息保真 | 无损（全历史） | 有损（β_M 衰减 + 矩阵容量） |
+| 独特优势 | — | spike 门控自动过滤废话 token |
+
+---
+
 ## 参考文献
 
 1. MambaExtend — *Training-Free Approach to Improve Long Context Extension of Mamba* (ICLR 2025)

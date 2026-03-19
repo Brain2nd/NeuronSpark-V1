@@ -108,9 +108,8 @@ class SNNBlock(base.MemoryModule):
         D, N = self.D, self.N
         K_ref = 16
 
-        # 目标 β 分布：多时间尺度 [0.80, 0.9999]
-        # 最后几组为长程记忆通道 (β>0.999, L_eff>1000 帧 ≈ 83 token)
-        beta_values = torch.linspace(0.80, 0.9999, N)
+        # 目标 β 分布：多时间尺度 [0.80, 0.99]
+        beta_values = torch.linspace(0.80, 0.99, N)
 
         # ====== 1. β 偏置：logit-spaced + 维度间随机扰动 ======
         b_beta_per_n = torch.log(beta_values / (1.0 - beta_values))
@@ -145,7 +144,7 @@ class SNNBlock(base.MemoryModule):
         sigma_V_per_n = sigma_I_base * torch.sqrt(
             1.0 - beta_values ** (2 * K_ref)
         )
-        target_p_fire = torch.linspace(0.25, 0.05, N)
+        target_p_fire = torch.linspace(0.25, 0.08, N)
         z_scores = math.sqrt(2.0) * torch.erfinv(
             2.0 * (1.0 - target_p_fire) - 1.0
         )

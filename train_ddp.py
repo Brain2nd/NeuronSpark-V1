@@ -166,6 +166,10 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
 
         # 梯度累积到边界步时更新
         if is_boundary:
+            # Dashboard: optimizer.step() 前缓存梯度范数（梯度此时有效）
+            if dashboard:
+                dashboard.cache_grad_norms(model)
+
             # Natural Gradient: 补偿 b_beta/b_alpha 的 sigmoid/softplus 梯度衰减
             raw_model = model.module if isinstance(model, DDP) else model
             raw_model.compensate_modulation_gradients()

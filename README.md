@@ -1,5 +1,9 @@
 # NeuronSpark — SNN Hidden State Space Language Model
 
+[![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
+
+**NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**
+
 A language model **built entirely on Spiking Neural Networks (SNNs)**. Hidden neurons with dynamic parameters β(t), α(t), V_th(t) serve as input-dependent modulation signals for selective information filtering. **The entire network is pure SNN — no standard ANN components.**
 
 > **Language**: Currently supports **Chinese only**, as the model was trained on Chinese corpora (Seq-Monkey + BelleGroup).
@@ -297,6 +301,17 @@ NeuronSpark/
 - **Author**: Zhengzheng Tang
 - **Email**: zztangbu@bu.edu
 - **GitHub**: [Brain2nd/NeuronSpark](https://github.com/Brain2nd/NeuronSpark)
+
+## Citation
+
+```bibtex
+@article{tang2025neuronspark,
+  title={NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics},
+  author={Tang, Zhengzheng},
+  journal={arXiv preprint arXiv:2603.16148},
+  year={2025}
+}
+```
 
 ## License
 

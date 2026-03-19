@@ -513,6 +513,61 @@ conda activate SNN
 # DGX Spark 需配置: export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
 ```
 
+## V2 Pretraining Plan
+
+### Dataset
+
+Bilingual pretraining dataset uploaded to HuggingFace: [Brain2nd/NeuronSpark-V1](https://huggingface.co/datasets/Brain2nd/NeuronSpark-V1)
+
+| Source | Documents | Ratio | Est. Tokens | Lang |
+|--------|-----------|-------|-------------|------|
+| FineWeb-Edu | 6,810,451 | 39.7% | ~7B | EN general |
+| SkyPile-150B | 7,173,310 | 41.8% | ~4.5B | ZH general |
+| Cosmopedia | 2,313,934 | 13.5% | ~1.5B | EN synthetic textbooks |
+| OpenWebMath | 792,380 | 4.6% | ~1.5B | EN math |
+| Belle school_math | 84,659 | 0.5% | ~17M | ZH math |
+| **Total** | **17,174,734** | | **~14.5B** | Bilingual |
+
+### 候选正式数据集（NVIDIA Nemotron Pre-Training）
+
+来源：[nvidia/nemotron-pre-training-datasets](https://huggingface.co/collections/nvidia/nemotron-pre-training-datasets)
+
+选用新版（提纯后），跳过旧版：
+
+| 数据集 | 下载大小 | 条数 | Tokens | 语种 | 说明 |
+|--------|---------|------|--------|------|------|
+| [Nemotron-CC-v2.1](https://huggingface.co/datasets/nvidia/Nemotron-CC-v2.1) | 4,591 GB | 3.8B | 2.5T | EN | CC 网页过滤 + 合成改写 + 多语种翻译为英文 |
+| [Nemotron-Pretraining-Code-v2](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Code-v2) | 907 GB | 836M | ~1.09T | Code | GitHub 代码 + 合成代码 |
+| [Nemotron-CC-Code-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Code-v1) | 563 GB | 216M | 427.9B | Code | CC 提取代码（Lynx+LLM 管线） |
+| [Nemotron-CC-Math-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1) | 260 GB | 190M | 133.3B | EN | CC 数学内容（保留 LaTeX） |
+| [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) | 35 GB | 19.8M | ~336B | EN | 合成 STEM（推理/逻辑/经济学） |
+| **总计** | **6.36 TB** | | **~4.5T** | | |
+
+> 注：全部为英文/代码，中文需另行补充。当前服务器可用空间 ~420GB，需按优先级分批下载。
+> 优先级建议：Math-v1 (260GB) > Specialized-v1.1 (35GB) > CC-Code-v1 (563GB)
+
+### Tokenizer
+
+Retrain 64K vocab BPE tokenizer (current 6144 is too small for bilingual):
+
+```bash
+python scripts/train_tokenizer.py \
+  --data_dir data/pretrain_mix \
+  --save_dir tokenizer \
+  --vocab_size 64000 \
+  --sample_docs 500000
+```
+
+Adjust `--sample_docs` by available RAM (200K ~8GB, 500K ~16GB, 2M ~64GB).
+
+### TODO
+
+1. [ ] Train 64K vocab bilingual BPE tokenizer
+2. [ ] Update `dataset.py` to support parquet input
+3. [ ] Update model config (vocab_size=64000, rest unchanged)
+4. [ ] Launch pretraining on remote server (4x RTX 4090D)
+5. [ ] SFT after pretraining
+
 ## Citation
 
 ```bibtex

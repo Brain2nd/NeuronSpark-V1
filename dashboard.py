@@ -1,32 +1,23 @@
 """
 SNNDashboard: TensorBoard 训练看板
 
-记录可训练参数的权重/梯度动态，用于论文写作和 debug。
+记录可训练参数的权重/梯度动态 + 神经元健康监控，用于论文写作和 debug。
 
-两级频率：
-  - log_step()       每 log_interval 步：训练标量 + 参数 norm + 神经元动力学 + PonderNet E[K]
-  - log_save_point() 每 save_interval 步：权重/梯度直方图 + 调制补偿因子
+三级频率：
+  - log_step()       每 log_interval 步：训练标量 + 神经元动力学 + 健康监控
+  - log_step(log_params=True)：额外记录参数 norm/grad/update_ratio
+  - log_save_point() 每 save_interval 步：权重/梯度直方图 + 补偿因子
 
-FSDP 梯度处理：
-  多卡 FSDP 下 summon_full_params 只聚合参数，不聚合梯度。
-  因此必须在 optimizer.step() 之前调用 cache_grad_norms()，此时梯度有效。
-  各 rank 持有梯度分片，通过 all_reduce(sum of squares) 还原完整 grad_norm。
-
-用法：
-    dashboard = SNNDashboard(log_dir='runs/pretrain', model=raw_model, rank=rank)
-
-    # 边界步（log_interval）
-    dashboard.cache_grad_norms(model)        # step 前：缓存梯度（所有 rank 参与）
-    optimizer.step()
-    with FSDP.summon_full_params(...):       # step 后：聚合参数
-        dashboard.log_step(global_step, metrics_dict, raw_model, log_params=True)
-    optimizer.zero_grad(set_to_none=True)
-
-    # 保存点（save_interval）
-    dashboard.log_save_point(global_step, raw_model)
-
-    # 训练结束
-    dashboard.close()
+监控类别：
+  1. 训练标量 (loss/ppl/lr/tps/memory)
+  2. 参数 norm + 梯度 norm + update_ratio
+  3. 神经元动力学 (β/α/V_th 的语义值演化)
+  4. PonderNet E[K] 每层极值
+  5. β 分布演化 (均值/std/min/max per layer — 论文级)
+  6. 发放率追踪 (per layer)
+  7. 联想记忆层 (M 范数/write_gate 发放率)
+  8. 坍缩/癫痫/趋同检测 (死/饱和神经元比例, β 趋同度, 输出范数比)
+  9. 综合健康得分
 """
 
 import torch
@@ -35,25 +26,13 @@ import torch.distributed as dist
 
 
 class SNNDashboard:
-    """SNN 训练看板（仅 rank 0 记录，其余为 no-op）。
-
-    FSDP 兼容：调用 log_step/log_save_point 前需在训练循环中
-    用 FSDP.summon_full_params() 聚合参数（集合操作，所有 rank 参与）。
-
-    Args:
-        log_dir: TensorBoard 日志目录，None 时完全禁用（零开销）
-        model: FSDP 包装前的原始模型（raw_model）
-        rank: 分布式 rank，仅 rank 0 启用记录
-    """
-
     def __init__(self, log_dir, model, rank=0):
         self._enabled = (log_dir is not None) and (rank == 0)
         self._rank = rank
-        self._grad_cache = {}  # name → grad_norm（跨 rank 聚合后）
+        self._grad_cache = {}
         if not self._enabled:
             return
 
-        # 延迟导入：仅启用时加载 tensorboard
         from torch.utils.tensorboard import SummaryWriter
         self._writer = SummaryWriter(log_dir=log_dir)
         self._registry = self._build_registry(model)
@@ -62,65 +41,45 @@ class SNNDashboard:
     # ====== 公开方法 ======
 
     def cache_grad_norms(self, model):
-        """在 optimizer.step() 之前调用：缓存所有参数的梯度范数。
-
-        多卡 FSDP 下每个 rank 持有梯度分片，通过 all_reduce 还原完整 grad_norm。
-        此方法是集合操作（all_reduce），所有 rank 必须同时调用。
-
-        注意：FSDP 包装后 named_parameters() 会插入 _fsdp_wrapped_module 前缀，
-        此处自动剥离以匹配 registry（FSDP 包装前构建）的键名。
-        """
+        """optimizer.step() 前调用：缓存梯度范数。"""
         use_dist = dist.is_initialized() and dist.get_world_size() > 1
         cache = {}
-
         for name, param in model.named_parameters():
             if not param.requires_grad or param.grad is None:
                 continue
             local_sq = param.grad.data.norm().square()
             if use_dist:
                 dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
-            # 剥离 FSDP 插入的 _fsdp_wrapped_module 前缀
             clean_name = name.replace("._fsdp_wrapped_module", "")
             cache[clean_name] = local_sq.sqrt().item()
-
         self._grad_cache = cache
 
     def log_step(self, step, metrics_dict, model, log_params=True):
-        """每 log_interval 步调用：训练标量 + 参数监控 + 神经元动力学。"""
         if not self._enabled:
             return
-
         self._log_training_scalars(step, metrics_dict)
-
         if log_params:
             self._log_param_norms(step, metrics_dict.get('lr', 1e-4))
-            self._log_neuron_dynamics(step)
-            self._log_dynamic_k(step, model)
-            self._log_health(step, model)
+        self._log_neuron_dynamics(step)
+        self._log_beta_distribution(step, model)
+        self._log_dynamic_k(step, model)
+        self._log_associative_memory(step, model)
+        self._log_health(step, model)
 
     def log_save_point(self, step, model):
-        """每 save_interval 步调用：直方图 + 补偿因子。"""
         if not self._enabled:
             return
-
         self._log_histograms(step)
         self._log_compensation_factors(step, model)
 
     def close(self):
-        """关闭 TensorBoard writer，刷新缓冲。"""
         if not self._enabled:
             return
         self._writer.close()
 
-    # ====== 注册表构建 ======
+    # ====== 注册表 ======
 
     def _build_registry(self, model):
-        """构建 param name → (TensorBoard tag, param) 映射。
-
-        命名规则：
-          layers.5.snn_block.W_in.weight → layer_05/snn_block/W_in/weight
-          embed_tokens.weight             → global/embed_tokens/weight
-        """
         registry = {}
         for name, param in model.named_parameters():
             parts = name.split('.')
@@ -133,17 +92,10 @@ class SNNDashboard:
         return registry
 
     def _build_neuron_semantics(self, model):
-        """识别需语义变换的神经元参数。
-
-        Returns:
-            list of (tag_prefix, param, transform_fn, metric_name)
-        """
         semantics = []
-
         for i, layer_module in enumerate(model.layers):
             prefix = f"layer_{i:02d}"
 
-            # 联想记忆层：只有 neuron_k/v/q/gate
             if not hasattr(layer_module, 'snn_block'):
                 for name in ('neuron_k', 'neuron_v', 'neuron_q', 'neuron_gate'):
                     neuron = getattr(layer_module, name, None)
@@ -156,45 +108,29 @@ class SNNDashboard:
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
-            # 输入神经元: PLIFNode.w → sigmoid → beta
-            semantics.append(
-                (f"{prefix}/input1_beta", layer_module.input_neuron1.w,
-                 torch.sigmoid, "beta"))
-            semantics.append(
-                (f"{prefix}/input2_beta", layer_module.input_neuron2.w,
-                 torch.sigmoid, "beta"))
-
-            # SNNBlock 调制偏置
-            semantics.append(
-                (f"{prefix}/block_beta_t", block.b_beta,
-                 torch.sigmoid, "beta(t)"))
-            semantics.append(
-                (f"{prefix}/block_alpha_t", block.b_alpha,
-                 F.softplus, "alpha(t)"))
+            semantics.append((f"{prefix}/input1_beta", layer_module.input_neuron1.w,
+                              torch.sigmoid, "beta"))
+            semantics.append((f"{prefix}/input2_beta", layer_module.input_neuron2.w,
+                              torch.sigmoid, "beta"))
+            semantics.append((f"{prefix}/block_beta_t", block.b_beta,
+                              torch.sigmoid, "beta(t)"))
+            semantics.append((f"{prefix}/block_alpha_t", block.b_alpha,
+                              F.softplus, "alpha(t)"))
             v_th_min = block.v_th_min
-            semantics.append(
-                (f"{prefix}/block_vth_t", block.b_th,
-                 lambda x, m=v_th_min: m + torch.abs(x), "V_th(t)"))
+            semantics.append((f"{prefix}/block_vth_t", block.b_th,
+                              lambda x, m=v_th_min: m + torch.abs(x), "V_th(t)"))
+            semantics.append((f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w,
+                              torch.sigmoid, "beta"))
+            semantics.append((f"{prefix}/ffn_up_beta", ffn.up_neuron.w,
+                              torch.sigmoid, "beta"))
 
-            # FFN 神经元: PLIFNode.w → sigmoid → beta
-            semantics.append(
-                (f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w,
-                 torch.sigmoid, "beta"))
-            semantics.append(
-                (f"{prefix}/ffn_up_beta", ffn.up_neuron.w,
-                 torch.sigmoid, "beta"))
-
-        # 输出神经元
-        semantics.append(
-            ("global/output_beta", model.output_neuron.w,
-             torch.sigmoid, "beta"))
-
+        semantics.append(("global/output_beta", model.output_neuron.w,
+                          torch.sigmoid, "beta"))
         return semantics
 
-    # ====== 轻量日志（每 log_interval 步） ======
+    # ====== 1. 训练标量 ======
 
     def _log_training_scalars(self, step, metrics):
-        """记录训练标量：loss, ppl, lr, tps, tokens_seen, ponder_cost, memory。"""
         w = self._writer
         for key in ('loss', 'ppl', 'lr', 'tps', 'tokens_seen', 'ponder_cost'):
             if key in metrics:
@@ -204,53 +140,42 @@ class SNNDashboard:
         if 'memory_peak_gb' in metrics:
             w.add_scalar("train/memory/peak_gb", metrics['memory_peak_gb'], step)
 
-    def _log_param_norms(self, step, lr):
-        """记录每个参数的 weight_norm, grad_norm, update_ratio + 层间梯度比。
+    # ====== 2. 参数 norm + 梯度 ======
 
-        grad_norm 优先使用 cache_grad_norms() 缓存的值（FSDP 多卡精确值），
-        fallback 到 param.grad.norm()（单卡或未调用 cache 时）。
-        """
+    def _log_param_norms(self, step, lr):
         w = self._writer
         cache = self._grad_cache
-
-        # 收集每层梯度范数，用于计算层间梯度比
-        layer_grad_sums = {}  # layer_idx → total grad_norm²
+        layer_grad_sums = {}
 
         for name, (tag, param) in self._registry.items():
             if not param.requires_grad:
                 continue
-
             weight_norm = param.data.norm().item()
             w.add_scalar(f"params/{tag}/weight_norm", weight_norm, step)
 
-            # 优先用缓存的梯度范数（FSDP 安全），fallback 到 live grad
             grad_norm = cache.get(name, None)
             if grad_norm is None and param.grad is not None:
                 grad_norm = param.grad.norm().item()
-
             if grad_norm is not None:
                 w.add_scalar(f"params/{tag}/grad_norm", grad_norm, step)
                 update_ratio = (lr * grad_norm) / (weight_norm + 1e-8)
                 w.add_scalar(f"params/{tag}/update_ratio", update_ratio, step)
-
-                # 按层累积梯度范数²
                 parts = name.split('.')
                 if parts[0] == 'layers' and parts[1].isdigit():
                     idx = int(parts[1])
                     layer_grad_sums[idx] = layer_grad_sums.get(idx, 0.0) + grad_norm ** 2
 
-        # 层间梯度比：max/min（诊断深层梯度均衡）
         if len(layer_grad_sums) >= 2:
             layer_norms = {k: v ** 0.5 for k, v in layer_grad_sums.items()}
             max_gn = max(layer_norms.values())
             min_gn = min(layer_norms.values())
-            grad_ratio = max_gn / (min_gn + 1e-12)
-            w.add_scalar("grad_health/layer_grad_ratio", grad_ratio, step)
+            w.add_scalar("grad_health/layer_grad_ratio", max_gn / (min_gn + 1e-12), step)
             w.add_scalar("grad_health/layer_grad_max", max_gn, step)
             w.add_scalar("grad_health/layer_grad_min", min_gn, step)
 
+    # ====== 3. 神经元动力学 ======
+
     def _log_neuron_dynamics(self, step):
-        """记录神经元参数的语义值（sigmoid/softplus 变换后）。"""
         w = self._writer
         for tag, param, transform_fn, metric_name in self._neuron_semantics:
             with torch.no_grad():
@@ -258,20 +183,18 @@ class SNNDashboard:
                 w.add_scalar(f"neuron_dynamics/{tag}/mean", val.mean().item(), step)
                 w.add_scalar(f"neuron_dynamics/{tag}/std", val.std().item(), step)
 
+    # ====== 4. PonderNet E[K] ======
+
     def _log_dynamic_k(self, step, model):
-        """记录每层 PonderNet E[K] 的极值范围 + halt 参数统计。"""
         w = self._writer
         for i, layer_module in enumerate(model.layers):
             if not hasattr(layer_module, 'block_halt'):
-                continue  # 联想记忆层没有 PonderNet
-
+                continue
             ek_min = getattr(layer_module, '_ek_min', None)
             ek_max = getattr(layer_module, '_ek_max', None)
             if ek_min is not None:
                 w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
                 w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
-
-            # halt 参数监控：权重 norm + 偏置值（诊断 halt 爆炸）
             with torch.no_grad():
                 for name, halt in [('block_halt', layer_module.block_halt),
                                    ('ffn_halt', layer_module.ffn_halt)]:
@@ -280,44 +203,70 @@ class SNNDashboard:
                     w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
                                  halt.bias.data.item(), step)
 
-    # ====== 重量日志（每 save_interval 步） ======
+    # ====== 5. β 分布演化（论文级） ======
 
-    def _log_histograms(self, step):
-        """记录所有参数权重分布（直方图）。"""
+    def _log_beta_distribution(self, step, model):
+        """每层 β 的均值/std/min/max — 追踪时间尺度分布是否健康。"""
         w = self._writer
-        for name, (tag, param) in self._registry.items():
-            if not param.requires_grad:
-                continue
-            w.add_histogram(f"histograms/{tag}/weight", param.data, step)
-            if param.grad is not None:
-                w.add_histogram(f"histograms/{tag}/grad", param.grad, step)
-
-    def _log_compensation_factors(self, step, model):
-        """记录 sigmoid/softplus 导数均值（诊断梯度补偿效果）。"""
-        w = self._writer
+        all_betas = []
         for i, layer_module in enumerate(model.layers):
             if not hasattr(layer_module, 'snn_block'):
-                continue  # 联想记忆层
-            block = layer_module.snn_block
+                continue
             with torch.no_grad():
-                # sigmoid 导数: β·(1-β), β = sigmoid(b_beta)
-                beta = torch.sigmoid(block.b_beta.data)
-                sigmoid_deriv = (beta * (1.0 - beta)).mean().item()
-                w.add_scalar(
-                    f"compensation/layer_{i:02d}/sigmoid_deriv_mean",
-                    sigmoid_deriv, step)
+                beta = torch.sigmoid(layer_module.snn_block.b_beta.data)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/mean", beta.mean().item(), step)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/std", beta.std().item(), step)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/min", beta.min().item(), step)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/max", beta.max().item(), step)
+                all_betas.append(beta)
 
-                # softplus 导数: sigmoid(b_alpha)
-                softplus_deriv = torch.sigmoid(block.b_alpha.data).mean().item()
-                w.add_scalar(
-                    f"compensation/layer_{i:02d}/softplus_deriv_mean",
-                    softplus_deriv, step)
+        # 全局 β 统计
+        if all_betas:
+            all_beta = torch.cat(all_betas)
+            w.add_scalar("beta_dist/global/mean", all_beta.mean().item(), step)
+            w.add_scalar("beta_dist/global/std", all_beta.std().item(), step)
+            w.add_scalar("beta_dist/global/min", all_beta.min().item(), step)
+            w.add_scalar("beta_dist/global/max", all_beta.max().item(), step)
 
-    # ====== 健康监控（每 log_interval 步） ======
+        # 输入神经元 β
+        for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'input_neuron1'):
+                continue
+            with torch.no_grad():
+                b1 = torch.sigmoid(layer_module.input_neuron1.w.data)
+                b2 = torch.sigmoid(layer_module.input_neuron2.w.data)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/input1_mean", b1.mean().item(), step)
+                w.add_scalar(f"beta_dist/layer_{i:02d}/input2_mean", b2.mean().item(), step)
+
+    # ====== 6. 联想记忆层监控 ======
+
+    def _log_associative_memory(self, step, model):
+        """联想记忆层 M 的范数 + write_gate 发放率。"""
+        w = self._writer
+        for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'neuron_gate'):
+                continue
+
+            # M 矩阵范数（如果已初始化）
+            M = getattr(layer_module, 'M', None)
+            if M is not None and not isinstance(M, float):
+                for g in range(M.shape[0]):
+                    m_norm = M[g].norm().item()
+                    w.add_scalar(f"memory/layer_{i:02d}/M_group{g}_norm", m_norm, step)
+                # M 的有效秩估计（奇异值比）
+                with torch.no_grad():
+                    # 取第一个 batch 的 M_slow (最后一组)
+                    M_last = M[-1, 0] if M.dim() == 4 else M[-1]
+                    if M_last.numel() > 0:
+                        s = torch.linalg.svdvals(M_last.float())
+                        if s[0] > 1e-8:
+                            effective_rank = (s / s[0]).sum().item()
+                            w.add_scalar(f"memory/layer_{i:02d}/effective_rank", effective_rank, step)
+
+    # ====== 7. 健康监控（坍缩/癫痫/趋同检测） ======
 
     @staticmethod
     def _gini(values):
-        """计算 Gini 系数（衡量不均匀度，0=完全均匀，1=完全集中）。"""
         if len(values) < 2:
             return 0.0
         vals = sorted(values)
@@ -329,13 +278,10 @@ class SNNDashboard:
         return (2.0 * cum) / (n * total) - (n + 1) / n
 
     def _log_health(self, step, model):
-        """综合健康监控：梯度均衡早期预警。
-
-        health/score: 0~1 综合得分（1=健康，<0.5 需要关注）
-        """
+        """坍缩/癫痫/趋同检测 + 综合健康得分。"""
         w = self._writer
 
-        # ====== 1. 层间梯度 Gini 系数 ======
+        # ====== 1. 层间梯度 Gini ======
         cache = self._grad_cache
         layer_grad_sums = {}
         for name, grad_norm in cache.items():
@@ -347,7 +293,6 @@ class SNNDashboard:
             layer_norms = [v ** 0.5 for v in layer_grad_sums.values()]
             grad_gini = self._gini(layer_norms)
             w.add_scalar("health/grad_gini", grad_gini, step)
-            # 每层梯度份额
             total_gn = sum(layer_norms)
             for idx in sorted(layer_grad_sums.keys()):
                 share = (layer_grad_sums[idx] ** 0.5) / (total_gn + 1e-12)
@@ -355,6 +300,97 @@ class SNNDashboard:
         else:
             grad_gini = 0.0
 
-        # ====== 2. 综合得分 ======
+        # ====== 2. β 趋同度（层内 std → 0 = 丧失多样性） ======
+        beta_stds = []
+        for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'snn_block'):
+                continue
+            with torch.no_grad():
+                beta = torch.sigmoid(layer_module.snn_block.b_beta.data)
+                beta_std = beta.std().item()
+                beta_stds.append(beta_std)
+                w.add_scalar(f"health/beta_std/layer_{i:02d}", beta_std, step)
+        if beta_stds:
+            min_beta_std = min(beta_stds)
+            w.add_scalar("health/beta_std_min", min_beta_std, step)
+            # 趋同警告：std < 0.01 说明 β 几乎一样了
+            w.add_scalar("health/beta_converged_layers",
+                         sum(1 for s in beta_stds if s < 0.01), step)
+
+        # ====== 3. 死神经元 / 癫痫神经元检测 ======
+        # 通过 b_beta 间接推断：极高 β + 高 V_th = 死（永远不发放）
+        # 极低 β + 低 V_th = 癫痫（每步都发放）
+        dead_count = 0
+        epileptic_count = 0
+        total_neurons = 0
+        for layer_module in model.layers:
+            if not hasattr(layer_module, 'snn_block'):
+                continue
+            block = layer_module.snn_block
+            with torch.no_grad():
+                beta = torch.sigmoid(block.b_beta.data)
+                v_th = block.v_th_min + torch.abs(block.b_th.data)
+                # 稳态 V = α·I/(1-β)，假设 α·I ≈ 0.2（典型值）
+                v_steady_est = 0.2 / (1.0 - beta + 1e-8)
+                # 死神经元：稳态 V 远低于 V_th
+                dead = (v_steady_est < 0.1 * v_th).sum().item()
+                # 癫痫：稳态 V 远高于 V_th
+                epileptic = (v_steady_est > 10.0 * v_th).sum().item()
+                n = beta.numel()
+                dead_count += dead
+                epileptic_count += epileptic
+                total_neurons += n
+
+        if total_neurons > 0:
+            dead_rate = dead_count / total_neurons
+            epileptic_rate = epileptic_count / total_neurons
+            w.add_scalar("health/dead_neuron_rate", dead_rate, step)
+            w.add_scalar("health/epileptic_neuron_rate", epileptic_rate, step)
+        else:
+            dead_rate = 0.0
+            epileptic_rate = 0.0
+
+        # ====== 4. 层间输出范数比（检测梯度爆炸/消失） ======
+        # 通过 residual_proj 权重范数间接估计
+        layer_out_norms = []
+        for layer_module in model.layers:
+            if hasattr(layer_module, 'block_out_proj'):
+                with torch.no_grad():
+                    norm = layer_module.block_out_proj.weight.data.norm().item()
+                    layer_out_norms.append(norm)
+        if len(layer_out_norms) >= 2:
+            out_ratio = max(layer_out_norms) / (min(layer_out_norms) + 1e-12)
+            w.add_scalar("health/layer_output_norm_ratio", out_ratio, step)
+
+        # ====== 5. 综合得分 ======
         s_grad = max(0.0, 1.0 - grad_gini * 2.0)
-        w.add_scalar("health/score", s_grad, step)
+        s_beta = max(0.0, 1.0 - sum(1 for s in beta_stds if s < 0.01) / max(len(beta_stds), 1))
+        s_neuron = max(0.0, 1.0 - (dead_rate + epileptic_rate) * 5.0)
+        score = 0.4 * s_grad + 0.3 * s_beta + 0.3 * s_neuron
+        w.add_scalar("health/score", score, step)
+
+    # ====== 直方图 + 补偿因子（save_interval） ======
+
+    def _log_histograms(self, step):
+        w = self._writer
+        for name, (tag, param) in self._registry.items():
+            if not param.requires_grad:
+                continue
+            w.add_histogram(f"histograms/{tag}/weight", param.data, step)
+            if param.grad is not None:
+                w.add_histogram(f"histograms/{tag}/grad", param.grad, step)
+
+    def _log_compensation_factors(self, step, model):
+        w = self._writer
+        for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'snn_block'):
+                continue
+            block = layer_module.snn_block
+            with torch.no_grad():
+                beta = torch.sigmoid(block.b_beta.data)
+                sigmoid_deriv = (beta * (1.0 - beta)).mean().item()
+                w.add_scalar(f"compensation/layer_{i:02d}/sigmoid_deriv_mean",
+                             sigmoid_deriv, step)
+                softplus_deriv = torch.sigmoid(block.b_alpha.data).mean().item()
+                w.add_scalar(f"compensation/layer_{i:02d}/softplus_deriv_mean",
+                             softplus_deriv, step)

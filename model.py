@@ -472,18 +472,16 @@ class SNNLanguageModel(nn.Module):
             if layer_type == 'memory':
                 # 联想记忆层的参数归入对应组
                 groups['residual_projs'].extend([
-                    layer_module.W_k.weight,
-                    layer_module.W_v.weight,
-                    layer_module.W_q.weight,
-                    layer_module.W_out.weight,
+                    layer_module.qkv_proj.weight,
+                    layer_module.out_proj.weight,
                 ])
                 groups['input_neurons'].extend([
-                    layer_module.neuron_k.w, layer_module.neuron_k.v_th,
-                    layer_module.neuron_v.w, layer_module.neuron_v.v_th,
-                    layer_module.neuron_q.w, layer_module.neuron_q.v_th,
-                    layer_module.neuron_gate.w, layer_module.neuron_gate.v_th,
+                    layer_module.gate_neuron.w, layer_module.gate_neuron.v_th,
                 ])
-                groups['rms_norms'].append(layer_module.norm.weight)
+                groups['rms_norms'].extend([
+                    layer_module.norm.weight,
+                    layer_module.out_norm.weight,
+                ])
                 continue
 
             block = layer_module.snn_block

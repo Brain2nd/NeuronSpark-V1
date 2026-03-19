@@ -216,11 +216,15 @@ class SNNDashboard:
             if not hasattr(layer_module, 'snn_block'):
                 continue
             with torch.no_grad():
-                beta = torch.sigmoid(layer_module.snn_block.b_beta.data)
+                b_raw = layer_module.snn_block.b_beta.data
+                beta = torch.sigmoid(b_raw)
                 w.add_scalar(f"beta_dist/layer_{i:02d}/mean", beta.mean().item(), step)
                 w.add_scalar(f"beta_dist/layer_{i:02d}/std", beta.std().item(), step)
                 w.add_scalar(f"beta_dist/layer_{i:02d}/min", beta.min().item(), step)
                 w.add_scalar(f"beta_dist/layer_{i:02d}/max", beta.max().item(), step)
+                # raw b_beta（sigmoid 前，bf16 下也能看到变化）
+                w.add_scalar(f"beta_raw/layer_{i:02d}/mean", b_raw.mean().item(), step)
+                w.add_scalar(f"beta_raw/layer_{i:02d}/std", b_raw.std().item(), step)
                 all_betas.append(beta)
 
         # 全局 β 统计

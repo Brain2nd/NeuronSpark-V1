@@ -68,8 +68,9 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
 
     print(f"  → Checkpoint saved: {ckpt_dir}")
 
-    # 清理旧 checkpoint 目录，仅保留最新 max_keep 个
-    ckpt_dirs = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*')))
+    # 清理旧 checkpoint 目录，按 mtime 排序，仅保留最新 max_keep 个
+    ckpt_dirs = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*')),
+                       key=os.path.getmtime)
     while len(ckpt_dirs) > max_keep:
         old = ckpt_dirs.pop(0)
         shutil.rmtree(old)

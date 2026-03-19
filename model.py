@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from spikingjelly.activation_based import functional, surrogate
 from torch.utils.checkpoint import checkpoint
 
-from atomic_ops import SNNDecoderLayer, SNNAssociativeMemoryLayer
+from atomic_ops import SNNDecoderLayer, SNNAttentionDecoderLayer
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
@@ -105,12 +105,14 @@ class SNNLanguageModel(nn.Module):
         self.layer_types = []  # 'snn' or 'memory'
         for i in range(num_layers):
             if memory_layer_interval > 0 and (i + 1) % memory_layer_interval == 0:
-                self.layers.append(SNNAssociativeMemoryLayer(
-                    D=D,
-                    D_key=D_key,
-                    D_value=D_value,
+                self.layers.append(SNNAttentionDecoderLayer(
+                    D=D, N=N, D_ff=D_ff,
+                    D_key=D_key, D_value=D_value,
+                    v_th_min=v_th_min,
+                    ffn_v_threshold=0.15,
                     K=K,
                     num_layers=num_layers,
+                    layer_idx=i,
                     activation_mode=activation_mode,
                 ))
                 self.layer_types.append('memory')
@@ -160,30 +162,18 @@ class SNNLanguageModel(nn.Module):
         h = spike_seq
         ponder_costs = []
 
-        def _snn_layer_forward(layer_mod, x):
+        def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
-            return layer_mod.forward_parallel(x)  # returns (h, ponder_cost)
+            return layer_mod.forward_parallel(x)  # 统一返回 (h, ponder_cost)
 
-        def _memory_layer_forward(layer_mod, x):
-            functional.reset_net(layer_mod)
-            out = layer_mod.forward_parallel(x)  # returns h only
-            return x + out, torch.tensor(0.0, device=x.device)  # 残差连接 + dummy pc
-
-        for layer_module, layer_type in zip(self.layers, self.layer_types):
-            if layer_type == 'memory':
-                h, pc = checkpoint(
-                    _memory_layer_forward, layer_module, h,
-                    use_reentrant=False,
-                )
-            else:
-                h, pc = checkpoint(
-                    _snn_layer_forward, layer_module, h,
-                    use_reentrant=False,
-                )
+        for layer_module in self.layers:
+            h, pc = checkpoint(
+                _layer_forward, layer_module, h,
+                use_reentrant=False,
+            )
             ponder_costs.append(pc)
 
-        snn_costs = [pc for pc, lt in zip(ponder_costs, self.layer_types) if lt == 'snn']
-        total_ponder_cost = sum(snn_costs) / max(len(snn_costs), 1)
+        total_ponder_cost = sum(ponder_costs) / len(ponder_costs)
         return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
@@ -270,11 +260,8 @@ class SNNLanguageModel(nn.Module):
         # ====== Prefill: parallel 处理整个 prompt ======
         h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
         h = h_seq
-        for layer_module, layer_type in zip(self.layers, self.layer_types):
-            if layer_type == 'memory':
-                h = h + layer_module.forward_parallel(h)  # 残差连接
-            else:
-                h, _ = layer_module.forward_parallel(h)  # 推理忽略 ponder_cost
+        for layer_module in self.layers:
+            h, _ = layer_module.forward_parallel(h)
         # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
 
         logits = self.decode(h, prompt_len)
@@ -293,11 +280,8 @@ class SNNLanguageModel(nn.Module):
 
             # K 帧通过 SNN — 不 reset，神经元 .v 跨 token 连续传递
             h = frames
-            for layer_module, layer_type in zip(self.layers, self.layer_types):
-                if layer_type == 'memory':
-                    h = h + layer_module.forward_parallel(h)
-                else:
-                    h, _ = layer_module.forward_parallel(h)
+            for layer_module in self.layers:
+                h, _ = layer_module.forward_parallel(h)
 
             logits = self.decode(h, 1)
 
@@ -470,17 +454,31 @@ class SNNLanguageModel(nn.Module):
 
         for layer_module, layer_type in zip(self.layers, self.layer_types):
             if layer_type == 'memory':
-                # 联想记忆层的参数归入对应组
+                # SNNAttentionDecoderLayer: attn 子层 + ffn 子层
                 groups['residual_projs'].extend([
                     layer_module.qkv_proj.weight,
-                    layer_module.out_proj.weight,
+                    layer_module.attn_out_proj.weight,
+                    layer_module.ffn_out_proj.weight,
                 ])
                 groups['input_neurons'].extend([
                     layer_module.gate_neuron.w, layer_module.gate_neuron.v_th,
+                    layer_module.input_neuron2.w, layer_module.input_neuron2.v_th,
                 ])
                 groups['rms_norms'].extend([
-                    layer_module.norm.weight,
-                    layer_module.out_norm.weight,
+                    layer_module.attn_norm.weight,
+                    layer_module.attn_out_norm.weight,
+                    layer_module.ffn_norm.weight,
+                ])
+                groups['halt_projs'].extend(list(layer_module.ffn_halt.parameters()))
+                # SNNFFN 参数
+                ffn = layer_module.snn_ffn
+                groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
+                groups['ffn_up_proj'].append(ffn.up_proj.weight)
+                groups['ffn_down_proj'].append(ffn.down_proj.weight)
+                groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
+                groups['ffn_neurons'].extend([
+                    ffn.gate_neuron.w, ffn.gate_neuron.v_th,
+                    ffn.up_neuron.w, ffn.up_neuron.v_th,
                 ])
                 continue
 

@@ -142,6 +142,17 @@ class SNNDashboard:
 
         for i, layer_module in enumerate(model.layers):
             prefix = f"layer_{i:02d}"
+
+            # 联想记忆层：只有 neuron_k/v/q/gate
+            if not hasattr(layer_module, 'snn_block'):
+                for name in ('neuron_k', 'neuron_v', 'neuron_q', 'neuron_gate'):
+                    neuron = getattr(layer_module, name, None)
+                    if neuron is not None and hasattr(neuron, 'w'):
+                        semantics.append(
+                            (f"{prefix}/mem_{name}_beta", neuron.w,
+                             torch.sigmoid, "beta"))
+                continue
+
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
@@ -251,6 +262,9 @@ class SNNDashboard:
         """记录每层 PonderNet E[K] 的极值范围 + halt 参数统计。"""
         w = self._writer
         for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'block_halt'):
+                continue  # 联想记忆层没有 PonderNet
+
             ek_min = getattr(layer_module, '_ek_min', None)
             ek_max = getattr(layer_module, '_ek_max', None)
             if ek_min is not None:
@@ -282,6 +296,8 @@ class SNNDashboard:
         """记录 sigmoid/softplus 导数均值（诊断梯度补偿效果）。"""
         w = self._writer
         for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'snn_block'):
+                continue  # 联想记忆层
             block = layer_module.snn_block
             with torch.no_grad():
                 # sigmoid 导数: β·(1-β), β = sigmoid(b_beta)

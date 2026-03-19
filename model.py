@@ -384,6 +384,8 @@ class SNNLanguageModel(nn.Module):
         """
         # ====== Phase 1: Sigmoid/softplus 饱和补偿 ======
         for layer_module in self.layers:
+            if not hasattr(layer_module, 'snn_block'):
+                continue  # 联想记忆层无调制参数
             block = layer_module.snn_block
 
             # b_beta: sigmoid 饱和补偿
@@ -411,6 +413,8 @@ class SNNLanguageModel(nn.Module):
                 norms = []
                 params_list = []
                 for layer_module in self.layers:
+                    if not hasattr(layer_module, 'snn_block'):
+                        continue
                     p = getattr(layer_module.snn_block, param_name)
                     if p.grad is not None:
                         n = p.grad.norm().item()

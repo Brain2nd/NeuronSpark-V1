@@ -87,7 +87,7 @@ class SNNLanguageModel(nn.Module):
         self.norm = LateralInhibition(D)
 
         # ====== 解码投影 ======
-        self.decode_proj = nn.Linear(D, D)
+        self.decode_proj = nn.Linear(D, D, bias=False)
 
         # ====== 输出 RMSNorm + 输出神经元 ======
         self.output_norm = RMSNorm(D)
@@ -133,7 +133,6 @@ class SNNLanguageModel(nn.Module):
         """初始化所有可训练权重（从零训练）。"""
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.decode_proj.weight)
-        nn.init.zeros_(self.decode_proj.bias)
 
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
         """输入边界：token_ids → 连续值序列。

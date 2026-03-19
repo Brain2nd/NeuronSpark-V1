@@ -117,7 +117,7 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
         # PonderNet halt (子层 2)
-        self.ffn_halt = nn.Linear(D, 1, bias=True)
+        self.ffn_halt = nn.Linear(D, 1, bias=False)
 
         # ====== 初始化 ======
         std = 0.02 / math.sqrt(2 * num_layers)
@@ -126,7 +126,6 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
         nn.init.xavier_uniform_(self.ffn_halt.weight)
         self.ffn_halt.weight.data.mul_(0.01)
-        nn.init.constant_(self.ffn_halt.bias, -3.5)
 
     def _input_neuron_parallel(self, input_neuron, x):
         """PLIFNode parallel scan, 返回激活值。复用 SNNDecoderLayer 的逻辑。"""

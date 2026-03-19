@@ -150,20 +150,18 @@ class SNNDecoderLayer(base.MemoryModule):
         # ====== 动态 K: 停止投影（突触: SNN 输出 → 停止概率） ======
         # halt_proj: D → 1，每步每 token 产生一个停止 logit
         # PonderNet 几何分布加权，替代 uniform mean 聚合
-        self.block_halt = nn.Linear(D, 1, bias=True)
-        self.ffn_halt = nn.Linear(D, 1, bias=True)
+        self.block_halt = nn.Linear(D, 1, bias=False)
+        self.ffn_halt = nn.Linear(D, 1, bias=False)
 
         # 残差输出缩放初始化（GPT-2 style: σ = 0.02 / √(2·num_layers)）
         std = 0.02 / math.sqrt(2 * num_layers)
         nn.init.normal_(self.block_out_proj.weight, std=std)
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
 
-        # halt 初始化: 小权重 + 负偏置 → p_halt ≈ 0.03 → 接近 uniform 聚合
-        # σ(-3.5) ≈ 0.029, 几何分布归一化后 λ_1/λ_K ≈ 1.5, 接近均匀
+        # halt 初始化: 小权重 → 输出接近 0 → sigmoid ≈ 0.5 → 接近 uniform 聚合
         for halt in [self.block_halt, self.ffn_halt]:
             nn.init.xavier_uniform_(halt.weight)
             halt.weight.data.mul_(0.01)
-            nn.init.constant_(halt.bias, -3.5)
 
     def _input_neuron_parallel(self, input_neuron, x):
         """

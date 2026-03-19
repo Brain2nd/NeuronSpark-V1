@@ -203,8 +203,6 @@ class SNNDashboard:
                                    ('ffn_halt', layer_module.ffn_halt)]:
                     w.add_scalar(f"halt/layer_{i:02d}/{name}/weight_norm",
                                  halt.weight.data.norm().item(), step)
-                    w.add_scalar(f"halt/layer_{i:02d}/{name}/bias",
-                                 halt.bias.data.item(), step)
 
     # ====== 5. β 分布演化（论文级） ======
 

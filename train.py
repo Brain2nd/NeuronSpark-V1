@@ -340,8 +340,8 @@ if __name__ == "__main__":
     # 神经元参数（PLIFNode w/v_th, 调制偏置 b_beta/b_alpha/b_th）梯度天然较弱
     # （surrogate sigmoid 窗口窄），需要更高 lr 才能跟上权重矩阵的漂移速度。
     _pg = model.get_param_groups()
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
-                    'block_output_neuron', 'ffn_neurons', 'output_neuron'}
+    _neuron_keys = ('input_neurons', 'b_beta', 'b_alpha', 'b_th',
+                    'block_output_neuron', 'ffn_neurons', 'output_neuron')
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
     optimizer = optim.Adam([

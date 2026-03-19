@@ -334,8 +334,9 @@ if __name__ == "__main__":
     # ==================== 优化器 ====================
     # 通过 .module 访问原始模型方法
     _pg = model.module.get_param_groups()
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
-                    'block_output_neuron', 'ffn_neurons', 'output_neuron'}
+    # tuple 保证固定遍历顺序（set 在不同进程间顺序随机，导致 optimizer state 映射错乱）
+    _neuron_keys = ('input_neurons', 'b_beta', 'b_alpha', 'b_th',
+                    'block_output_neuron', 'ffn_neurons', 'output_neuron')
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
     optimizer = optim.Adam([
@@ -348,6 +349,8 @@ if __name__ == "__main__":
     if _resume_optim_state is not None:
         optimizer.load_state_dict(_resume_optim_state)
         Logger("  Optimizer state restored.", rank)
+    elif args.resume:
+        Logger("  Optimizer state not found, starting fresh.", rank)
 
     # ==================== 训练信息 ====================
     iter_per_epoch = len(train_loader)

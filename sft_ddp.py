@@ -296,8 +296,8 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     _pg = model.module.get_param_groups()
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
-                    'block_output_neuron', 'ffn_neurons', 'output_neuron'}
+    _neuron_keys = ('input_neurons', 'b_beta', 'b_alpha', 'b_th',
+                    'block_output_neuron', 'ffn_neurons', 'output_neuron')
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
     optimizer = optim.AdamW([

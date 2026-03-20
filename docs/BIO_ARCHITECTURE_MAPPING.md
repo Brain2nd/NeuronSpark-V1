@@ -1,0 +1,348 @@
+# NeuronSpark V2.5 架构与脑结构的对应关系
+
+> 供神经科学专家校验的技术文档。
+> 梳理每个计算组件的数学定义、在模型中的功能角色、以及对应的脑区/神经机制。
+
+---
+
+## 1. 整体架构概览
+
+```
+输入 token → Embedding → repeat K 帧
+  → 24 层交替堆叠:
+      18 层 SNN Decoder Layer（皮层局部回路）
+       6 层 SNN-Attention Layer（丘脑-海马系统）
+  → 输出神经元 → 侧向抑制 → 词表投影 → logits
+```
+
+配比 3:1（每 4 层中 3 层局部回路 + 1 层全局记忆），类似于皮层中局部处理和长程连接的比例关系。
+
+---
+
+## 2. 基础神经元：PLIF（Parametric Leaky Integrate-and-Fire）
+
+### 数学定义
+
+```
+V_pre[t] = β · V_post[t-1] + (1-β) · x[t]       充电（漏积分）
+s[t]     = Θ(V_pre[t] - V_th)                     发放（阈值比较）
+V_post[t] = V_pre[t] - V_th · s[t]                软重置
+output   = (1-β) · V_post[t]                       输出（膜电位泄漏量）
+```
+
+### 可学习参数
+
+| 参数 | 含义 | 值域 |
+|---|---|---|
+| β = sigmoid(w) | 膜时间常数（衰减率） | (0, 1)，D 维，每个神经元独立 |
+| V_th | 发放阈值 | R+，D 维，每个神经元独立 |
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| V（膜电位） | 神经元胞体的膜电位 |
+| β（衰减率） | 膜时间常数 τ = 1/(1-β)，由离子通道特性决定 |
+| (1-β)·x（充电项） | 突触后电位（PSP）的积分 |
+| V_th（阈值） | 动作电位触发阈值（~-55mV） |
+| soft reset（V -= V_th·s） | 动作电位后的相对不应期 |
+| (1-β)·V_post（输出） | 突触前释放的神经递质量，与膜电位相关的分级释放 |
+
+### 校验问题
+
+1. 输出使用膜电位泄漏量 (1-β)·V_post 而非二值 spike，这对应生物系统中的什么？
+   - 我们的解释：类似于分级电位（graded potential），如视网膜光感受器的输出
+   - 或：突触小泡释放概率与膜电位的连续关系
+2. β 在训练中由数据驱动优化，是否对应离子通道的自适应修饰（如磷酸化调节）？
+
+---
+
+## 3. SelectivePLIF：输入依赖的动态参数神经元
+
+### 数学定义
+
+```
+β(t) = sigmoid(W_β · x[t] + b_β)                 动态衰减率
+α(t) = softplus(W_α · x[t] + b_α)                动态写入增益
+V_th(t) = V_th_min + |W_th · x[t] + b_th|         动态阈值
+
+V[t] = β(t) · V[t-1] + α(t) · I[t]
+s[t] = Θ(V[t] - V_th(t))
+V[t] -= V_th(t) · s[t]
+```
+
+### 生物对应
+
+| 动态参数 | 脑中对应 |
+|---|---|
+| β(t) 输入依赖的衰减率 | 神经调制（如乙酰胆碱/去甲肾上腺素改变膜时间常数） |
+| α(t) 输入依赖的增益 | 突触增益调制（如 NMDA 受体的电压依赖性） |
+| V_th(t) 输入依赖的阈值 | 阈值的快速适应（如 Na+ 通道的失活/恢复动力学） |
+| W_β, W_α, W_th（6 条并行投影） | 不同类型的突触输入调制不同膜特性 |
+
+### 校验问题
+
+1. β, α, V_th 同时由同一个输入 x 调制，这在生物中是否合理？
+   - 不同调制通常由不同的神经递质系统（胆碱能、去甲肾上腺素能、多巴胺能）独立控制
+   - 我们的设计中，不同投影矩阵 W_β, W_α, W_th 是否足够模拟这种独立性？
+2. 6 条并行投影路径对应什么？是否可对应树突不同区域的独立输入？
+
+---
+
+## 4. SNNBlock：隐状态空间计算单元
+
+### 结构
+
+```
+x(D 维) → 因果卷积(kernel=4) → 6 条并行投影:
+  ├─ W_in(D→D×N)    → I[t]（主输入电流）
+  ├─ W_β(D→D×N)     → β(t)（衰减率调制）
+  ├─ W_α(D→D×N)     → α(t)（增益调制）
+  ├─ W_th(D→D×N)    → V_th(t)（阈值调制）
+  ├─ W_gate(D→D)    → gate（输出门控）
+  └─ W_skip(D→D)    → skip（残差跳跃）
+
+SelectivePLIF(I, β, α, V_th) → V_post(D×N 维)
+
+W_out(D×N→D) · V_post ⊙ gate + skip → 输出(D 维)
+```
+
+### N = 8（状态扩展因子）
+
+每个可见维度扩展为 N=8 个隐神经元，各有不同的 β 初始化 ∈ [0.80, 0.99]，
+覆盖从快（τ=5 帧）到慢（τ=100 帧）的多时间尺度。
+
+### 因果卷积
+
+```
+Conv1d(D, D, kernel_size=4, groups=D, causal)
+```
+
+每个通道独立看前 3 帧 + 当前帧的局部上下文。
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| SNNBlock 整体 | 皮层微柱（cortical minicolumn）的局部回路 |
+| N=8 个多时间尺度神经元 | 同一微柱内不同层（L2/3, L4, L5, L6）的神经元群，各有不同的时间常数 |
+| W_in（主输入投影） | 丘脑皮层投射（thalamocortical projection）到 L4 |
+| W_β/W_α/W_th（调制投影） | 来自高级皮层的反馈调制（top-down modulation） |
+| W_gate（输出门控） | L5 锥体神经元的输出门控（basal ganglia 通路） |
+| W_skip（残差跳跃） | 直接通路（feedforward bypass），不经过时序处理 |
+| W_out（D×N → D 投影） | 微柱的输出汇聚（readout from multiple cell types） |
+| 因果卷积(k=4) | 树突的局部时空整合（dendritic integration over ~4 个突触延迟） |
+
+### 校验问题
+
+1. N=8 个并行的不同 β 神经元，是否对应皮层微柱内不同细胞类型的不同时间常数？
+2. 6 条并行投影是否有过多？皮层微柱的实际输入模态数量是多少？
+3. gate 机制（sigmoid 门控输出）在皮层回路中有直接对应吗？
+
+---
+
+## 5. SNNFFN：脉冲前馈网络
+
+### 结构
+
+```
+x → gate_proj(D→D_ff) → PLIFNode_gate → V_post_gate
+x → up_proj(D→D_ff)   → PLIFNode_up   → V_post_up
+
+gated = (1-β_g)·V_post_gate × (1-β_u)·V_post_up    // 双通路乘法门控
+
+down_proj(D_ff→D)(gated) + skip_proj(D→D)(x) → 输出
+```
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| 双通路乘法门控 | 树突的乘法交互（dendritic multiplication），两条输入在树突上的非线性整合 |
+| gate × up 结构 | 类似 SiLU/SwiGLU 的生物实现：一条通路控制增益，另一条传递信号 |
+| D_ff > D 的扩展-压缩 | 皮层中间层（如 L2/3）的神经元数量 > 输入/输出层 |
+| skip 连接 | 直接兴奋性传递（monosynaptic excitation） |
+
+### 校验问题
+
+1. 树突的乘法计算是否有足够的实验证据支持？
+   - 参考：Poirazi et al. 2003, "Pyramidal Neuron as a Two-Layer Neural Network"
+2. gate × up 的双通路结构是否对应 ON-OFF 通路（如视觉系统的 ON-center / OFF-center）？
+
+---
+
+## 6. PonderNet：自适应计算步数
+
+### 数学定义
+
+```
+对每个 token 的 K=12 帧 SNN 输出:
+
+p_k = σ(halt_proj(frame_k))               每步的停止概率
+S_k = ∏_{j<k} (1 - p_j)                   生存概率
+λ_k = p_k · S_k                           几何分布权重
+λ̂_k = λ_k / Σ λ_k                         归一化
+
+output = Σ_k λ̂_k · frame_k                加权聚合
+E[K] = Σ_k k · λ̂_k                        期望步数
+```
+
+简单 token 早停（E[K]≈1），复杂 token 多想（E[K]≈10-11）。
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| 自适应步数 | 皮层振荡中的可变处理周期：简单刺激引起少量 gamma 振荡周期，复杂刺激引起更多周期 |
+| halt 信号 | 前额叶对处理完成度的监控（metacognition），类似 anterior cingulate cortex (ACC) 的冲突/完成检测 |
+| 几何分布聚合 | 类似 evidence accumulation (漂移扩散模型)，累积够就停 |
+| K=12 上限 | 一个 gamma 振荡 burst 内的最大周期数（~200-500ms / ~20ms per cycle ≈ 10-25 cycles） |
+
+### 校验问题
+
+1. K=12 帧是否对应 gamma 振荡的 cycle 数？一个 gamma burst 通常有多少个 cycle？
+2. PonderNet 的停止概率学习是否有对应的神经机制？ACC 的活动是否可以建模为这样的 halt 信号？
+
+---
+
+## 7. SNNDecoderLayer：完整的皮层局部回路
+
+### 结构（双子层）
+
+```
+子层 1: RMSNorm → PLIFNode → SNNBlock → PonderNet聚合 → out_proj → 残差中心化 → 残差
+子层 2: RMSNorm → PLIFNode → SNNFFN  → PonderNet聚合 → out_proj → 残差中心化 → 残差
+```
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| 双子层结构 | 皮层回路的两阶段处理：L4→L2/3（接收→关联）和 L2/3→L5（关联→输出） |
+| RMSNorm（侧向抑制） | 抑制性中间神经元（PV+ interneurons）的 divisive normalization |
+| 输入 PLIFNode | 兴奋性中间神经元（stellate cells in L4），将连续信号转为脉冲编码 |
+| 残差中心化（h -= mean(h)） | 适应（adaptation），消除 DC 偏移，维持群体活动平衡 |
+| 残差连接（h = h + sublayer） | 皮层层间的跳跃连接（如 L2/3 直接到 L5 的投射） |
+| out_proj 的缩放初始化 | 突触的初始弱连接，通过学习增强（Hebbian-like） |
+
+---
+
+## 8. SNN-Attention Layer：丘脑-海马记忆系统
+
+### 结构
+
+```
+子层 1: SNN-Attention
+  h → K帧平均聚合 → token 级表示
+  → 投影 q, k, v
+  → RoPE(q, k)                              // 相对位置编码
+  → PLIFNode gate（spike 门控写入判定）
+  → M[T] = Σ_{t≤T} gate[t] · k[t] · v[t]ᵀ  // 无衰减累积
+  → output[t] = q[t]ᵀ · M[t]                // content-based 分离查询
+  → RMSNorm → out_proj → 残差
+
+子层 2: SNNFFN（同 SNNDecoderLayer）
+```
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| SNN-Attention 整体 | 海马体 CA1-CA3 回路的快速联想记忆 |
+| M 矩阵（无衰减累积） | 海马体 CA3 的自联想网络（autoassociative network），突触权重通过 Hebbian 规则快速修改 |
+| gate（PLIFNode spike 门控） | 海马体门控机制：只有"新颖"或"重要"的信息被编码（novelty detection by dentate gyrus） |
+| k·vᵀ 外积写入 | Hebbian 学习规则：pre × post → 突触增强。k 是 pre-synaptic pattern，v 是 post-synaptic pattern |
+| q·M 查询 | 模式补全（pattern completion）：给一个部分线索 q，从联想记忆 M 中恢复完整模式 |
+| 无衰减（β_M = 1） | 海马体的记忆持续时间（minutes to hours），远长于皮层局部回路的 β 衰减 |
+| RoPE 位置编码 | 海马体的位置细胞（place cells）/ 网格细胞（grid cells），编码空间/序列位置 |
+| K 帧平均 → token 级操作 | 海马体操作在比皮层更慢的时间尺度（theta rhythm ~4-8Hz vs gamma ~30-100Hz） |
+| 3:1 配比（18 SNN : 6 Attention） | 皮层面积远大于海马体，大部分处理是局部的，少量需要全局记忆 |
+
+### 校验问题
+
+1. M 矩阵的无衰减累积是否对应海马体 CA3 的突触可塑性？CA3 的突触增强持续时间是？
+2. spike 门控写入是否对应齿状回（dentate gyrus）的稀疏编码/新颖性检测？
+3. q·M 的线性读出是否过于简化了 CA1 的模式补全过程？
+4. RoPE 作为位置编码放在"海马层"是否合理？海马的位置/网格细胞确实编码序列位置。
+5. 3:1 的皮层:海马比例在解剖学上是否有依据？
+
+---
+
+## 9. 层间信息流：连续残差流
+
+### 设计
+
+```
+h[l+1] = h[l] + sublayer(h[l])
+```
+
+层间传递连续值 h（不是 spike），仅在 SNN 子层内部使用 spike-reset 动力学。
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| 连续残差流 | 皮层白质中的长程轴突传导（graded potential propagation via myelinated axons） |
+| 层内 spike 动力学 | 灰质内的局部回路处理（local circuit processing with action potentials） |
+| 残差连接 | 跨区域的直接投射（bypass connections between cortical areas） |
+
+### 校验问题
+
+1. 层间用连续值传递而非 spike，是否可解释为长程轴突中的模拟信号传导？
+2. 或者：每层的输出可理解为群体编码（population rate code），而非单神经元 spike？
+
+---
+
+## 10. 输出层：侧向抑制 + 竞争选择
+
+### 结构
+
+```
+h → output_neuron（PLIFNode）→ K帧平均 → decode_proj → LateralInhibition → Embedding^T → logits
+```
+
+### 生物对应
+
+| 计算元素 | 脑中对应 |
+|---|---|
+| output_neuron | 运动皮层 / Broca 区的输出神经元 |
+| LateralInhibition | 输出层的抑制性回路，实现赢者通吃（winner-take-all）竞争 |
+| Embedding^T（tied head） | 反向投射：从内部表征到词汇空间的映射，类似语言产出中的词汇选择 |
+| softmax(logits) | 词汇间的互斥竞争选择 |
+
+---
+
+## 11. 多时间尺度层级总结
+
+| 时间尺度 | 组件 | 对应脑区 | 频率范围 |
+|---|---|---|---|
+| 最快（帧级） | PLIF 动力学，K=12 帧/token | 皮层局部回路，gamma 振荡 | ~30-100 Hz |
+| 中等（token 级） | PonderNet 聚合，SNN-Attention | 海马 theta 节律 | ~4-8 Hz |
+| 最慢（序列级） | 残差流累积，M 矩阵持久化 | 工作记忆，前额叶持续活动 | ~0.1-1 Hz |
+
+---
+
+## 12. 训练算法的生物对应
+
+| 训练组件 | 算法 | 生物对应 |
+|---|---|---|
+| 替代梯度（surrogate gradient） | 前向 Θ(x)，反向 sigmoid'(αx) | STDP 的连续近似：spike timing → 突触修改 |
+| Adam 优化器 | 自适应学习率 | 突触标签假说（synaptic tagging）：不同突触有不同的可塑性阈值 |
+| neuron_lr_mult = 10× | 神经元参数更高学习率 | 内在可塑性（intrinsic plasticity）比突触可塑性更快 |
+| compensate_modulation_gradients | sigmoid 饱和区梯度补偿 | 稳态可塑性（homeostatic plasticity）：维持神经元在最佳工作区间 |
+| 残差中心化 | h -= mean(h) | 突触缩放（synaptic scaling）：全局增益调整维持活动平衡 |
+
+---
+
+## 13. 待校验的核心问题清单
+
+1. **泄漏量输出 (1-β)·V_post 的生物学解释**：分级电位？突触释放概率？还是群体发放率编码？
+2. **6 条并行调制投影**：是否对应不同的神经调制系统？数量是否合理？
+3. **N=8 多时间尺度**：皮层微柱内是否确实有 ~8 种不同时间常数的细胞类型？
+4. **无衰减联想记忆 M**：海马 CA3 的突触增强是否可近似为无衰减？时间尺度？
+5. **spike 门控写入**：齿状回的稀疏编码是否是 spike-based gating 的生物基础？
+6. **3:1 局部:全局比例**：皮层和海马体的体积/面积比是否支持这个比例？
+7. **K=12 作为 gamma burst 的 cycle 数**：实验数据中一个 gamma burst 有多少 cycle？
+8. **PonderNet 的元认知停止**：ACC 的冲突检测信号是否可建模为 halt probability？
+9. **连续残差流**：层间不用 spike 传递，用群体编码/分级电位，是否有实验支持？
+10. **RoPE 在海马层**：位置/网格细胞编码序列位置的假说是否被广泛接受？

@@ -19,10 +19,10 @@ import math
 
 import torch
 import torch.nn as nn
-from spikingjelly.activation_based import base, surrogate
+from .snn_base import MemoryModule, SurrogateSigmoid
 
 
-class PLIFNode(base.MemoryModule):
+class PLIFNode(MemoryModule):
     """
     D 维固定参数 PLIF 神经元。
 
@@ -38,7 +38,7 @@ class PLIFNode(base.MemoryModule):
         dim: int,
         init_tau: float = 2.0,
         v_threshold: float = 0.5,
-        surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        surrogate_function=SurrogateSigmoid(alpha=4.0),
     ):
         super().__init__()
         # D 维可学习参数（随机初始化，每个维度独立）

@@ -18,7 +18,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, surrogate
+from .snn_base import MemoryModule, SurrogateSigmoid
 
 from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
@@ -40,7 +40,7 @@ def _apply_rope(x, cos, sin):
     return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
 
 
-class SNNAttentionDecoderLayer(base.MemoryModule):
+class SNNAttentionDecoderLayer(MemoryModule):
     """
     完整的 SNN-Attention 解码层, 结构对齐 SNNDecoderLayer。
 
@@ -87,7 +87,7 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         self.qkv_proj = nn.Linear(D, D_key * 2 + D_value, bias=False)
         self.gate_neuron = PLIFNode(
             dim=D, init_tau=2.0, v_threshold=0.8,
-            surrogate_function=surrogate.Sigmoid(alpha=4.0),
+            surrogate_function=SurrogateSigmoid(alpha=4.0),
         )
         self.attn_out_norm = RMSNorm(D_value)
         self.attn_out_proj = nn.Linear(D_value, D, bias=False)
@@ -105,7 +105,7 @@ class SNNAttentionDecoderLayer(base.MemoryModule):
         self.ffn_norm = RMSNorm(D)
         self.input_neuron2 = PLIFNode(
             dim=D, init_tau=2.0, v_threshold=0.5,
-            surrogate_function=surrogate.Sigmoid(alpha=4.0),
+            surrogate_function=SurrogateSigmoid(alpha=4.0),
         )
         self.snn_ffn = SNNFFN(
             D=D, D_ff=D_ff,

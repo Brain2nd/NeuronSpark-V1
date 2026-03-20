@@ -23,7 +23,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import functional, surrogate
+from atomic_ops.snn_base import reset_net, SurrogateSigmoid
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer, SNNAttentionDecoderLayer
@@ -95,7 +95,7 @@ class SNNLanguageModel(nn.Module):
             dim=D,
             init_tau=2.0,
             v_threshold=0.3,
-            surrogate_function=surrogate.Sigmoid(alpha=4.0),
+            surrogate_function=SurrogateSigmoid(alpha=4.0),
         )
 
         # ====== 混合层栈: SNN Decoder + SNN Associative Memory ======
@@ -162,7 +162,7 @@ class SNNLanguageModel(nn.Module):
         ponder_costs = []
 
         def _layer_forward(layer_mod, x):
-            functional.reset_net(layer_mod)
+            reset_net(layer_mod)
             return layer_mod.forward_parallel(x)  # 统一返回 (h, ponder_cost)
 
         for layer_module in self.layers:
@@ -254,8 +254,8 @@ class SNNLanguageModel(nn.Module):
 
         # 重置所有神经元（新序列的初始条件 V=0）
         for layer_module in self.layers:
-            functional.reset_net(layer_module)
-        functional.reset_net(self.output_neuron)
+            reset_net(layer_module)
+        reset_net(self.output_neuron)
 
         # ====== Prefill: parallel 处理整个 prompt ======
         h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
@@ -326,8 +326,8 @@ class SNNLanguageModel(nn.Module):
 
         # 重置所有神经元状态
         for layer_module in self.layers:
-            functional.reset_net(layer_module)
-        functional.reset_net(self.output_neuron)
+            reset_net(layer_module)
+        reset_net(self.output_neuron)
 
         # 三段式
         spike_seq = self.encode(token_ids)            # 输入边界

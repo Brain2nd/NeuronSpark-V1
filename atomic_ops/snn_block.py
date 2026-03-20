@@ -21,7 +21,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, layer, surrogate
+from .snn_base import MemoryModule, SurrogateSigmoid
 
 from .selective_plif import SelectivePLIFNode
 from .parallel_scan import plif_parallel_forward
@@ -41,7 +41,7 @@ def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_m
     return beta, u, v_th
 
 
-class SNNBlock(base.MemoryModule):
+class SNNBlock(MemoryModule):
     """
     单个 SNN Block（并行化）。
 
@@ -57,7 +57,7 @@ class SNNBlock(base.MemoryModule):
         D: int,
         N: int = 8,
         v_th_min: float = 0.1,
-        surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        surrogate_function=SurrogateSigmoid(alpha=4.0),
     ):
         super().__init__()
         self.D = D
@@ -77,12 +77,12 @@ class SNNBlock(base.MemoryModule):
         )
 
         # ====== 六条并行输入投影（SNN 突触：spike 输入） ======
-        self.W_in = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_beta_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_alpha_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_th_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')
-        self.W_skip = layer.Linear(D, D, bias=False, step_mode='s')
+        self.W_in = nn.Linear(D, DN, bias=False)
+        self.W_beta_x = nn.Linear(D, DN, bias=False)
+        self.W_alpha_x = nn.Linear(D, DN, bias=False)
+        self.W_th_x = nn.Linear(D, DN, bias=False)
+        self.W_gate = nn.Linear(D, D, bias=False)
+        self.W_skip = nn.Linear(D, D, bias=False)
 
         # ====== β/α/V_th 仅依赖 spike_in（无 W^(V)·V 项） ======
 
@@ -92,7 +92,7 @@ class SNNBlock(base.MemoryModule):
         self.b_th = nn.Parameter(torch.empty(DN))
 
         # ====== 输出投影：D*N → D（SNN 突触） ======
-        self.W_out = layer.Linear(DN, D, bias=False, step_mode='s')
+        self.W_out = nn.Linear(DN, D, bias=False)
 
         # ====== 隐状态空间神经元（D*N 个，动态参数） ======
         self.hidden_neuron = SelectivePLIFNode(

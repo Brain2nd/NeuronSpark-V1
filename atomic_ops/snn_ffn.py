@@ -20,13 +20,13 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, layer, surrogate
+from .snn_base import MemoryModule, SurrogateSigmoid
 
 from .plif_node import PLIFNode
 from .parallel_scan import plif_rowparam_forward
 
 
-class SNNFFN(base.MemoryModule):
+class SNNFFN(MemoryModule):
     """
     SNN 等价的 Feed-Forward Network。
 
@@ -46,7 +46,7 @@ class SNNFFN(base.MemoryModule):
         output_v_threshold: float = 0.3,
         num_layers: int = 1,
         layer_idx: int = 0,
-        surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        surrogate_function=SurrogateSigmoid(alpha=4.0),
         activation_mode: str = 'v2',
     ):
         super().__init__()
@@ -55,12 +55,12 @@ class SNNFFN(base.MemoryModule):
         self.activation_mode = activation_mode
 
         # ====== 三条投影路径（对标 SwiGLU: gate_proj, up_proj, down_proj） ======
-        self.gate_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
-        self.up_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
-        self.down_proj = layer.Linear(D_ff, D, bias=False, step_mode='s')
+        self.gate_proj = nn.Linear(D, D_ff, bias=False)
+        self.up_proj = nn.Linear(D, D_ff, bias=False)
+        self.down_proj = nn.Linear(D_ff, D, bias=False)
 
         # ====== 残差路径 ======
-        self.skip_proj = layer.Linear(D, D, bias=False, step_mode='s')
+        self.skip_proj = nn.Linear(D, D, bias=False)
 
         # ====== 神经元（D 维或 D_ff 维可学习 β 和 V_th） ======
         # gate_neuron: 门控发放

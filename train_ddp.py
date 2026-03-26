@@ -144,7 +144,11 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
     local_rank = int(os.environ["LOCAL_RANK"])
 
     for step, (X, Y, loss_mask) in enumerate(train_loader):
-        global_step = start_step + step
+        if step < start_step:
+            if step % 10000 == 0 and rank == 0:
+                print(f"  Skipping to step {start_step}... ({step}/{start_step})")
+            continue
+        global_step = step
         X = X.to(f"cuda:{local_rank}")
         Y = Y.to(f"cuda:{local_rank}")
         loss_mask = loss_mask.to(f"cuda:{local_rank}")

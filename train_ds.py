@@ -39,6 +39,8 @@ warnings.filterwarnings('ignore')
 # ============================================================
 
 def is_main_process():
+    if not dist.is_initialized():
+        return int(os.environ.get("RANK", "0")) == 0
     return dist.get_rank() == 0
 
 def Logger(content):

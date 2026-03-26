@@ -240,7 +240,6 @@ if __name__ == "__main__":
     parser.add_argument('--dashboard_dir', type=str, default=None)
 
     # DeepSpeed
-    parser.add_argument('--deepspeed_config', type=str, default='ds_config.json')
     parser.add_argument('--local_rank', type=int, default=-1)
 
     parser = deepspeed.add_config_arguments(parser)
@@ -278,7 +277,8 @@ if __name__ == "__main__":
 
     # ==================== DeepSpeed 初始化 ====================
     # 读取 ds_config 并覆盖 CLI 参数
-    with open(args.deepspeed_config) as f:
+    ds_config_path = getattr(args, 'deepspeed_config', 'ds_config.json')
+    with open(ds_config_path) as f:
         ds_config = json.load(f)
     ds_config['train_micro_batch_size_per_gpu'] = args.batch_size
     ds_config['gradient_accumulation_steps'] = args.accumulation_steps

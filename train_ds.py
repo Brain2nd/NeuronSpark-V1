@@ -123,10 +123,11 @@ def train_epoch(epoch, model_engine, train_loader, sampler, args,
             param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
 
         # 前向传播
-        out = model_engine(X, Y)
-        loss = out.last_loss
-        loss_mask_flat = loss_mask.view(-1)
-        loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            out = model_engine(X, Y)
+            loss = out.last_loss
+            loss_mask_flat = loss_mask.view(-1)
+            loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
 
         # 反向传播 (DeepSpeed 自动处理梯度累积和通信)
         model_engine.backward(loss)
@@ -146,7 +147,7 @@ def train_epoch(epoch, model_engine, train_loader, sampler, args,
         if is_boundary and dashboard and is_main_process():
             raw_model = model_engine.module
             dashboard.cache_grad_norms(model_engine)
-            batch_loss = loss.item() * args.accumulation_steps
+            batch_loss = loss.item()
             spend_time = time.time() - start_time
             dashboard.log_step(global_step, {
                 'loss': batch_loss,
@@ -167,7 +168,7 @@ def train_epoch(epoch, model_engine, train_loader, sampler, args,
 
         # 日志
         if global_step % args.log_interval == 0 and is_main_process():
-            batch_loss = loss.item() * args.accumulation_steps
+            batch_loss = loss.item()
             batch_ppl = math.exp(min(batch_loss, 20.0))
             spend_time = time.time() - start_time
             tps = tokens_seen / spend_time if spend_time > 0 else 0

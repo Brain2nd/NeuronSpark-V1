@@ -132,21 +132,20 @@ def train_epoch(epoch, model_engine, train_loader, sampler, args,
         # 反向传播 (DeepSpeed 自动处理梯度累积和通信)
         model_engine.backward(loss)
 
-        # DeepSpeed 自动处理 accumulation 边界的 step
-        model_engine.step()
-
-        # Natural Gradient 补偿 (在 optimizer.step 后做不影响梯度)
-        # 注: DeepSpeed step 内部已经做了 optimizer.step + zero_grad
-        # compensate 需要在 backward 之后、step 之前，这里改为在 backward 后插入
-        # 实际上 DeepSpeed 的 step() 包含了 backward 后的所有操作
-        # 我们需要在 engine.backward() 和 engine.step() 之间做补偿
-
-        # Dashboard + 日志 (每 accumulation_steps 步)
+        # Dashboard: 在 step() 前缓存梯度（step 内部会 zero_grad）
         is_boundary = (step + 1) % args.accumulation_steps == 0
+        if is_boundary and dashboard and is_main_process():
+            dashboard.cache_grad_norms(model_engine.module)
+
+        # Natural Gradient 补偿（backward 之后、step 之前）
+        if is_boundary:
+            model_engine.module.compensate_modulation_gradients()
+
+        # DeepSpeed step（内部处理 accumulation + allreduce + optimizer.step + zero_grad）
+        model_engine.step()
 
         if is_boundary and dashboard and is_main_process():
             raw_model = model_engine.module
-            dashboard.cache_grad_norms(model_engine)
             batch_loss = loss.item()
             spend_time = time.time() - start_time
             dashboard.log_step(global_step, {

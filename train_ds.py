@@ -132,8 +132,10 @@ def train_epoch(epoch, model_engine, train_loader, sampler, args,
         # 反向传播 (DeepSpeed 自动处理梯度累积和通信)
         model_engine.backward(loss)
 
-        # DeepSpeed step（内部处理 accumulation + allreduce + optimizer.step + zero_grad）
+        # accumulation 边界：补偿梯度 + step
         is_boundary = (step + 1) % args.accumulation_steps == 0
+        if is_boundary:
+            model_engine.module.compensate_modulation_gradients()
         model_engine.step()
 
         if is_boundary and dashboard and is_main_process():

@@ -191,18 +191,28 @@ class SNNDashboard:
     def _log_dynamic_k(self, step, model):
         w = self._writer
         for i, layer_module in enumerate(model.layers):
-            if not hasattr(layer_module, 'block_halt'):
-                continue
-            ek_min = getattr(layer_module, '_ek_min', None)
-            ek_max = getattr(layer_module, '_ek_max', None)
-            if ek_min is not None:
-                w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
-                w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
-            with torch.no_grad():
-                for name, halt in [('block_halt', layer_module.block_halt),
-                                   ('ffn_halt', layer_module.ffn_halt)]:
-                    w.add_scalar(f"halt/layer_{i:02d}/{name}/weight_norm",
-                                 halt.weight.data.norm().item(), step)
+            # SNN 层 (block_halt + ffn_halt)
+            if hasattr(layer_module, 'block_halt'):
+                ek_min = getattr(layer_module, '_ek_min', None)
+                ek_max = getattr(layer_module, '_ek_max', None)
+                if ek_min is not None:
+                    w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
+                    w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
+                with torch.no_grad():
+                    for name, halt in [('block_halt', layer_module.block_halt),
+                                       ('ffn_halt', layer_module.ffn_halt)]:
+                        w.add_scalar(f"halt/layer_{i:02d}/{name}/weight_norm",
+                                     halt.weight.data.norm().item(), step)
+            # 海马体层 (ffn_halt only)
+            elif hasattr(layer_module, 'ffn_halt') and not hasattr(layer_module, 'block_halt'):
+                ek_min = getattr(layer_module, '_ek_min', None)
+                ek_max = getattr(layer_module, '_ek_max', None)
+                if ek_min is not None:
+                    w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
+                    w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
+                with torch.no_grad():
+                    w.add_scalar(f"halt/layer_{i:02d}/ffn_halt/weight_norm",
+                                 layer_module.ffn_halt.weight.data.norm().item(), step)
 
     # ====== 5. β 分布演化（论文级） ======
 
@@ -235,13 +245,33 @@ class SNNDashboard:
 
         # 输入神经元 β
         for i, layer_module in enumerate(model.layers):
-            if not hasattr(layer_module, 'input_neuron1'):
+            if hasattr(layer_module, 'input_neuron1'):
+                with torch.no_grad():
+                    b1 = torch.sigmoid(layer_module.input_neuron1.w.data)
+                    b2 = torch.sigmoid(layer_module.input_neuron2.w.data)
+                    w.add_scalar(f"beta_dist/layer_{i:02d}/input1_mean", b1.mean().item(), step)
+                    w.add_scalar(f"beta_dist/layer_{i:02d}/input2_mean", b2.mean().item(), step)
+
+        # 海马体层 gate_neuron β + input_neuron2 β + M_state 范数
+        for i, layer_module in enumerate(model.layers):
+            if not hasattr(layer_module, 'gate_neuron'):
                 continue
             with torch.no_grad():
-                b1 = torch.sigmoid(layer_module.input_neuron1.w.data)
-                b2 = torch.sigmoid(layer_module.input_neuron2.w.data)
-                w.add_scalar(f"beta_dist/layer_{i:02d}/input1_mean", b1.mean().item(), step)
-                w.add_scalar(f"beta_dist/layer_{i:02d}/input2_mean", b2.mean().item(), step)
+                # gate neuron β（控制 attention write gate）
+                gate_beta = torch.sigmoid(layer_module.gate_neuron.w.data)
+                w.add_scalar(f"attn/layer_{i:02d}/gate_beta_mean", gate_beta.mean().item(), step)
+                w.add_scalar(f"attn/layer_{i:02d}/gate_beta_std", gate_beta.std().item(), step)
+                # gate neuron V_th
+                gate_vth = layer_module.gate_neuron.v_th.data
+                w.add_scalar(f"attn/layer_{i:02d}/gate_vth_mean", gate_vth.mean().item(), step)
+                # input_neuron2 β（FFN 子层输入）
+                if hasattr(layer_module, 'input_neuron2'):
+                    in2_beta = torch.sigmoid(layer_module.input_neuron2.w.data)
+                    w.add_scalar(f"attn/layer_{i:02d}/input2_beta_mean", in2_beta.mean().item(), step)
+                # M_state 范数（关联记忆矩阵累积状态）
+                M = getattr(layer_module, 'M_state', None)
+                if M is not None and not isinstance(M, (int, float)):
+                    w.add_scalar(f"attn/layer_{i:02d}/M_state_norm", M.norm().item(), step)
 
     # ====== 6. 联想记忆层监控 ======
 

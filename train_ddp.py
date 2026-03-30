@@ -135,7 +135,7 @@ def init_model(args, local_rank, rank):
 
 def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
                 iter_per_epoch, tokens_seen, rank, world_size, dashboard=None,
-                start_step=0):
+                start_step=0, adam_optimizer=None):
     """训练一个 epoch（DDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
     sampler.set_epoch(epoch)
@@ -157,7 +157,13 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
         lr = get_lr(global_step, args.epochs * iter_per_epoch,
                      args.learning_rate, args.warmup_iters)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
+            if args.use_muon and 'lr_mult' not in param_group:
+                param_group['lr'] = lr * (args.muon_lr / args.learning_rate)
+            else:
+                param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
+        if adam_optimizer is not None:
+            for param_group in adam_optimizer.param_groups:
+                param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
 
         # no_sync: 非边界步跳过 all-reduce，节省通信
         is_boundary = (step + 1) % args.accumulation_steps == 0
@@ -185,6 +191,8 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
             raw_model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
+            if adam_optimizer is not None:
+                adam_optimizer.step()
 
             # Dashboard
             if dashboard and is_main_process(rank):
@@ -203,6 +211,8 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, ctx, args,
                 }, raw_model, log_params=(global_step % args.log_interval == 0))
 
             optimizer.zero_grad(set_to_none=True)
+            if adam_optimizer is not None:
+                adam_optimizer.zero_grad(set_to_none=True)
 
         # 有效 token 数（汇总所有卡）
         valid_tokens = loss_mask_flat.sum()
@@ -273,6 +283,8 @@ if __name__ == "__main__":
     parser.add_argument('--grad_clip', type=float, default=1.0)
     parser.add_argument('--warmup_iters', type=int, default=0)
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0)
+    parser.add_argument('--use_muon', action='store_true', help='Muon+Adam 混合优化器')
+    parser.add_argument('--muon_lr', type=float, default=0.02, help='Muon 学习率（矩阵参数）')
 
     # 日志和保存
     parser.add_argument("--log_interval", type=int, default=100)
@@ -353,18 +365,37 @@ if __name__ == "__main__":
                     'block_output_neuron', 'ffn_neurons', 'output_neuron')
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
-        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
-    ])
 
-    # 恢复 optimizer state（optimizer 创建后加载，参数引用已绑定）
-    if _resume_optim_state is not None:
+    if args.use_muon:
+        # Muon + Adam 混合优化器（Moonlight 方案）
+        # 矩阵参数（2D+）用 Muon，非矩阵参数和 neuron 参数用 Adam
+        matrix_params = [p for p in other_params if p.dim() >= 2]
+        non_matrix_params = [p for p in other_params if p.dim() < 2]
+        Logger(f"  Muon: {len(matrix_params)} matrix params, Adam: {len(non_matrix_params)} non-matrix + {len(neuron_params)} neuron", rank)
+        optimizer = torch.optim.Muon(
+            [{'params': matrix_params}],
+            lr=args.muon_lr,
+            momentum=0.95,
+        )
+        adam_optimizer = optim.Adam([
+            {'params': non_matrix_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+            {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
+             'lr_mult': float(args.neuron_lr_mult)},
+        ])
+    else:
+        optimizer = optim.Adam([
+            {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+            {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
+             'lr_mult': float(args.neuron_lr_mult)},
+        ])
+        adam_optimizer = None
+
+    # 恢复 optimizer state（切换优化器后不恢复，从头初始化）
+    if _resume_optim_state is not None and not args.use_muon:
         optimizer.load_state_dict(_resume_optim_state)
         Logger("  Optimizer state restored.", rank)
     elif args.resume:
-        Logger("  Optimizer state not found, starting fresh.", rank)
+        Logger("  Optimizer state not found or Muon mode, starting fresh.", rank)
 
     # ==================== 训练信息 ====================
     iter_per_epoch = len(train_loader)
@@ -403,7 +434,7 @@ if __name__ == "__main__":
         tokens_seen = train_epoch(
             epoch, model, train_loader, sampler, optimizer, ctx, args,
             iter_per_epoch, tokens_seen, rank, world_size, dashboard=dashboard,
-            start_step=start_step,
+            start_step=start_step, adam_optimizer=adam_optimizer,
         )
 
     if dashboard:

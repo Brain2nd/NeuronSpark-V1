@@ -297,6 +297,8 @@ if __name__ == "__main__":
 
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--start_step', type=int, default=None,
+                        help='覆盖 resume 的起始 step（用于日志续写）')
 
     # TensorBoard 看板
     parser.add_argument('--dashboard_dir', type=str, default=None,
@@ -336,6 +338,10 @@ if __name__ == "__main__":
         start_epoch = _ts.get('epoch', 0)
         tokens_seen = _ts.get('tokens_seen', 0)
         _resume_optim_state = _ts.get('optimizer_state', None)
+        # 覆盖起始 step（用于日志续写，跳过崩坏区间）
+        if args.start_step is not None:
+            start_step = args.start_step
+            Logger(f"  Overriding start_step to {start_step}", rank)
         Logger(f"  Resumed model: step={start_step}, epoch={start_epoch}, tokens={tokens_seen:,}", rank)
 
     # DDP 包装（gradient_as_bucket_view 复用通信 buffer 省显存）

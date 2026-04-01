@@ -147,7 +147,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             if mask_sum > 0:
                 loss = torch.sum(loss * loss_mask_float) / mask_sum
             else:
-                loss = torch.zeros(1, device=X.device)  # 无 assistant 回复则跳过
+                loss = loss.sum() * 0.0  # 无 assistant 回复，loss=0 但保留计算图
 
         scaler.scale(loss).backward()
 

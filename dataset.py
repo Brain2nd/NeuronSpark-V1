@@ -65,20 +65,37 @@ class PretrainDataset(Dataset):
         return torch.from_numpy(X), torch.from_numpy(Y), torch.from_numpy(loss_mask)
 
 class SFTDataset(Dataset):
+    """SFT 数据集，支持 JSONL 和 HF Datasets (Arrow) 两种格式。
+
+    格式自动判断：
+      - 目录路径 → HF Datasets (load_from_disk)，需含 'messages' 列
+      - .jsonl 文件 → byte-offset 随机访问 JSONL
+    """
+
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
-        self.data_path = data_path
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = 0
-        self._offsets = []
-        with open(data_path, 'rb') as f:
-            self._offsets.append(0)
-            while f.readline():
-                self._offsets.append(f.tell())
-        self._total_lines = len(self._offsets) - 1
+
+        if os.path.isdir(data_path):
+            from datasets import load_from_disk
+            self._hf_dataset = load_from_disk(data_path)
+            self._mode = 'hf'
+        else:
+            self._hf_dataset = None
+            self._mode = 'jsonl'
+            self.data_path = data_path
+            self._offsets = []
+            with open(data_path, 'rb') as f:
+                self._offsets.append(0)
+                while f.readline():
+                    self._offsets.append(f.tell())
+            self._total_lines = len(self._offsets) - 1
 
     def __len__(self):
+        if self._mode == 'hf':
+            return len(self._hf_dataset)
         return self._total_lines
 
     def generate_loss_mask(self, input_ids):
@@ -118,11 +135,21 @@ class SFTDataset(Dataset):
         return mask
 
     def __getitem__(self, index: int):
-        with open(self.data_path, 'rb') as f:
-            f.seek(self._offsets[index])
-            line = f.readline().decode('utf-8')
-        sample = json.loads(line)
-        text = self.tokenizer.apply_chat_template(sample, tokenize=False, add_generation_prompt=False)
+        if self._mode == 'hf':
+            sample = self._hf_dataset[index]
+        else:
+            with open(self.data_path, 'rb') as f:
+                f.seek(self._offsets[index])
+                line = f.readline().decode('utf-8')
+            sample = json.loads(line)
+
+        # messages 格式 → apply_chat_template；旧格式直接用 text
+        if 'messages' in sample:
+            text = self.tokenizer.apply_chat_template(
+                sample['messages'], tokenize=False, add_generation_prompt=False)
+        else:
+            text = self.tokenizer.apply_chat_template(
+                sample, tokenize=False, add_generation_prompt=False)
         input_id = self.tokenizer(text).data['input_ids'][:self.max_length]
         text_len = len(input_id)
         # 没满最大长度的剩余部分

@@ -102,6 +102,7 @@ class SFTDataset(Dataset):
         # 生成 loss mask, 0 表示不计算损失, 1 表示计算损失
         mask = [0] * len(input_ids)
         a_sequence = self.tokenizer("<|im_start|>assistant\n")['input_ids']  # <|im_start|>assistant\n
+        im_end_id = self.tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]  # <|im_end|> token id
         a_length = len(a_sequence)
         n = len(input_ids)
         i = 0
@@ -114,10 +115,10 @@ class SFTDataset(Dataset):
                     match = False
                     break
             if match:
-                # 从子序列结束的位置开始查找第一个 4 (eos_token_id)
+                # 从子序列结束的位置开始查找 <|im_end|>
                 j = None
                 for idx in range(i + a_length, n):
-                    if input_ids[idx] == self.tokenizer.eos_token_id:
+                    if input_ids[idx] == im_end_id:
                         j = idx
                         break
                 if j is not None:

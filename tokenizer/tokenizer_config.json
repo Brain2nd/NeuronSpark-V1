@@ -2,7 +2,7 @@
   "backend": "tokenizers",
   "bos_token": "<s>",
   "eos_token": "</s>",
-  "extra_special_tokens": [
+  "additional_special_tokens": [
     "<|thinking|>",
     "<|/thinking|>"
   ],

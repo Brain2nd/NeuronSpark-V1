@@ -2,8 +2,13 @@
   "backend": "tokenizers",
   "bos_token": "<s>",
   "eos_token": "</s>",
+  "extra_special_tokens": [
+    "<|thinking|>",
+    "<|/thinking|>"
+  ],
+  "is_local": true,
   "model_max_length": 1000000000000000019884624838656,
   "pad_token": "<|pad|>",
-  "tokenizer_class": "PreTrainedTokenizerFast",
+  "tokenizer_class": "TokenizersBackend",
   "unk_token": "<unk>"
 }

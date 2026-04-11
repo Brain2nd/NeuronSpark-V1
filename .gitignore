@@ -7,10 +7,14 @@ build/
 
 # Training artifacts
 checkpoints/
+checkpoints_sft/
+checkpoints_distill/
+checkpoints_hf/
 *.pt
 train_log*.txt
 train_v75.log
 train*.log
+runs/
 
 # Data (too large for git)
 data/

@@ -42,11 +42,11 @@ def load_model(checkpoint_path, device):
 
     config = load_config(checkpoint_path)
     model = SNNLanguageModel(
-        vocab_size=config.get('vocab_size', 6144),
+        vocab_size=config.get('vocab_size', 64000),
         D=config.get('D', 1024),
         N=config.get('N', 8),
-        K=config.get('K', 16),
-        num_layers=config.get('num_layers', 20),
+        K=config.get('K', 12),
+        num_layers=config.get('num_layers', 24),
         D_ff=config.get('D_ff', 3072),
         activation_mode=config.get('activation_mode', 'v2'),
     )
@@ -59,7 +59,8 @@ def load_model(checkpoint_path, device):
 
 
 def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,
-                    temperature=0.8, top_k=50, device='cuda'):
+                    temperature=0.8, top_k=50, top_p=1.0,
+                    repetition_penalty=1.0, device='cuda'):
     """预训练模型文本续写。"""
     text = f"{tokenizer.bos_token}{prompt}"
     input_ids = tokenizer(text, return_tensors='pt')['input_ids'].to(device)
@@ -70,6 +71,8 @@ def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
             eos_token_id=tokenizer.eos_token_id,
         )
 
@@ -78,7 +81,8 @@ def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,
 
 
 def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
-               temperature=0.8, top_k=50, device='cuda'):
+               temperature=0.8, top_k=50, top_p=1.0,
+               repetition_penalty=1.0, device='cuda'):
     """SFT 模型对话生成。"""
     messages = [
         {"role": "system", "content": "你是一个AI助手"},
@@ -95,6 +99,8 @@ def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
             eos_token_id=tokenizer.eos_token_id,
         )
 
@@ -148,6 +154,8 @@ def interactive_mode(model, tokenizer, args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
             device=args.device,
         )
         print(f"\n{response}\n")
@@ -172,7 +180,8 @@ SFT_TEST_PROMPTS = [
 def run_pretrain_test(model, tokenizer, args):
     """预训练模型批量续写测试。"""
     print(f"\n{'='*50}")
-    print(f"预训练续写测试 | temp={args.temperature} top_k={args.top_k}")
+    print(f"预训练续写测试 | temp={args.temperature} top_k={args.top_k} "
+          f"top_p={args.top_p} rep_pen={args.repetition_penalty}")
     print(f"{'='*50}")
     for i, prompt in enumerate(PRETRAIN_TEST_PROMPTS, 1):
         response = pretrain_sample(
@@ -180,6 +189,8 @@ def run_pretrain_test(model, tokenizer, args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
             device=args.device,
         )
         print(f"\n[{i}/{len(PRETRAIN_TEST_PROMPTS)}] Prompt: {prompt}")
@@ -190,7 +201,8 @@ def run_pretrain_test(model, tokenizer, args):
 def run_sft_test(model, tokenizer, args):
     """SFT 模型批量对话测试。"""
     print(f"\n{'='*50}")
-    print(f"SFT 对话测试 | temp={args.temperature} top_k={args.top_k}")
+    print(f"SFT 对话测试 | temp={args.temperature} top_k={args.top_k} "
+          f"top_p={args.top_p} rep_pen={args.repetition_penalty}")
     print(f"{'='*50}")
     for i, prompt in enumerate(SFT_TEST_PROMPTS, 1):
         response = sft_sample(
@@ -198,6 +210,8 @@ def run_sft_test(model, tokenizer, args):
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
             device=args.device,
         )
         print(f"\n[{i}/{len(SFT_TEST_PROMPTS)}] Q: {prompt}")
@@ -209,7 +223,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SNN Language Model Text Generation")
 
     parser.add_argument('--checkpoint', type=str, required=True, help='Checkpoint 路径')
-    parser.add_argument('--tokenizer_path', type=str, default='./tokenizer_snn/')
+    parser.add_argument('--tokenizer_path', type=str, default='./tokenizer/')
     parser.add_argument('--device', type=str,
                         default='cuda:0' if torch.cuda.is_available() else 'cpu')
 
@@ -220,6 +234,9 @@ if __name__ == "__main__":
     parser.add_argument('--max_new_tokens', type=int, default=256)
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--top_k', type=int, default=50)
+    parser.add_argument('--top_p', type=float, default=1.0, help='Nucleus 采样阈值')
+    parser.add_argument('--repetition_penalty', type=float, default=1.0,
+                        help='重复惩罚 (>1.0 惩罚重复)')
 
     # 交互模式
     parser.add_argument('--interactive', action='store_true', help='交互式生成')
@@ -239,6 +256,8 @@ if __name__ == "__main__":
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
             top_k=args.top_k,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
             device=args.device,
         )
         print(f"\n{response}")

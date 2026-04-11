@@ -25,7 +25,7 @@ import os
 
 import torch
 import torch.nn as nn
-from spikingjelly.activation_based import base
+from .snn_base import MemoryModule
 
 
 # ============================================================
@@ -175,7 +175,7 @@ class _LateralInhibitionTriton(torch.autograd.Function):
 # Public module
 # ============================================================
 
-class LateralInhibition(base.MemoryModule):
+class LateralInhibition(MemoryModule):
     """
     侧抑制归一化层（Divisive Normalization）。
 

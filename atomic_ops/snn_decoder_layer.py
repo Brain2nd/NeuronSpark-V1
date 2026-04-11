@@ -40,7 +40,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, surrogate
+from .snn_base import MemoryModule, surrogate
 
 from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
@@ -75,11 +75,11 @@ def _fused_geometric_halt(halt_logits):
     return halt_weights
 
 
-class SNNDecoderLayer(base.MemoryModule):
+class SNNDecoderLayer(MemoryModule):
     """
     单个 SNN 解码层（连续残差流 + K 帧聚合版本）。
 
-    层间传递连续值 h (TK, batch, D)，通过 PLIF 神经元转换为 spike，
+    层间传递连续值 h (TK, batch, D)，通过 PLIF 神经元提取连续激活（V_post 泄漏量），
     输入 SNN 子层处理后，K 帧聚合为 1 per token，经 out_proj 投影，
     广播回 K 帧做残差连接。
 
@@ -143,7 +143,7 @@ class SNNDecoderLayer(base.MemoryModule):
             surrogate_function=surrogate.Sigmoid(alpha=4.0),
         )
 
-        # 输出投影（突触）: spike (D) → 连续空间 (D)
+        # 输出投影（突触）: activation (D) → 输出 (D)
         self.block_out_proj = nn.Linear(D, D, bias=False)
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 

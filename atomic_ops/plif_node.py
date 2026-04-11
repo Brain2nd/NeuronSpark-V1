@@ -19,10 +19,10 @@ import math
 
 import torch
 import torch.nn as nn
-from spikingjelly.activation_based import base, surrogate
+from .snn_base import MemoryModule, surrogate
 
 
-class PLIFNode(base.MemoryModule):
+class PLIFNode(MemoryModule):
     """
     D 维固定参数 PLIF 神经元。
 

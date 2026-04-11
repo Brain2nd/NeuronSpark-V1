@@ -85,7 +85,7 @@ token → Embedding(D=1024) → repeat K=12 帧
 - **基础神经元**: PLIF (Parametric LIF)，动态 β(t), α(t), V_th(t) 由调制网络生成
 - **连续残差流**: 层间传递连续值 h，仅 SNN 子层内部使用 spike，解决深层梯度消失
 - **Pre-LN RMSNorm**: 分支归一化控制 PLIFNode 输入 scale + 残差中心化消除 DC 漂移
-- **7 条并行输入路径**: W_in, W_β, W_α, W_th, W_gate, W_skip, W_out
+- **6 条并行输入投影 + 1 条输出投影**: W_in, W_β, W_α, W_th, W_gate, W_skip (+ W_out)
 - **并行化**: Triton Fused PLIF Kernel，单 kernel 完成扫描 + spike + 软重置 + 替代梯度
 - **Natural Gradient 补偿**: sigmoid/softplus 饱和补偿 + 层间梯度均衡
 - **训练**: Surrogate Gradient + 标准反向传播
@@ -101,7 +101,7 @@ token → Embedding(D=1024) → repeat K=12 帧
 |------|-----------------|---------------------|---------|
 | **数据下载** | `download_dataset.sh` | `scripts/download_dataset.sh` | 完全对齐：ModelScope + HuggingFace 镜像 |
 | **数据预处理** | `deal_dataset.py` | `scripts/deal_dataset.py` | 完全对齐：预训练 512 字符切块 + SFT ChatML 格式转换 |
-| **Tokenizer 训练** | `train_tokenizer.py` | `scripts/train_tokenizer.py` | 完全对齐：BPE, vocab=6144, NFKC 正则化, ChatML chat_template |
+| **Tokenizer 训练** | `train_tokenizer.py` | `scripts/train_tokenizer.py` | 完全对齐：BPE, vocab=64000, NFKC 正则化, ChatML chat_template |
 | **数据集加载** | `dataset.py` | `dataset.py` | 完全对齐：PretrainDataset (byte-offset JSONL), SFTDataset (assistant-only loss_mask) |
 | **预训练循环** | `ddp_pretrain.py` | `train.py` / `train_ddp.py` | 高度对齐：Adam, Warmup+Cosine LR, autocast bf16, 梯度累积/裁剪 |
 | **SFT 训练** | `ddp_sft_full.py` | `sft.py` / `sft_ddp.py` | 高度对齐：加载预训练权重 + SFTDataset + 相同训练循环 |
@@ -116,13 +116,14 @@ token → Embedding(D=1024) → repeat K=12 帧
 | `model.py` | SNNLanguageModel：三段式 encode/snn_forward/decode，自回归 generate() |
 | `atomic_ops/selective_plif.py` | SelectivePLIFNode：动态参数 PLIF 神经元 |
 | `atomic_ops/plif_node.py` | PLIFNode：D 维固定参数 PLIF 神经元 |
-| `atomic_ops/snn_block.py` | SNNBlock：SNN 注意力等价层（7 条并行路径 + 门控 + 跳跃连接） |
-| `atomic_ops/snn_ffn.py` | SNNFFN：SNN 前馈网络（SwiGLU 风格三分支 spike 门控） |
+| `atomic_ops/snn_block.py` | SNNBlock：SNN 状态空间 Mixer（6 条并行输入投影 + 门控 + 跳跃连接） |
+| `atomic_ops/snn_ffn.py` | SNNFFN：SNN 前馈网络（SwiGLU 风格三分支连续膜电位门控） |
 | `atomic_ops/snn_decoder_layer.py` | SNNDecoderLayer：Pre-LN RMSNorm + Block + FFN + 残差中心化 |
+| `atomic_ops/snn_attention_decoder_layer.py` | SNNAttentionDecoderLayer：SNN-Attention + FFN 解码层 |
+| `atomic_ops/snn_base.py` | Vendored spikingjelly 兼容层（MemoryModule / BaseNode / Sigmoid / Linear） |
 | `atomic_ops/parallel_scan.py` | Triton Fused PLIF Kernel，Row-param Kernel |
 | `atomic_ops/lateral_inhibition.py` | Triton 实现的侧抑制归一化 (divisive normalization) |
 | `atomic_ops/rms_norm.py` | Pre-LN 分支归一化 |
-| `atomic_ops/fp16_codec.py` | IEEE 754 float16 位编解码器（未使用） |
 | `docs/SNN_SELECTIVE_STATE_SPACE.md` | 完整架构设计文档 |
 
 ### 与 happy-llm 的配置对比
@@ -133,7 +134,7 @@ token → Embedding(D=1024) → repeat K=12 帧
 | 参数量 | 215M | 1.37B |
 | 隐藏维度 | 1024 | 1024 |
 | 层数 | 18 | 24 |
-| 词表 | 6144 | 6144 |
+| 词表 | 64000 | 64000 |
 | 序列长度 | 512 | 2048 |
 | SNN 时间步 K | — | 12 (PonderNet 动态) |
 | 优化器 | Adam | Adam |
@@ -155,7 +156,7 @@ conda activate SNN
 
 # 2. 安装依赖
 pip install torch torchvision torchaudio
-pip install spikingjelly transformers tokenizers pandas numpy tqdm
+pip install transformers tokenizers pandas numpy tqdm
 pip install modelscope huggingface_hub  # 数据集下载
 
 # 3. (DGX Spark / Blackwell GPU) Triton ptxas 配置
@@ -237,11 +238,11 @@ python scripts/deal_dataset.py --sft_only
 python scripts/train_tokenizer.py \
     --data_path data/seq-monkey/seq_monkey_datawhale.jsonl \
     --save_dir tokenizer_snn \
-    --vocab_size 6144
+    --vocab_size 64000
 ```
 
 输出 `tokenizer_snn/` 目录，包含：
-- `tokenizer.json` — BPE 模型（6144 词表，NFKC 正则化，ByteLevel 编码）
+- `tokenizer.json` — BPE 模型（64000 词表，NFKC 正则化，ByteLevel 编码）
 - `tokenizer_config.json` — ChatML chat_template（兼容 Qwen2.5 格式）
 - `special_tokens_map.json` — 特殊 token 映射
 
@@ -372,7 +373,7 @@ python generate_sample.py \
 | `--K` | 12 | 每 token 最大 SNN 时间步（PonderNet 动态决定有效步数） |
 | `--num_layers` | 24 | SNN 解码层数 |
 | `--D_ff` | 3072 | FFN 中间维度 (通常 3×D) |
-| `--vocab_size` | 6144 | 词表大小 |
+| `--vocab_size` | 64000 | 词表大小 |
 
 ### 训练参数
 
@@ -412,7 +413,7 @@ Step 2: 数据预处理
 
 Step 3: Tokenizer 训练 (首次)
   python scripts/train_tokenizer.py
-  → tokenizer_snn/ (6144 词表 BPE + ChatML chat_template)
+  → tokenizer_snn/ (64000 词表 BPE + ChatML chat_template)
 
 Step 4: 预训练
   python train.py (单卡) / torchrun train_ddp.py (多卡)
@@ -448,17 +449,18 @@ NeuronSpark/
 │   ├── __init__.py
 │   ├── selective_plif.py           # SelectivePLIFNode: 动态参数 PLIF 神经元
 │   ├── plif_node.py                # PLIFNode: D 维固定参数 PLIF 神经元
-│   ├── snn_block.py                # SNNBlock: SNN 注意力等价层 (7 路并行 + 门控)
+│   ├── snn_block.py                # SNNBlock: SNN 状态空间 Mixer (6 路并行投影 + 门控)
 │   ├── snn_ffn.py                  # SNNFFN: SNN 前馈网络 (SwiGLU 风格三分支)
 │   ├── snn_decoder_layer.py        # SNNDecoderLayer: Pre-LN + Block + FFN + PonderNet + 残差
+│   ├── snn_attention_decoder_layer.py # SNNAttentionDecoderLayer: SNN-Attention + FFN 解码层
+│   ├── snn_base.py                 # Vendored spikingjelly 兼容层 (MemoryModule/BaseNode/Sigmoid)
 │   ├── parallel_scan.py            # Triton Fused PLIF Kernel + Row-param Kernel
 │   ├── lateral_inhibition.py       # Triton 侧抑制归一化 (输出层使用)
 │   ├── rms_norm.py                 # Pre-LN 分支归一化
-│   └── fp16_codec.py              # IEEE 754 float16 位编解码器（未使用）
 ├── scripts/                        # 数据处理脚本 (对齐 happy-llm)
 │   ├── download_dataset.sh         # 一键下载预训练 + SFT 数据集
 │   ├── deal_dataset.py             # 数据预处理 (预训练切块 + SFT ChatML 转换)
-│   ├── train_tokenizer.py          # BPE Tokenizer 训练 (6144 词表)
+│   ├── train_tokenizer.py          # BPE Tokenizer 训练 (64000 词表)
 │   └── prepare_data.py             # SkyPile-150B 数据集处理 (备选)
 ├── docs/                           # 设计文档
 │   ├── SNN_SELECTIVE_STATE_SPACE.md  # 主设计文档
@@ -473,7 +475,7 @@ NeuronSpark/
 ├── notebooks/                      # 实验 Notebook
 │   ├── linear_layer_analysis.ipynb # SpikingJelly 线性层分析
 │   └── neuron_comparison.ipynb     # 7 种神经元模型对比 → PLIF 最优
-├── tokenizer_snn/                  # 已训练的 BPE tokenizer (6144 词表)
+├── tokenizer_snn/                  # 已训练的 BPE tokenizer (64000 词表)
 ├── data/                           # 训练数据 (不纳入 git)
 │   ├── seq-monkey/                 # Seq-Monkey 预训练数据 (29M 样本 JSONL)
 │   └── sft/                        # BelleGroup SFT 数据 (350 万条对话)
@@ -494,7 +496,7 @@ NeuronSpark/
 | K (最大 SNN 步数) | 12 (PonderNet 动态决定有效步数) |
 | Layers | 24 |
 | D_ff (FFN 维度) | 3072 |
-| Vocab | 6144 |
+| Vocab | 64000 |
 | 序列长度 | 2048 |
 | 激活模式 | V2 ((1-β)·V_post 泄漏量) |
 | Batch size | 1/gpu × 4 gpus × accum 32 = 128 effective |
@@ -548,7 +550,7 @@ Bilingual pretraining dataset uploaded to HuggingFace: [Brain2nd/NeuronSpark-V1]
 
 ### Tokenizer
 
-Retrain 64K vocab BPE tokenizer (current 6144 is too small for bilingual):
+Current tokenizer: 64K vocab BPE (bilingual).
 
 ```bash
 python scripts/train_tokenizer.py \

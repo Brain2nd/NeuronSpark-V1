@@ -14,10 +14,10 @@ SelectivePLIFNode: 动态参数的 PLIF 神经元
 """
 
 import torch
-from spikingjelly.activation_based import neuron, surrogate
+from .snn_base import BaseNode, surrogate
 
 
-class SelectivePLIFNode(neuron.BaseNode):
+class SelectivePLIFNode(BaseNode):
     """
     隐状态空间的核心神经元。
 

@@ -642,7 +642,7 @@ def plif_parallel_forward(
         v_th:  (K, *shape) — 动态阈值
         v_init: (*shape) — 初始膜电位
         max_iter: spike 不动点迭代次数上限
-        surrogate_function: SpikingJelly surrogate gradient 函数（如 surrogate.Sigmoid(alpha=4.0)）
+        surrogate_function: surrogate gradient 函数（如 surrogate.Sigmoid(alpha=4.0)）
                            None 时退化为硬阈值（无梯度）
 
     Returns:

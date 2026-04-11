@@ -2,7 +2,7 @@
 SNNBlock: 完整的 SNN 隐状态空间 Block（并行化版本）
 
 结构（每个 SNN 时间步）：
-  spike_in {0,1}^D
+  x ∈ R^D（连续激活，来自上层 PLIFNode 的 V_post 泄漏量）
     ├─→ W_in     → I[t] ∈ R^{D*N}
     ├─→ W_β^(x)  + b_β → σ      → β(t)
     ├─→ W_α^(x)  + b_α → softplus → α(t)
@@ -21,7 +21,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, layer, surrogate
+from .snn_base import MemoryModule, layer, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .parallel_scan import plif_parallel_forward
@@ -41,7 +41,7 @@ def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_m
     return beta, u, v_th
 
 
-class SNNBlock(base.MemoryModule):
+class SNNBlock(MemoryModule):
     """
     单个 SNN Block（并行化）。
 
@@ -76,7 +76,7 @@ class SNNBlock(base.MemoryModule):
             bias=False,
         )
 
-        # ====== 六条并行输入投影（SNN 突触：spike 输入） ======
+        # ====== 六条并行输入投影（SNN 突触：连续激活输入） ======
         self.W_in = layer.Linear(D, DN, bias=False, step_mode='s')
         self.W_beta_x = layer.Linear(D, DN, bias=False, step_mode='s')
         self.W_alpha_x = layer.Linear(D, DN, bias=False, step_mode='s')
@@ -84,7 +84,7 @@ class SNNBlock(base.MemoryModule):
         self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')
         self.W_skip = layer.Linear(D, D, bias=False, step_mode='s')
 
-        # ====== β/α/V_th 仅依赖 spike_in（无 W^(V)·V 项） ======
+        # ====== β/α/V_th 仅依赖 x（无 W^(V)·V 项） ======
 
         # ====== 调制偏置（结构化初始化） ======
         self.b_beta = nn.Parameter(torch.empty(DN))
@@ -161,27 +161,27 @@ class SNNBlock(base.MemoryModule):
         with torch.no_grad():
             self.W_out.weight.mul_(out_scale_DN.unsqueeze(0))
 
-    def forward_parallel(self, spike_in_seq: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(self, h_seq: torch.Tensor) -> torch.Tensor:
         """
         并行前向传播：使用 parallel scan 处理全序列。
 
         Args:
-            spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
+            h_seq: (TK, batch, D) — 全部 T×K 帧的连续激活（来自 PLIFNode V_post 泄漏量）
 
         Returns:
             continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出（V_post 经 W_out 投影）
         """
-        TK, batch, D = spike_in_seq.shape
+        TK, batch, D = h_seq.shape
         DN = self.D * self.N
 
         # ====== Phase 0: 因果卷积预混合（局部上下文） ======
         conv_dtype = self.conv1d.weight.dtype
-        conv_in = spike_in_seq.to(conv_dtype).permute(1, 2, 0)  # (batch, D, TK)
+        conv_in = h_seq.to(conv_dtype).permute(1, 2, 0)  # (batch, D, TK)
         conv_out = self.conv1d(conv_in)[:, :, :TK]  # causal: 截断未来
-        spike_in_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
+        h_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
 
         # ====== Phase 1: 批量投影（全部 TK 帧同时计算）======
-        flat = spike_in_seq.reshape(TK * batch, D)
+        flat = h_seq.reshape(TK * batch, D)
 
         I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
         raw_beta = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
@@ -194,7 +194,7 @@ class SNNBlock(base.MemoryModule):
 
         # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
         # 神经元参数可能是 fp32 (master weights)，计算时转为输入 dtype
-        compute_dtype = spike_in_seq.dtype
+        compute_dtype = h_seq.dtype
         beta_all, u_hidden, v_th_all = _fused_modulation(
             raw_beta, self.b_beta.to(compute_dtype),
             raw_alpha, self.b_alpha.to(compute_dtype),
@@ -223,15 +223,15 @@ class SNNBlock(base.MemoryModule):
         I_out_all = F.linear(v_flat, self.W_out.weight).reshape(TK, batch, D)
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
-        # output_neuron 已移除：连续值由层级 K 帧聚合处理
+        # 子层级 output_neuron 已移除，改由层级 K 帧聚合处理（模型级 output_neuron 仍保留于 model.py）
         return I_total_all  # (TK, batch, D), 连续值
 
-    def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
+    def single_step_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         单步前向传播（用于调试/兼容）。
 
         Args:
-            spike_in: 二值脉冲输入, shape (batch, D), 值域 {0, 1}
+            x: 连续激活输入, shape (batch, D)
 
         Returns:
             continuous_out: 连续输出, shape (batch, D)
@@ -239,19 +239,19 @@ class SNNBlock(base.MemoryModule):
         V_prev = self.hidden_neuron.v
         if isinstance(V_prev, float):
             V_prev = torch.zeros(
-                spike_in.shape[0], self.D * self.N,
-                device=spike_in.device, dtype=spike_in.dtype,
+                x.shape[0], self.D * self.N,
+                device=x.device, dtype=x.dtype,
             )
 
-        I_t = self.W_in(spike_in)
+        I_t = self.W_in(x)
 
-        # β 调制仅依赖 spike_in
-        beta = torch.sigmoid(self.W_beta_x(spike_in) + self.b_beta)
-        alpha = F.softplus(self.W_alpha_x(spike_in) + self.b_alpha)
-        v_th = self.v_th_min + torch.abs(self.W_th_x(spike_in) + self.b_th)
+        # β 调制仅依赖 x
+        beta = torch.sigmoid(self.W_beta_x(x) + self.b_beta)
+        alpha = F.softplus(self.W_alpha_x(x) + self.b_alpha)
+        v_th = self.v_th_min + torch.abs(self.W_th_x(x) + self.b_th)
 
-        gate = torch.sigmoid(self.W_gate(spike_in))
-        I_skip = self.W_skip(spike_in)
+        gate = torch.sigmoid(self.W_gate(x))
+        I_skip = self.W_skip(x)
 
         s_hidden = self.hidden_neuron(I_t, beta, alpha, v_th)
 

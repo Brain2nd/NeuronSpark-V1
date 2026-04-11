@@ -52,6 +52,10 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
         'num_layers': raw.num_layers,
         'D_ff': raw.D_ff,
         'activation_mode': raw.activation_mode,
+        'v_th_min': raw.v_th_min,
+        'memory_layer_interval': raw.memory_layer_interval,
+        'D_key': raw.D_key,
+        'D_value': raw.D_value,
     }
     with open(os.path.join(ckpt_dir, 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)

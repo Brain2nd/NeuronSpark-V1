@@ -20,18 +20,18 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import base, layer, surrogate
+from .snn_base import MemoryModule, layer, surrogate
 
 from .plif_node import PLIFNode
 from .parallel_scan import plif_rowparam_forward
 
 
-class SNNFFN(base.MemoryModule):
+class SNNFFN(MemoryModule):
     """
     SNN 等价的 Feed-Forward Network。
 
     Args:
-        D: 可见维度（输入/输出 spike 维度）
+        D: 可见维度（输入/输出 activation 维度）
         D_ff: 中间层维度（对标 Qwen3 intermediate_size）
         output_v_threshold: 输出神经元阈值
         num_layers: 总层数，用于 down_proj 缩放
@@ -92,7 +92,7 @@ class SNNFFN(base.MemoryModule):
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
         self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
 
-    def forward_parallel(self, spike_in_seq: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(self, h_seq: torch.Tensor) -> torch.Tensor:
         """
         并行前向传播：使用 parallel scan 处理全序列。
 
@@ -102,15 +102,15 @@ class SNNFFN(base.MemoryModule):
           - u_merged: 向量缩放替代 cat（1次 broadcast multiply 替代 2次 scale + 1次 cat）
 
         Args:
-            spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
+            h_seq: (TK, batch, D) — 全部 T×K 帧的连续激活（来自 PLIFNode V_post 泄漏量）
 
         Returns:
             continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出
         """
-        TK, batch, D = spike_in_seq.shape
-        input_dtype = spike_in_seq.dtype
+        TK, batch, D = h_seq.shape
+        input_dtype = h_seq.dtype
         D_ff = self.D_ff
-        flat = spike_in_seq.reshape(TK * batch, D)
+        flat = h_seq.reshape(TK * batch, D)
 
         # ====== Phase 1: 批量投影（gate+up 合并为 1 次 matmul） ======
         W_gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
@@ -164,25 +164,25 @@ class SNNFFN(base.MemoryModule):
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
-        # output_neuron 已移除：连续值由层级 K 帧聚合处理
+        # 子层级 output_neuron 已移除，改由层级 K 帧聚合处理（模型级 output_neuron 仍保留于 model.py）
         return I_out.to(input_dtype)  # (TK, batch, D), 连续值
 
-    def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
+    def single_step_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         单步前向传播。
 
         Args:
-            spike_in: 二值脉冲输入, shape (batch, D), 值域 {0, 1}
+            x: 连续激活输入, shape (batch, D)
 
         Returns:
             continuous_out: 连续输出, shape (batch, D)
         """
         # 门控路径
-        _ = self.gate_neuron(self.gate_proj(spike_in))
+        _ = self.gate_neuron(self.gate_proj(x))
         gate_v = self.gate_neuron.v
 
         # 值路径
-        _ = self.up_neuron(self.up_proj(spike_in))
+        _ = self.up_neuron(self.up_proj(x))
         up_v = self.up_neuron.v
 
         if self.activation_mode == 'v2':
@@ -193,5 +193,5 @@ class SNNFFN(base.MemoryModule):
         gated = gate_v * up_v
 
         # 降维 + 残差
-        I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D
+        I_out = self.down_proj(gated) + self.skip_proj(x)  # R^D
         return I_out  # 连续值

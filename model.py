@@ -3,7 +3,7 @@ SNNLanguageModel: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
 
 架构（三段式）：
   model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
-  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，全膜电位 + 动态 K 聚合
+  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: num_layers 层，全膜电位 + 动态 K 聚合
   model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
 
 核心设计：
@@ -23,14 +23,13 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import functional, surrogate
+from atomic_ops.snn_base import functional, surrogate
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer, SNNAttentionDecoderLayer
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
-# fp16_encode/fp16_decode 已移除: 全膜电位架构不需要 spike 编解码
 from atomic_ops.lateral_inhibition import LateralInhibition
 
 
@@ -47,7 +46,7 @@ class SNNLanguageModel(nn.Module):
     从零训练的 SNN 隐状态空间语言模型（parallel scan）。
 
     Args:
-        vocab_size: 词表大小（默认 6144，自训练 BPE）
+        vocab_size: 词表大小（默认 64000）
         D: 可见维度
         N: 状态扩展因子
         K: 每 token 最大 SNN 时间步数（K_max）。PonderNet 动态决定有效步数 ∈ [1, K]。
@@ -59,9 +58,9 @@ class SNNLanguageModel(nn.Module):
 
     def __init__(
         self,
-        vocab_size: int = 6144,
+        vocab_size: int = 64000,
         D: int = 1024,
-        N: int = 16,
+        N: int = 8,
         K: int = 12,
         num_layers: int = 24,
         D_ff: int = 3072,
@@ -70,7 +69,6 @@ class SNNLanguageModel(nn.Module):
         memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
-        num_memory_groups: int = 3,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -81,6 +79,9 @@ class SNNLanguageModel(nn.Module):
         self.D_ff = D_ff
         self.activation_mode = activation_mode
         self.memory_layer_interval = memory_layer_interval
+        self.v_th_min = v_th_min
+        self.D_key = D_key
+        self.D_value = D_value
 
         # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
@@ -98,9 +99,9 @@ class SNNLanguageModel(nn.Module):
             surrogate_function=surrogate.Sigmoid(alpha=4.0),
         )
 
-        # ====== 混合层栈: SNN Decoder + SNN Associative Memory ======
-        # 每 memory_layer_interval 层插入 1 层联想记忆
-        # 例: interval=4, 24 层 → 层 3,7,11,15,19,23 为联想记忆层
+        # ====== 混合层栈: SNN Decoder + SNN-Attention Decoder ======
+        # 每 memory_layer_interval 层插入 1 层 SNN-Attention 解码层
+        # 例: interval=4, 24 层 → 层 3,7,11,15,19,23 为 SNN-Attention 层
         self.layers = nn.ModuleList()
         self.layer_types = []  # 'snn' or 'memory'
         for i in range(num_layers):
@@ -148,8 +149,8 @@ class SNNLanguageModel(nn.Module):
         emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
         return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
 
-    def snn_forward(self, spike_seq: torch.Tensor):
-        """SNN 核心：spike_seq → (h_out, ponder_cost)。
+    def snn_forward(self, h_seq: torch.Tensor):
+        """SNN 核心：h_seq → (h_out, ponder_cost)。
 
         纯 SNN 层计算，带梯度检查点。
         每层返回 (h, ponder_cost)，ponder_cost 作为 checkpoint 输出保留梯度图。
@@ -158,7 +159,7 @@ class SNNLanguageModel(nn.Module):
             h: (seq_len*K, batch, D), 连续值
             total_ponder_cost: scalar, 所有层平均期望步数
         """
-        h = spike_seq
+        h = h_seq
         ponder_costs = []
 
         def _layer_forward(layer_mod, x):
@@ -231,6 +232,8 @@ class SNNLanguageModel(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
@@ -245,6 +248,8 @@ class SNNLanguageModel(nn.Module):
             max_new_tokens: 最大生成 token 数
             temperature: 采样温度（<=0 = greedy）
             top_k: top-k 采样（None/0 = 不限制）
+            top_p: nucleus 采样阈值（1.0 = 不限制）
+            repetition_penalty: 重复惩罚（1.0 = 无惩罚，>1.0 = 惩罚重复）
             eos_token_id: 遇到此 token 停止生成
 
         Returns:
@@ -266,9 +271,14 @@ class SNNLanguageModel(nn.Module):
 
         logits = self.decode(h, prompt_len)
 
+        # 已生成的 token ID 集合（用于 repetition_penalty）
+        generated_ids = prompt_ids.clone()
+
         # 采样第一个新 token
-        next_token = self._sample(logits[:, -1, :], temperature, top_k)
+        next_token = self._sample(logits[:, -1, :], temperature, top_k, top_p,
+                                  repetition_penalty, generated_ids)
         generated = [next_token]
+        generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
         # ====== Autoregressive: 逐 token，forward_parallel 处理 K 帧 ======
         for _ in range(max_new_tokens - 1):
@@ -285,23 +295,51 @@ class SNNLanguageModel(nn.Module):
 
             logits = self.decode(h, 1)
 
-            next_token = self._sample(logits[:, -1, :], temperature, top_k)
+            next_token = self._sample(logits[:, -1, :], temperature, top_k, top_p,
+                                      repetition_penalty, generated_ids)
             generated.append(next_token)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
 
         return torch.cat([prompt_ids, torch.cat(generated, dim=1)], dim=1)
 
-    def _sample(self, logits: torch.Tensor, temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
-        """从 logits 采样（temperature + top-k）。
+    def _sample(self, logits: torch.Tensor, temperature: float = 1.0,
+                top_k: int = None, top_p: float = 1.0,
+                repetition_penalty: float = 1.0,
+                generated_ids: torch.Tensor = None) -> torch.Tensor:
+        """从 logits 采样（temperature + repetition_penalty + top-k + top-p）。
 
         Returns: (batch, 1)
         """
         if temperature <= 0:
             return logits.argmax(dim=-1, keepdim=True)
+
+        # Repetition penalty: 对已出现的 token 降低概率
+        if repetition_penalty != 1.0 and generated_ids is not None:
+            for b in range(logits.size(0)):
+                prev_ids = generated_ids[b].unique()
+                score = logits[b, prev_ids]
+                # 正 logit 除以 penalty（降低），负 logit 乘以 penalty（更负）
+                logits[b, prev_ids] = torch.where(
+                    score > 0, score / repetition_penalty, score * repetition_penalty
+                )
+
         logits = logits / temperature
+
+        # Top-k
         if top_k is not None and top_k > 0:
             top_k = min(top_k, logits.size(-1))
             v, _ = torch.topk(logits, top_k)
             logits[logits < v[:, [-1]]] = float('-inf')
+
+        # Top-p (nucleus sampling)
+        if top_p < 1.0:
+            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            # 移除累积概率超过 top_p 的 token（保留第一个超过的）
+            sorted_mask = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+            sorted_logits[sorted_mask] = float('-inf')
+            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
+
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
 
@@ -330,8 +368,8 @@ class SNNLanguageModel(nn.Module):
         functional.reset_net(self.output_neuron)
 
         # 三段式
-        spike_seq = self.encode(token_ids)            # 输入边界
-        h_out, ponder_cost = self.snn_forward(spike_seq)  # SNN 核心 + ponder cost
+        h_seq = self.encode(token_ids)                # 输入边界
+        h_out, ponder_cost = self.snn_forward(h_seq)  # SNN 核心 + ponder cost
         logits = self.decode(h_out, seq_len)          # 输出边界
 
         if target_ids is not None:
@@ -357,7 +395,7 @@ class SNNLanguageModel(nn.Module):
           补偿: grad /= activation'(b)，等价于在 β/α 空间做梯度下降。
 
         Phase 2: 层间梯度均衡
-          残差链反向传播每层放大 ~1.17×，20 层累积 ~20× L0/L19 比。
+          残差链反向传播每层放大 ~1.17×，num_layers 层累积显著梯度比。
           深层选择性参数（b_beta/b_alpha/b_th）梯度被压制，无法有效学习。
           修复: 将每层调制参数梯度 norm 归一化到所有层的几何均值。
 
@@ -390,7 +428,7 @@ class SNNLanguageModel(nn.Module):
 
         # ====== Phase 2: 层间梯度均衡 ======
         # 残差链 h = h + sublayer(h) 的反向路径 ∂h_{l+1}/∂h_l = I + ∂sublayer/∂h_l
-        # 每层放大 ~1.17×, 20 层累积 ~20× → L0 梯度远大于 L19
+        # 每层放大 ~1.17×, 深层累积显著梯度比 → L0 梯度远大于 L_{num_layers-1}
         # 用几何均值归一化每层调制参数梯度 norm，消除残差放大效应
         with torch.no_grad():
             for param_name in ['b_beta', 'b_alpha', 'b_th']:

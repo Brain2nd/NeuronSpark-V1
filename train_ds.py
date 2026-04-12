@@ -230,6 +230,9 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="data/pretrain_mix/dataset")
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer/")
 
+    # 优化器
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'sgd'])
+
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
 
@@ -266,11 +269,19 @@ if __name__ == "__main__":
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
 
-    optimizer = torch.optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
-        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
-    ])
+    if args.optimizer == 'sgd':
+        optimizer = torch.optim.SGD([
+            {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
+             'momentum': 0.9, 'weight_decay': 0.01},
+            {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
+             'lr_mult': float(args.neuron_lr_mult), 'momentum': 0.9, 'weight_decay': 0.0},
+        ])
+    else:
+        optimizer = torch.optim.Adam([
+            {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+            {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
+             'lr_mult': float(args.neuron_lr_mult)},
+        ])
 
     # ==================== DeepSpeed 初始化 ====================
     # 读取 ds_config 并覆盖 CLI 参数

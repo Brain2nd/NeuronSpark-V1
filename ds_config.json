@@ -14,5 +14,6 @@
   "gradient_accumulation_steps": 100,
   "gradient_clipping": 1.0,
   "train_micro_batch_size_per_gpu": 1,
-  "wall_clock_breakdown": false
+  "wall_clock_breakdown": false,
+  "zero_allow_untested_optimizer": true
 }

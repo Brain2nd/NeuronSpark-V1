@@ -235,6 +235,8 @@ if __name__ == "__main__":
 
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--pretrained_ckpt', type=str, default=None,
+                        help='只加载权重，不恢复 step/optimizer（用于退火等）')
 
     # TensorBoard 看板
     parser.add_argument('--dashboard_dir', type=str, default=None)
@@ -248,10 +250,13 @@ if __name__ == "__main__":
     # ==================== 模型初始化 ====================
     model, tokenizer, device = init_model(args)
 
-    # Resume
+    # Resume / Pretrained
     tokens_seen = 0
     start_step = 0
-    if args.resume:
+    if args.pretrained_ckpt:
+        load_model_weights(args.pretrained_ckpt, model, device)
+        Logger(f"  Loaded pretrained weights: {args.pretrained_ckpt} (step=0, fresh optimizer)")
+    elif args.resume:
         load_model_weights(args.resume, model, device)
         if os.path.isdir(args.resume):
             _ts = torch.load(os.path.join(args.resume, 'training_state.pth'),

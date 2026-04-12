@@ -22,8 +22,12 @@ class PretrainDataset(Dataset):
 
         if os.path.isdir(data_path):
             # HF Datasets Arrow 格式
-            from datasets import load_from_disk
-            self._hf_dataset = load_from_disk(data_path)
+            from datasets import load_from_disk, DatasetDict
+            ds = load_from_disk(data_path)
+            # DatasetDict → 取第一个 split
+            if isinstance(ds, DatasetDict):
+                ds = ds[list(ds.keys())[0]]
+            self._hf_dataset = ds
             self._mode = 'hf'
         else:
             # JSONL 格式（向后兼容）

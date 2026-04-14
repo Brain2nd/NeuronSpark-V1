@@ -93,33 +93,117 @@ class NeuronSparkLM(LM):
         return [''] * len(requests)
 
 
-if __name__ == '__main__':
-    tasks = [
-        'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
-        'mmlu', 'piqa', 'openbookqa', 'lambada_openai',
-        'ceval-valid',
-    ]
-    print(f'Running {len(tasks)}-task eval on step 428000...')
-    results = lm_eval.simple_evaluate(model='neuronspark', tasks=tasks, batch_size=1)
+def run_eval(checkpoint, device, tasks, output_path):
+    """单 GPU 测评指定任务子集。"""
+    print(f'[{device}] Running {len(tasks)} tasks on {checkpoint}...')
+    results = lm_eval.simple_evaluate(
+        model='neuronspark',
+        model_args=f'checkpoint={checkpoint},device={device}',
+        tasks=tasks,
+        batch_size=1,
+    )
 
     for task, res in results['results'].items():
         acc = res.get('acc,none', res.get('acc', '?'))
         acc_n = res.get('acc_norm,none', '')
         norm_str = f' (norm: {acc_n:.4f})' if isinstance(acc_n, float) else ''
         if isinstance(acc, float):
-            print(f'  {task:>20s}: {acc:.4f}{norm_str}')
+            print(f'  [{device}] {task:>20s}: {acc:.4f}{norm_str}')
         else:
-            print(f'  {task:>20s}: {acc}')
+            print(f'  [{device}] {task:>20s}: {acc}')
 
     os.makedirs('exp', exist_ok=True)
     out = {
-        'checkpoint': 'ckpt_step441000',
+        'checkpoint': os.path.basename(checkpoint),
+        'device': device,
         'tasks': tasks,
         'results': {
             t: {k: v for k, v in r.items() if not k.startswith('samples')}
             for t, r in results['results'].items()
         },
     }
-    with open('exp/lm_eval_full_ckpt_step441000.json', 'w') as f:
+    with open(output_path, 'w') as f:
         json.dump(out, f, indent=2)
-    print('Saved to exp/lm_eval_full_ckpt_step441000.json')
+    print(f'[{device}] Saved to {output_path}')
+    return out
+
+
+def merge_results(partial_files, merged_path):
+    """合并多个 partial JSON 为一个完整结果文件。"""
+    merged = {'results': {}, 'tasks': []}
+    for pf in partial_files:
+        if not os.path.exists(pf):
+            continue
+        with open(pf) as f:
+            part = json.load(f)
+        merged['results'].update(part['results'])
+        merged['tasks'].extend(part['tasks'])
+        merged['checkpoint'] = part.get('checkpoint', '')
+    with open(merged_path, 'w') as f:
+        json.dump(merged, f, indent=2)
+    print(f'Merged → {merged_path}')
+    return merged
+
+
+if __name__ == '__main__':
+    import argparse, multiprocessing
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str, default='checkpoints/ckpt_step441000')
+    parser.add_argument('--num_gpus', type=int, default=1)
+    parser.add_argument('--output', type=str, default=None)
+    args = parser.parse_args()
+
+    all_tasks = [
+        'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
+        'mmlu', 'piqa', 'openbookqa', 'lambada_openai',
+        'ceval-valid',
+    ]
+
+    ckpt_name = os.path.basename(args.checkpoint)
+    output_path = args.output or f'exp/lm_eval_full_{ckpt_name}.json'
+
+    if args.num_gpus <= 1:
+        run_eval(args.checkpoint, 'cuda:0', all_tasks, output_path)
+    else:
+        # 按请求量均衡分配: mmlu 最重, ceval+hellaswag 次之
+        task_groups = [
+            ['mmlu'],                                          # GPU 0 (~14K reqs)
+            ['ceval-valid', 'hellaswag'],                      # GPU 1 (~11K reqs)
+            ['arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~8K reqs)
+            ['piqa', 'openbookqa', 'lambada_openai'],          # GPU 3 (~8K reqs)
+        ]
+        # 如果 GPU 数不足 4，合并剩余任务到最后一组
+        while len(task_groups) > args.num_gpus:
+            task_groups[-2].extend(task_groups.pop())
+
+        partial_files = []
+        procs = []
+        for i, tasks in enumerate(task_groups):
+            device = f'cuda:{i}'
+            pf = f'exp/lm_eval_{ckpt_name}_gpu{i}.json'
+            partial_files.append(pf)
+            p = multiprocessing.Process(
+                target=run_eval,
+                args=(args.checkpoint, device, tasks, pf),
+            )
+            p.start()
+            procs.append(p)
+
+        for p in procs:
+            p.join()
+
+        # 合并
+        merged = merge_results(partial_files, output_path)
+
+        # 打印汇总
+        print(f'\n{"="*60}')
+        print(f'RESULTS: {ckpt_name}')
+        print(f'{"="*60}')
+        for task, res in merged['results'].items():
+            acc = res.get('acc,none', res.get('acc', '?'))
+            acc_n = res.get('acc_norm,none', '')
+            norm_str = f' (norm: {acc_n:.4f})' if isinstance(acc_n, float) else ''
+            if isinstance(acc, float):
+                print(f'  {task:>20s}: {acc:.4f}{norm_str}')
+            else:
+                print(f'  {task:>20s}: {acc}')

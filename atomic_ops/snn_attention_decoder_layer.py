@@ -57,7 +57,6 @@ class SNNAttentionDecoderLayer(MemoryModule):
         K: 每 token SNN 帧数
         num_layers: 总层数 (用于输出缩放)
         layer_idx: 当前层索引
-        activation_mode: v1/v2 激活模式
     """
 
     def __init__(
@@ -72,14 +71,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
         K: int = 12,
         num_layers: int = 1,
         layer_idx: int = 0,
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.K = K
         self.D_key = D_key
         self.D_value = D_value
-        self.activation_mode = activation_mode
 
         # ====== 子层 1: SNN-Attention ======
         self.attn_norm = RMSNorm(D)
@@ -111,7 +108,6 @@ class SNNAttentionDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
-            activation_mode=activation_mode,
         )
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
@@ -145,9 +141,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
             surrogate_function=input_neuron.surrogate_function,
         )
         input_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)
-        return V_post.to(input_dtype)
+        return ((1.0 - beta) * V_post).to(input_dtype)
 
     def _gate_neuron_parallel(self, h_normed):
         """PLIFNode gate 的 parallel scan, 返回标量门控。"""

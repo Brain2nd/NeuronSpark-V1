@@ -13,7 +13,6 @@ class NeuronSparkConfig(PretrainedConfig):
         num_layers=24,
         D_ff=3072,
         v_th_min=0.1,
-        activation_mode='v2',
         memory_layer_interval=4,
         D_key=128,
         D_value=128,
@@ -28,7 +27,6 @@ class NeuronSparkConfig(PretrainedConfig):
         self.num_layers = num_layers
         self.D_ff = D_ff
         self.v_th_min = v_th_min
-        self.activation_mode = activation_mode
         self.memory_layer_interval = memory_layer_interval
         self.D_key = D_key
         self.D_value = D_value

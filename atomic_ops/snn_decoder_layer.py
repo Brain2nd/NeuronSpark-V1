@@ -107,12 +107,10 @@ class SNNDecoderLayer(MemoryModule):
         K: int = 16,
         num_layers: int = 1,
         layer_idx: int = 0,
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.K = K
-        self.activation_mode = activation_mode
 
         self.snn_block = SNNBlock(
             D=D, N=N, v_th_min=v_th_min,
@@ -122,7 +120,6 @@ class SNNDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
-            activation_mode=activation_mode,
         )
 
         # Pre-LN 分支归一化: h → RMSNorm → PLIFNode
@@ -198,9 +195,7 @@ class SNNDecoderLayer(MemoryModule):
         )
 
         input_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
-        return V_post.to(input_dtype)  # 膜电位
+        return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
@@ -316,18 +311,14 @@ class SNNDecoderLayer(MemoryModule):
         """
         # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差
         _ = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
-        v_in = self.input_neuron1.v
-        if self.activation_mode == 'v2':
-            v_in = (1.0 - self.input_neuron1.beta) * v_in
+        v_in = (1.0 - self.input_neuron1.beta) * self.input_neuron1.v
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
         h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差
         _ = self.input_neuron2(self.ffn_norm(h))
-        v_in2 = self.input_neuron2.v
-        if self.activation_mode == 'v2':
-            v_in2 = (1.0 - self.input_neuron2.beta) * v_in2
+        v_in2 = (1.0 - self.input_neuron2.beta) * self.input_neuron2.v
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
         h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)

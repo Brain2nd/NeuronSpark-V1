@@ -35,7 +35,6 @@ def load_model(checkpoint_path, device):
         K=config.get('K', 12),
         num_layers=config.get('num_layers', 24),
         D_ff=config.get('D_ff', 3072),
-        activation_mode=config.get('activation_mode', 'v2'),
     )
     load_model_weights(checkpoint_path, model, device)
     model = model.to(device).eval()

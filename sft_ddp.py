@@ -100,7 +100,6 @@ def init_model(args, local_rank, rank):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
-        activation_mode=args.activation_mode,
     )
 
     device = torch.device(f"cuda:{local_rank}")
@@ -227,9 +226,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=24)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
-    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
-                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
-
     # SFT 特有
     parser.add_argument('--pretrained_ckpt', type=str, default=None)
     parser.add_argument('--sft_data_path', type=str, default='data/sft/sft_data.jsonl')

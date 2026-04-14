@@ -47,12 +47,10 @@ class SNNFFN(MemoryModule):
         num_layers: int = 1,
         layer_idx: int = 0,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.D_ff = D_ff
-        self.activation_mode = activation_mode
 
         # ====== 三条投影路径（对标 SwiGLU: gate_proj, up_proj, down_proj） ======
         self.gate_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
@@ -149,15 +147,14 @@ class SNNFFN(MemoryModule):
             surrogate_function=surr,
         )
 
-        # 激活值: v2=(1-β)·V_post (泄漏量), v1=V_post (膜电位)
+        # 激活值: (1-β)·V_post (膜电位泄漏量)
         gate_v = V_post_merged[:, :, :D_ff]
         up_v = V_post_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        if self.activation_mode == 'v2':
-            gate_v = gate_v * (1.0 - beta_gate)
-            up_v = up_v * (1.0 - beta_up)
+        gate_v = gate_v * (1.0 - beta_gate)
+        up_v = up_v * (1.0 - beta_up)
 
         # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
         gated = gate_v * up_v  # (TK, batch, D_ff)
@@ -179,15 +176,11 @@ class SNNFFN(MemoryModule):
         """
         # 门控路径
         _ = self.gate_neuron(self.gate_proj(x))
-        gate_v = self.gate_neuron.v
+        gate_v = (1.0 - self.gate_neuron.beta) * self.gate_neuron.v
 
         # 值路径
         _ = self.up_neuron(self.up_proj(x))
-        up_v = self.up_neuron.v
-
-        if self.activation_mode == 'v2':
-            gate_v = (1.0 - self.gate_neuron.beta) * gate_v
-            up_v = (1.0 - self.up_neuron.beta) * up_v
+        up_v = (1.0 - self.up_neuron.beta) * self.up_neuron.v
 
         # 连续门控（对标 SwiGLU）
         gated = gate_v * up_v

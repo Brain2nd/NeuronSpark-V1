@@ -74,7 +74,6 @@ def init_model(args):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
-        activation_mode=args.activation_mode,
     )
 
     device = torch.device(f"cuda:{local_rank}")
@@ -206,8 +205,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=24)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
-    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'])
-
     # 训练参数
     parser.add_argument("--out_dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", type=int, default=1)

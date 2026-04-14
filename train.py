@@ -112,7 +112,6 @@ def init_model(args):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
-        activation_mode=args.activation_mode,
     )
 
     # 将模型移动到指定设备
@@ -263,9 +262,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=24, help='SNN 解码层数')
     parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
-    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
-                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
-
     # 基础训练参数（对齐教程）
     parser.add_argument("--out_dir", type=str, default="checkpoints", help="模型输出目录")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")

@@ -51,7 +51,6 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
         'K': raw.K,
         'num_layers': raw.num_layers,
         'D_ff': raw.D_ff,
-        'activation_mode': raw.activation_mode,
         'v_th_min': raw.v_th_min,
         'memory_layer_interval': raw.memory_layer_interval,
         'D_key': raw.D_key,
@@ -104,7 +103,7 @@ def load_checkpoint(path, model, optimizer, scaler, device):
     if os.path.exists(training_state_path):
         ts = torch.load(training_state_path, map_location=device, weights_only=False)
 
-        if 'optimizer_state' in ts and optimizer is not None:
+        if ts.get('optimizer_state') is not None and optimizer is not None:
             optimizer.load_state_dict(ts['optimizer_state'])
 
         if 'scaler_state' in ts and scaler is not None and ts['scaler_state'] is not None:

@@ -47,7 +47,6 @@ def convert(checkpoint_path, tokenizer_path, output_dir):
         num_layers=snn_config.get('num_layers', 24),
         D_ff=snn_config.get('D_ff', 3072),
         v_th_min=snn_config.get('v_th_min', 0.1),
-        activation_mode=snn_config.get('activation_mode', 'v2'),
         memory_layer_interval=snn_config.get('memory_layer_interval', 4),
         D_key=snn_config.get('D_key', 128),
         D_value=snn_config.get('D_value', 128),

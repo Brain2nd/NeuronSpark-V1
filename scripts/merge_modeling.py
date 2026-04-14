@@ -295,7 +295,6 @@ def main():
                 num_layers=config.num_layers,
                 D_ff=config.D_ff,
                 v_th_min=config.v_th_min,
-                activation_mode=config.activation_mode,
                 memory_layer_interval=config.memory_layer_interval,
                 D_key=config.D_key,
                 D_value=config.D_value,

@@ -65,7 +65,6 @@ class SNNLanguageModel(nn.Module):
         num_layers: int = 24,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
-        activation_mode: str = 'v2',
         memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
@@ -77,7 +76,6 @@ class SNNLanguageModel(nn.Module):
         self.K = K
         self.num_layers = num_layers
         self.D_ff = D_ff
-        self.activation_mode = activation_mode
         self.memory_layer_interval = memory_layer_interval
         self.v_th_min = v_th_min
         self.D_key = D_key
@@ -114,7 +112,6 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
-                    activation_mode=activation_mode,
                 ))
                 self.layer_types.append('memory')
             else:
@@ -124,7 +121,6 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
-                    activation_mode=activation_mode,
                 ))
                 self.layer_types.append('snn')
 
@@ -204,9 +200,7 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)
-        return V_post.to(input_dtype)
+        return ((1.0 - beta) * V_post).to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

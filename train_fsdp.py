@@ -16,9 +16,6 @@
     # 切换分片策略
     torchrun --nproc_per_node=4 train_fsdp.py --sharding_strategy hybrid_shard
 
-    # V1 激活模式训练
-    torchrun --nproc_per_node=4 train_fsdp.py --activation_mode v1
-
     # 启用 TensorBoard 看板
     torchrun --nproc_per_node=4 train_fsdp.py --dashboard_dir runs/pretrain
 
@@ -154,7 +151,6 @@ def save_checkpoint_fsdp(save_dir, model, optimizer, step, epoch, best_loss, tok
             'K': raw_model.K,
             'num_layers': raw_model.num_layers,
             'D_ff': raw_model.D_ff,
-            'activation_mode': raw_model.activation_mode,
         }
         with open(os.path.join(ckpt_dir, 'config.json'), 'w') as f:
             json.dump(config, f, indent=2)
@@ -246,7 +242,6 @@ def init_model(args, local_rank, rank):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
-        activation_mode=args.activation_mode,
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -421,9 +416,6 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=24)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
-    parser.add_argument('--activation_mode', type=str, default='v2', choices=['v1', 'v2'],
-                        help='激活模式: v1=V_post, v2=(1-β)·V_post (默认 v2)')
-
     # 训练参数
     parser.add_argument("--out_dir", type=str, default="checkpoints")
     parser.add_argument("--epochs", type=int, default=1)
@@ -542,7 +534,6 @@ if __name__ == "__main__":
     Logger(f"SNN Language Model Pretraining (FSDP, {world_size} GPUs)", rank)
     Logger(f"  Vocab:       {args.vocab_size}", rank)
     Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}", rank)
-    Logger(f"  Activation:  {args.activation_mode}", rank)
     Logger(f"  Data:        {args.data_path}", rank)
     Logger(f"  Samples:     {len(train_ds):,}", rank)
     Logger(f"  Max length:  {args.max_length}", rank)

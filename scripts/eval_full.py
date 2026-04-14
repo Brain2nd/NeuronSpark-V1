@@ -130,6 +130,7 @@ def run_eval(checkpoint, device, tasks, output_path):
 
 def merge_results(partial_files, merged_path):
     """合并多个 partial JSON 为一个完整结果文件。"""
+    os.makedirs(os.path.dirname(merged_path) or '.', exist_ok=True)
     merged = {'results': {}, 'tasks': []}
     for pf in partial_files:
         if not os.path.exists(pf):
@@ -147,6 +148,7 @@ def merge_results(partial_files, merged_path):
 
 if __name__ == '__main__':
     import argparse, multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     parser = argparse.ArgumentParser()
     parser.add_argument('--checkpoint', type=str, default='checkpoints/ckpt_step441000')
     parser.add_argument('--num_gpus', type=int, default=1)

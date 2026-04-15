@@ -446,7 +446,7 @@ if __name__ == "__main__":
     # 数据
     parser.add_argument("--data_path", type=str,
                         default="data/seq-monkey/seq_monkey_datawhale.jsonl")
-    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/")
+    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer/")
 
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)

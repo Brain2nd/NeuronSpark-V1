@@ -227,7 +227,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_interval", type=int, default=1000)
 
     # Tokenizer
-    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/")
+    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer/")
 
     # 断续训练
     parser.add_argument('--resume', type=str, default=None, help='从 SFT checkpoint 恢复')

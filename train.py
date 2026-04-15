@@ -289,7 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str,
                         default="data/seq-monkey/seq_monkey_datawhale.jsonl",
                         help="预处理后的 JSONL 数据路径")
-    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/",
+    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer/",
                         help="自训练 tokenizer 路径")
 
     # Checkpoint

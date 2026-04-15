@@ -144,7 +144,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="转换前后推理对比测试")
     parser.add_argument('--original', type=str, required=True, help='原始 checkpoint')
     parser.add_argument('--converted', type=str, required=True, help='转换后 checkpoint')
-    parser.add_argument('--tokenizer_path', type=str, default='./tokenizer_snn/')
+    parser.add_argument('--tokenizer_path', type=str, default='./tokenizer/')
     parser.add_argument('--device', type=str, default='cpu')
     parser.add_argument('--mode', type=str, default='sft', choices=['pretrain', 'sft'])
     parser.add_argument('--max_new_tokens', type=int, default=64)

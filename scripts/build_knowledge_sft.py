@@ -69,10 +69,17 @@ def clean_text(text):
     # 7. 残缺 URL（http://. 这种明显残缺的，删掉）
     text = re.sub(r'https?://[.,\s]*$', '', text)
     text = re.sub(r'https?://\.\s', ' ', text)
-    # 8. 连续相同标点（4+个）
-    text = re.sub(r'([,，。.])\1{3,}', r'\1\1\1', text)  # 保留最多 3 个
-    text = re.sub(r'\?{4,}', '???', text)
-    text = re.sub(r'!{4,}', '!!!', text)
+    # 8. 连续相同字符（4+个）→ 最多保留 3 个
+    # 压缩非字母数字的重复（如 ---- ____ **** 等），但保留数字序列 10000 和中文重叠
+    text = re.sub(r'([\W_])\1{3,}', r'\1\1\1', text)
+    # 9. 控制字符 + Unicode 私有使用区（U+E000-F8FF）
+    import unicodedata
+    # 先处理常见零宽字符
+    text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
+    # 删除 Unicode 私有区（罕见字符，模型不认识）
+    text = re.sub(r'[\ue000-\uf8ff]', '', text)
+    # 删除其他控制字符（保留 \n \t）
+    text = ''.join(c for c in text if c in '\n\t' or not unicodedata.category(c).startswith('C'))
     # 9. 多个换行合并（最多保留 2 个）
     text = re.sub(r'\n{3,}', '\n\n', text)
     # 10. 多个空格合并

@@ -69,9 +69,12 @@ def clean_text(text):
     # 7. 残缺 URL（http://. 这种明显残缺的，删掉）
     text = re.sub(r'https?://[.,\s]*$', '', text)
     text = re.sub(r'https?://\.\s', ' ', text)
-    # 8. 连续相同字符（4+个）→ 最多保留 3 个
-    # 压缩非字母数字的重复（如 ---- ____ **** 等），但保留数字序列 10000 和中文重叠
-    text = re.sub(r'([\W_])\1{3,}', r'\1\1\1', text)
+    # 8. 分割线/重复符号垃圾（数据爬取残留）→ 删除
+    # ---- ____ ==== **** #### 等 4+ 重复直接删除（分割线无语义价值）
+    text = re.sub(r'[-_=*#~]{4,}', '', text)
+    text = re.sub(r'\.{4,}', '...', text)  # 省略号压缩
+    # 其他字符的重复（标点/符号），保留最多 3 个
+    text = re.sub(r'([^\w\s\u4e00-\u9fff])\1{3,}', r'\1\1\1', text)
     # 9. 控制字符 + Unicode 私有使用区（U+E000-F8FF）
     import unicodedata
     # 先处理常见零宽字符
@@ -124,6 +127,10 @@ def is_quality(q, a, min_a_len=2):
     for p in refuse_phrases:
         if p in a_lower:
             return False
+    # 可打印语义字符占比过低（全是符号/空白，可能是垃圾残留）
+    letters = sum(1 for c in a if c.isalpha() or '\u4e00' <= c <= '\u9fff' or c.isdigit())
+    if letters < len(a_stripped) * 0.3:
+        return False
     return True
 
 

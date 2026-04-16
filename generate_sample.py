@@ -100,7 +100,7 @@ def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
             top_k=top_k,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
-            eos_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.encode("<|im_end|>", add_special_tokens=False)[0],
         )
 
     full_text = tokenizer.decode(output_ids[0], skip_special_tokens=False)

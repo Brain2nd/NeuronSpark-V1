@@ -168,20 +168,30 @@ for fname in ["train.json", "dev.json", "test.json"]:
             except json.JSONDecodeError:
                 continue
             q = clean_text(row.get("input", ""))
-            a = clean_text(row.get("output", ""))
-            # webqa 百科答案应该有一定长度（至少 5 字符）
-            if not is_quality(q, a, min_a_len=5):
+            a_raw = clean_text(row.get("output", ""))
+            # webqa 格式: "答案。扩展解释1<e>扩展解释2<e>..." (clean_text 已去掉 <e>)
+            # 策略: 只保留第一句作为核心答案 + 最多一段简短补充
+            # 找第一个 "。" 后是否还有内容
+            first_period = a_raw.find('。')
+            if first_period > 0 and first_period < len(a_raw) - 1:
+                core = a_raw[:first_period + 1]  # 核心答案
+                rest = a_raw[first_period + 1:].strip()
+                # 再取一小段补充 (最多 200 字)
+                if len(rest) > 200:
+                    cut = rest[:200].rfind('。')
+                    if cut > 30:
+                        rest = rest[:cut + 1]
+                    else:
+                        rest = rest[:200]
+                a = core + rest if rest else core
+            else:
+                a = a_raw
+
+            if not is_quality(q, a, min_a_len=2):
                 continue
             if q in seen_questions:
                 continue
             seen_questions.add(q)
-            if len(a) > 500:
-                # 截断到最后一个完整句子
-                cut = a[:500].rfind('。')
-                if cut > 100:
-                    a = a[:cut+1]
-                else:
-                    a = a[:500]
             knowledge_samples.append({
                 "messages": [
                     {"role": "system", "content": SYS_KNOWLEDGE},
@@ -235,6 +245,28 @@ for simpleqa_path in ["data/raw/chinese-simpleqa/chinese_simpleqa.jsonl",
                        "data/raw/chinese-simpleqa/chinese_simpleqa.csv"]:
     if not os.path.exists(simpleqa_path):
         continue
+    def add_simpleqa(row):
+        q = clean_text(row.get("question", ""))
+        a = clean_text(row.get("answer", ""))
+        if not q or not a:
+            return
+        if not is_quality(q, a, min_a_len=1):
+            return
+        # SimpleQA 答案很短（如"北京"），用领域系统提示让模型对齐
+        cat = row.get("primary_category", "")
+        sub = row.get("secondary_category", "")
+        if cat and sub:
+            sys_prompt = f"你是一个{cat}/{sub}领域的知识助手，请简短准确地回答。"
+        else:
+            sys_prompt = "你是一个知识助手，请简短准确地回答事实性问题。"
+        knowledge_samples.append({
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": q},
+                {"role": "assistant", "content": a},
+            ],
+        })
+
     if simpleqa_path.endswith(".jsonl"):
         with open(simpleqa_path, encoding="utf-8") as f:
             for line in f:
@@ -242,34 +274,14 @@ for simpleqa_path in ["data/raw/chinese-simpleqa/chinese_simpleqa.jsonl",
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                q = clean_text(row.get("question", ""))
-                a = clean_text(row.get("answer", ""))
-                if not q or not a:
-                    continue
-                knowledge_samples.append({
-                    "messages": [
-                        {"role": "system", "content": SYS_KNOWLEDGE},
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": a},
-                    ],
-                })
+                add_simpleqa(row)
         break
     elif simpleqa_path.endswith(".csv"):
         import csv
         with open(simpleqa_path, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                q = clean_text(row.get("question", ""))
-                a = clean_text(row.get("answer", ""))
-                if not q or not a:
-                    continue
-                knowledge_samples.append({
-                    "messages": [
-                        {"role": "system", "content": SYS_KNOWLEDGE},
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": a},
-                    ],
-                })
+                add_simpleqa(row)
         break
 print(f"  simpleqa: {len(knowledge_samples) - before}")
 
@@ -314,11 +326,18 @@ print("\n=== 英文知识数据 ===")
 
 SYS_EN = "You are a helpful assistant. Please answer the user's question accurately."
 
-# 1. databricks/databricks-dolly-15k - 英文指令问答
+# 1. databricks/databricks-dolly-15k - 英文指令问答（按 category 分情况处理）
+#
+# 8 种 category 的处理:
+#   open_qa / general_qa / brainstorming / creative_writing → 只用 instruction
+#   closed_qa / information_extraction / summarization → context 在前（先给材料再问）
+#   classification → instruction 在前（先说任务再给选项）
+#
 dolly_path = "data/raw/dolly-15k"
 if os.path.isdir(dolly_path):
     print("=== Dolly-15k ===")
     before = len(knowledge_samples)
+    cat_counts = {}
     for fname in os.listdir(dolly_path):
         if not fname.endswith(".jsonl"):
             continue
@@ -331,10 +350,32 @@ if os.path.isdir(dolly_path):
                 q = clean_text(row.get("instruction", ""))
                 a = clean_text(row.get("response", ""))
                 ctx = clean_text(row.get("context", ""))
-                # 如果有 context，拼接到问题里
-                user_content = q if not ctx else f"{ctx}\n\n{q}"
+                cat = row.get("category", "")
+
+                # 按 category 拼接
+                if cat in ("closed_qa", "information_extraction", "summarization"):
+                    # 需要参考材料，材料在前
+                    if ctx:
+                        user_content = f"Context:\n{ctx}\n\nQuestion: {q}"
+                    else:
+                        user_content = q
+                elif cat == "classification":
+                    # 分类任务，指令在前（说明任务），context 如果是选项列表跟在后面
+                    if ctx:
+                        user_content = f"{q}\n\n{ctx}"
+                    else:
+                        user_content = q
+                else:
+                    # open_qa / general_qa / brainstorming / creative_writing
+                    # 一般不需要 context，有也附加
+                    if ctx:
+                        user_content = f"{q}\n\n{ctx}"
+                    else:
+                        user_content = q
+
                 if not is_quality(user_content, a, min_a_len=10):
                     continue
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
                 knowledge_samples.append({
                     "messages": [
                         {"role": "system", "content": SYS_EN},
@@ -343,6 +384,8 @@ if os.path.isdir(dolly_path):
                     ],
                 })
     print(f"  dolly: {len(knowledge_samples) - before}")
+    for c, n in sorted(cat_counts.items(), key=lambda x: -x[1]):
+        print(f"    {c}: {n}")
 
 # 2. trivia_qa - 英文事实问答
 trivia_path = "data/raw/trivia_qa"
@@ -405,11 +448,16 @@ if os.path.isdir(alpaca_path):
                 items = json.load(f)
             else:
                 items = [json.loads(l) for l in f if l.strip()]
+        # Alpaca 原模板：instruction 描述任务，input 是输入数据
+        # 按原论文: Instruction 在前，Input 跟随 (不加 "### Input:" 标记，简化为换行)
         for row in items:
             q = clean_text(row.get("instruction", ""))
             a = clean_text(row.get("output", ""))
             inp = clean_text(row.get("input", ""))
-            user_content = q if not inp else f"{q}\n\n{inp}"
+            if inp:
+                user_content = f"{q}\n\n{inp}"
+            else:
+                user_content = q
             if not is_quality(user_content, a, min_a_len=10):
                 continue
             knowledge_samples.append({

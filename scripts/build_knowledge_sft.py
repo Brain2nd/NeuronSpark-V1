@@ -33,22 +33,82 @@ SYS_KNOWLEDGE = "你是一个有帮助的知识助手，请准确回答用户的
 
 
 def clean_text(text):
-    """清洗文本：去 <e> 标签、HTML、多余空白。"""
+    """清洗文本：去所有已知异常标签、Markdown、URL、乱码等。
+
+    顺序很重要：先处理会嵌套的（图片/链接）、再 HTML、再单独符号。
+    """
+    # 1. Markdown 图片（必须先于链接处理）![alt](url) → 删除
+    text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
+    # 2. Markdown 链接 [text](url) → text
+    text = re.sub(r'\[([^\]]*)\]\(([^)]*)\)', r'\1', text)
+    # 3. 特殊标签
     text = re.sub(r'<e>', '', text)
-    text = re.sub(r'<[^>]+>', '', text)
-    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'<\|im_start\|>|<\|im_end\|>', '', text)
+    # 4. 处理尖括号：保留数学比较符号 <=, <, >=, > 和中文书名号，删除 HTML 标签
+    # <<xxx>> → 《xxx》
+    text = re.sub(r'<<([^<>]+)>>', r'《\1》', text)
+    # <中文xxx> → 《中文xxx》（中文标签当书名处理）
+    text = re.sub(r'<([\u4e00-\u9fff][^<>]{0,30})>', r'《\1》', text)
+    # HTML 标签：以字母开头或 / 开头
+    text = re.sub(r'<(/?[a-zA-Z][^<>]*)>', '', text)
+    # 5. URL (http/https) → 删除，包括残缺的 http://. 这种
+    text = re.sub(r'https?://[^\s，。,)\]}]*', '', text)
+    # 6. Markdown 代码块 ```xxx``` → 删除
+    text = re.sub(r'```[\s\S]*?```', '', text, flags=re.MULTILINE)
+    # 如果只有单个 ``` 残留也删掉
+    text = re.sub(r'```', '', text)
+    # 7. 行内代码 `xxx` → xxx
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
+    # 8. Markdown 标题 ## ### 等
+    text = re.sub(r'(^|\n)#{1,6}\s*', r'\1', text)
+    # 9. Markdown 粗体/斜体（多行配对）
+    text = re.sub(r'\*{2,3}([^*]+?)\*{2,3}', r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'\*([^*\n]+?)\*', r'\1', text)
+    # 清理所有剩余的 *
+    text = re.sub(r'\*+', '', text)
+    # 10. 参考标记 [1] [2] → 删除
+    text = re.sub(r'\[\d+\]', '', text)
+    # 11. 字面转义字符 \\n \\t → 空格
+    text = text.replace('\\n', ' ').replace('\\t', ' ').replace('\\r', ' ')
+    # 12. Unicode 转义 \\u0027 等 → 删除（通常是残缺的，正常文本不会有）
+    text = re.sub(r'\\u[0-9a-fA-F]{4}', '', text)
+    # 13. 方框等特殊符号（Unicode 25a0-25ff）
+    text = re.sub(r'[\u25a0-\u25ff]', '', text)
+    # 14. 乱码替换符
+    text = text.replace('�', '')
+    # 15. 连续标点（3+个相同）
+    text = re.sub(r'([,，。.])\1{2,}', r'\1', text)
+    text = re.sub(r'\?{3,}', '?', text)
+    text = re.sub(r'!{3,}', '!', text)
+    # 16. 多个换行合并
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # 17. 多个空格合并
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r' *\n *', '\n', text)
     text = text.strip()
     return text
 
 
-def is_quality(q, a, min_a_len=10):
-    """质量过滤。"""
+def is_quality(q, a, min_a_len=2):
+    """质量过滤。
+
+    注意：min_a_len 默认 2，因为 Chinese-SimpleQA 等答案可能只有"北京"这样的短答案。
+    过短过滤主要靠调用时传入更高阈值（百科类 >=10）。
+    """
     if not q or not a:
         return False
-    if len(a.strip()) < min_a_len:
+    a_stripped = a.strip()
+    if len(a_stripped) < min_a_len:
         return False
-    # 过滤乱码
+    # 乱码过多
     if a.count('�') > 3:
+        return False
+    # 整段复述问题
+    if len(q) > 20 and q in a:
+        return False
+    # URL 占比过高
+    url_chars = sum(len(u) for u in re.findall(r'https?://\S+', a))
+    if url_chars > len(a_stripped) * 0.3:
         return False
     return True
 
@@ -71,9 +131,10 @@ for fname in ["train.json", "dev.json", "test.json"]:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            q = row.get("input", "").strip()
+            q = clean_text(row.get("input", ""))
             a = clean_text(row.get("output", ""))
-            if not is_quality(q, a):
+            # webqa 百科答案应该有一定长度（至少 5 字符）
+            if not is_quality(q, a, min_a_len=5):
                 continue
             if q in seen_questions:
                 continue
@@ -108,9 +169,10 @@ if os.path.isdir(wiki_dir):
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                q = row.get("instruction", "").strip()
+                q = clean_text(row.get("instruction", ""))
                 a = clean_text(row.get("output", ""))
-                if not is_quality(q, a):
+                # COIG wiki 是科普长回答，要求至少 10 字符
+                if not is_quality(q, a, min_a_len=10):
                     continue
                 if q in seen_questions:
                     continue
@@ -144,8 +206,8 @@ for simpleqa_path in ["data/raw/chinese-simpleqa/chinese_simpleqa.jsonl",
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                q = row.get("question", "").strip()
-                a = row.get("answer", "").strip()
+                q = clean_text(row.get("question", ""))
+                a = clean_text(row.get("answer", ""))
                 if not q or not a:
                     continue
                 knowledge_samples.append({
@@ -161,8 +223,8 @@ for simpleqa_path in ["data/raw/chinese-simpleqa/chinese_simpleqa.jsonl",
         with open(simpleqa_path, encoding="utf-8") as f:
             reader = csv.DictReader(f)
             for row in reader:
-                q = row.get("question", "").strip()
-                a = row.get("answer", "").strip()
+                q = clean_text(row.get("question", ""))
+                a = clean_text(row.get("answer", ""))
                 if not q or not a:
                     continue
                 knowledge_samples.append({
@@ -188,9 +250,9 @@ for math_path in ["data/pretrain_raw/belle_math/school_math_0.25M.json",
                     row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                q = row.get("instruction", "").strip()
+                q = clean_text(row.get("instruction", ""))
                 a = clean_text(row.get("output", ""))
-                if not is_quality(q, a):
+                if not is_quality(q, a, min_a_len=10):
                     continue
                 if count >= 20000:
                     break
@@ -234,11 +296,20 @@ for belle_path in ["data/sft/sft_data.jsonl",
                     continue
                 if not isinstance(messages, list) or len(messages) < 2:
                     continue
+                # 清洗每条消息的内容
+                cleaned = []
+                for m in messages:
+                    content = clean_text(m.get('content', ''))
+                    if not content:
+                        continue
+                    cleaned.append({"role": m['role'], "content": content})
+                if len(cleaned) < 2:
+                    continue
                 # 检查 assistant 回复质量
-                asst = [m['content'] for m in messages if m['role'] == 'assistant']
+                asst = [m['content'] for m in cleaned if m['role'] == 'assistant']
                 if not asst or len(asst[0].strip()) < 10:
                     continue
-                belle_samples.append({"messages": messages})
+                belle_samples.append({"messages": cleaned})
     elif 'conversations' in first:
         # 原始 BelleGroup 格式
         with open(belle_path, encoding="utf-8") as f:
@@ -250,10 +321,13 @@ for belle_path in ["data/sft/sft_data.jsonl",
                 convs = item.get('conversations', [])
                 messages = [{"role": "system", "content": SYS_CHAT}]
                 for c in convs:
+                    val = clean_text(c.get('value', ''))
+                    if not val:
+                        continue
                     if c['from'] == 'human':
-                        messages.append({"role": "user", "content": c['value']})
+                        messages.append({"role": "user", "content": val})
                     elif c['from'] == 'assistant':
-                        messages.append({"role": "assistant", "content": c['value']})
+                        messages.append({"role": "assistant", "content": val})
                 if len(messages) < 3:
                     continue
                 asst = [m['content'] for m in messages if m['role'] == 'assistant']
@@ -290,11 +364,51 @@ ds_out.save_to_disk(save_dir)
 print(f"\n已保存到 {save_dir}")
 print(f"样本数: {len(ds_out):,}")
 
-# 验证清洗效果
+# 验证清洗效果 - 完整扫描
 print("\n=== 清洗验证 ===")
-e_count = sum(1 for s in all_samples
-              for m in s['messages'] if '<e>' in m['content'])
-print(f"  含 <e> 的消息数: {e_count} (应为 0)")
+check_patterns = {
+    '<e>': r'<e>',
+    'HTML<tag>': r'<(/?[a-zA-Z])[^<>]*>',
+    'Markdown##': r'(^|\n)#{1,6}\s',
+    'Markdown**': r'\*\*[^*]+\*\*',
+    'Markdown[..](..)': r'\[[^\]]+\]\([^)]+\)',
+    'Markdown```': r'```',
+    'URL http': r'https?://',
+    '字面\\n': r'\\n',
+    '字面\\t': r'\\t',
+    '字面\\u': r'\\u[0-9a-fA-F]{4}',
+    '乱码�': r'�',
+    '方框◼': r'[\u25a0-\u25ff]',
+    '连续句号...': r'\.{4,}',
+    '连续逗号,,,': r',{3,}',
+    '参考[1]': r'\[\d+\]',
+}
+
+total_bad = 0
+for name, pat in check_patterns.items():
+    cnt = sum(1 for s in all_samples
+              for m in s['messages'] if re.search(pat, m['content']))
+    if cnt > 0:
+        print(f"  ⚠️  {name}: {cnt} 条残留")
+        total_bad += cnt
+    else:
+        print(f"  ✓ {name}: 0")
+
+# 长度分布统计（不当作异常，只是信息）
+lengths = [len(m['content']) for s in all_samples
+           for m in s['messages'] if m['role'] == 'assistant']
+lengths.sort()
+import statistics
+print(f"\n  回复长度分布: min={lengths[0]} / "
+      f"p25={lengths[len(lengths)//4]} / "
+      f"median={statistics.median(lengths):.0f} / "
+      f"p75={lengths[3*len(lengths)//4]} / "
+      f"max={lengths[-1]}")
+
+if total_bad == 0:
+    print("\n  ✅ 所有清洗检查通过")
+else:
+    print(f"\n  ⚠️  {total_bad} 条清洗异常（需要处理）")
 
 # 打印样例
 print("\n=== 样例 ===")

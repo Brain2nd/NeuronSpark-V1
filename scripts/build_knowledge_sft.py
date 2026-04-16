@@ -33,56 +33,49 @@ SYS_KNOWLEDGE = "你是一个有帮助的知识助手，请准确回答用户的
 
 
 def clean_text(text):
-    """清洗文本：去所有已知异常标签、Markdown、URL、乱码等。
+    """只清洗真正的垃圾。Markdown 等合法格式保留。
 
-    顺序很重要：先处理会嵌套的（图片/链接）、再 HTML、再单独符号。
+    清洗目标：
+      - 特殊数据集标签（<e> 等 webqa 残留）
+      - 乱码字符 (�)
+      - 字面转义字符 \\n \\t \\u (应该已被解码)
+      - 残缺/异常的 HTML 遗留（如 <br>、<p>）
+      - 残缺 URL (http://.)
+      - 连续相同标点 (4+个)
+      - 方框等输入残留
+      - 特殊标签 <|im_start|> <|im_end|>
+
+    保留：
+      - Markdown 标题 ## 、粗体 **、斜体 *、代码块 ```、行内代码 `
+      - Markdown 链接 [text](url) 和图片 ![alt](url)
+      - 合法 URL
+      - 数学符号 <, <=, >, >=
+      - 中文书名号 <xxx> → 《xxx》（已有大量《》写法，统一）
+      - 参考标记 [1]
     """
-    # 1. Markdown 图片（必须先于链接处理）![alt](url) → 删除
-    text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
-    # 2. Markdown 链接 [text](url) → text
-    text = re.sub(r'\[([^\]]*)\]\(([^)]*)\)', r'\1', text)
-    # 3. 特殊标签
+    # 1. 特殊数据集标签
     text = re.sub(r'<e>', '', text)
     text = re.sub(r'<\|im_start\|>|<\|im_end\|>', '', text)
-    # 4. 处理尖括号：保留数学比较符号 <=, <, >=, > 和中文书名号，删除 HTML 标签
-    # <<xxx>> → 《xxx》
-    text = re.sub(r'<<([^<>]+)>>', r'《\1》', text)
-    # <中文xxx> → 《中文xxx》（中文标签当书名处理）
-    text = re.sub(r'<([\u4e00-\u9fff][^<>]{0,30})>', r'《\1》', text)
-    # HTML 标签：以字母开头或 / 开头
-    text = re.sub(r'<(/?[a-zA-Z][^<>]*)>', '', text)
-    # 5. URL (http/https) → 删除，包括残缺的 http://. 这种
-    text = re.sub(r'https?://[^\s，。,)\]}]*', '', text)
-    # 6. Markdown 代码块 ```xxx``` → 删除
-    text = re.sub(r'```[\s\S]*?```', '', text, flags=re.MULTILINE)
-    # 如果只有单个 ``` 残留也删掉
-    text = re.sub(r'```', '', text)
-    # 7. 行内代码 `xxx` → xxx
-    text = re.sub(r'`([^`\n]+)`', r'\1', text)
-    # 8. Markdown 标题 ## ### 等
-    text = re.sub(r'(^|\n)#{1,6}\s*', r'\1', text)
-    # 9. Markdown 粗体/斜体（多行配对）
-    text = re.sub(r'\*{2,3}([^*]+?)\*{2,3}', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'\*([^*\n]+?)\*', r'\1', text)
-    # 清理所有剩余的 *
-    text = re.sub(r'\*+', '', text)
-    # 10. 参考标记 [1] [2] → 删除
-    text = re.sub(r'\[\d+\]', '', text)
-    # 11. 字面转义字符 \\n \\t → 空格
+    # 2. HTML 标签残留（只删常见的真实 HTML 标签，不删内容）
+    text = re.sub(r'</?(?:br|p|div|span|li|ul|ol|table|tr|td|th|hr|html|body|head|meta|h[1-6]|b|i|u|a|img|strong|em|code|pre)(?:\s[^<>]*)?>', '', text, flags=re.IGNORECASE)
+    # 3. 字面转义字符 \\n \\t \\r
     text = text.replace('\\n', ' ').replace('\\t', ' ').replace('\\r', ' ')
-    # 12. Unicode 转义 \\u0027 等 → 删除（通常是残缺的，正常文本不会有）
+    # 4. Unicode 转义 \\u0027 等 → 删除（应被 json.loads 解码；出现即数据有问题）
     text = re.sub(r'\\u[0-9a-fA-F]{4}', '', text)
-    # 13. 方框等特殊符号（Unicode 25a0-25ff）
+    # 5. 方框等特殊符号（Unicode 25a0-25ff）
     text = re.sub(r'[\u25a0-\u25ff]', '', text)
-    # 14. 乱码替换符
+    # 6. 乱码替换符
     text = text.replace('�', '')
-    # 15. 连续标点（3+个相同）
-    text = re.sub(r'([,，。.])\1{2,}', r'\1', text)
-    text = re.sub(r'\?{3,}', '?', text)
-    text = re.sub(r'!{3,}', '!', text)
-    # 16. 多个换行合并
+    # 7. 残缺 URL（http://. 这种明显残缺的，删掉）
+    text = re.sub(r'https?://[.,\s]*$', '', text)
+    text = re.sub(r'https?://\.\s', ' ', text)
+    # 8. 连续相同标点（4+个）
+    text = re.sub(r'([,，。.])\1{3,}', r'\1\1\1', text)  # 保留最多 3 个
+    text = re.sub(r'\?{4,}', '???', text)
+    text = re.sub(r'!{4,}', '!!!', text)
+    # 9. 多个换行合并（最多保留 2 个）
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # 17. 多个空格合并
+    # 10. 多个空格合并
     text = re.sub(r'[ \t]+', ' ', text)
     text = re.sub(r' *\n *', '\n', text)
     text = text.strip()
@@ -272,6 +265,121 @@ else:
 print(f"\n知识数据小计: {len(knowledge_samples):,}")
 
 # ============================================================
+# 英文知识数据（预训练是双语 55% 英文，SFT 也需要英文）
+# ============================================================
+print("\n=== 英文知识数据 ===")
+
+SYS_EN = "You are a helpful assistant. Please answer the user's question accurately."
+
+# 1. databricks/databricks-dolly-15k - 英文指令问答
+dolly_path = "data/raw/dolly-15k"
+if os.path.isdir(dolly_path):
+    print("=== Dolly-15k ===")
+    before = len(knowledge_samples)
+    for fname in os.listdir(dolly_path):
+        if not fname.endswith(".jsonl"):
+            continue
+        with open(os.path.join(dolly_path, fname), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                q = clean_text(row.get("instruction", ""))
+                a = clean_text(row.get("response", ""))
+                ctx = clean_text(row.get("context", ""))
+                if not q or not a:
+                    continue
+                if len(a.strip()) < 10:
+                    continue
+                # 如果有 context，拼接到问题里
+                user_content = q if not ctx else f"{ctx}\n\n{q}"
+                knowledge_samples.append({
+                    "messages": [
+                        {"role": "system", "content": SYS_EN},
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": a},
+                    ],
+                })
+    print(f"  dolly: {len(knowledge_samples) - before}")
+
+# 2. trivia_qa - 英文事实问答
+trivia_path = "data/raw/trivia_qa"
+if os.path.isdir(trivia_path):
+    print("=== TriviaQA ===")
+    before = len(knowledge_samples)
+    count = 0
+    for fname in sorted(os.listdir(trivia_path)):
+        if not fname.endswith((".jsonl", ".json")):
+            continue
+        fpath = os.path.join(trivia_path, fname)
+        with open(fpath, encoding="utf-8") as f:
+            for line in f:
+                if count >= 30000:
+                    break
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                q = clean_text(row.get("question", ""))
+                # TriviaQA 的 answer 可能是 dict
+                ans = row.get("answer", "")
+                if isinstance(ans, dict):
+                    a = ans.get("value", "") or (ans.get("aliases", [""]) or [""])[0]
+                else:
+                    a = ans
+                a = clean_text(a if isinstance(a, str) else "")
+                if not q or not a:
+                    continue
+                # 过滤 <unk> 等占位回答
+                if a.strip().lower() in ('<unk>', 'unk', 'none', 'n/a', '[unk]'):
+                    continue
+                knowledge_samples.append({
+                    "messages": [
+                        {"role": "system", "content": SYS_EN},
+                        {"role": "user", "content": q},
+                        {"role": "assistant", "content": a},
+                    ],
+                })
+                count += 1
+    print(f"  trivia_qa: {count}")
+
+# 3. Alpaca-cleaned - 英文指令数据（备选）
+alpaca_path = "data/raw/alpaca-cleaned"
+if os.path.isdir(alpaca_path):
+    print("=== Alpaca-cleaned ===")
+    before = len(knowledge_samples)
+    for fname in os.listdir(alpaca_path):
+        if not (fname.endswith(".json") or fname.endswith(".jsonl")):
+            continue
+        fpath = os.path.join(alpaca_path, fname)
+        # 判断是 json 数组还是 jsonl
+        with open(fpath, encoding="utf-8") as f:
+            first_char = f.read(1)
+            f.seek(0)
+            if first_char == '[':
+                items = json.load(f)
+            else:
+                items = [json.loads(l) for l in f if l.strip()]
+        for row in items:
+            q = clean_text(row.get("instruction", ""))
+            a = clean_text(row.get("output", ""))
+            inp = clean_text(row.get("input", ""))
+            if not q or not a or len(a.strip()) < 10:
+                continue
+            user_content = q if not inp else f"{q}\n\n{inp}"
+            knowledge_samples.append({
+                "messages": [
+                    {"role": "system", "content": SYS_EN},
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": a},
+                ],
+            })
+    print(f"  alpaca: {len(knowledge_samples) - before}")
+
+print(f"\n知识数据总计（中+英）: {len(knowledge_samples):,}")
+
+# ============================================================
 # BelleGroup 对话数据（采样等量混合）
 # ============================================================
 print("\n=== BelleGroup 对话数据 ===")
@@ -286,17 +394,20 @@ for belle_path in ["data/sft/sft_data.jsonl",
         first_line = f.readline()
         first = json.loads(first_line)
 
+    # 目标：最多 200K 条（减少内存占用和处理时间，足够混合）
+    BELLE_LIMIT = 200000
     if isinstance(first, list):
         # deal_dataset.py 处理后的 ChatML list 格式
         with open(belle_path, encoding="utf-8") as f:
             for line in f:
+                if len(belle_samples) >= BELLE_LIMIT:
+                    break
                 try:
                     messages = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if not isinstance(messages, list) or len(messages) < 2:
                     continue
-                # 清洗每条消息的内容
                 cleaned = []
                 for m in messages:
                     content = clean_text(m.get('content', ''))
@@ -305,15 +416,18 @@ for belle_path in ["data/sft/sft_data.jsonl",
                     cleaned.append({"role": m['role'], "content": content})
                 if len(cleaned) < 2:
                     continue
-                # 检查 assistant 回复质量
                 asst = [m['content'] for m in cleaned if m['role'] == 'assistant']
                 if not asst or len(asst[0].strip()) < 10:
                     continue
                 belle_samples.append({"messages": cleaned})
+                if len(belle_samples) % 20000 == 0:
+                    print(f"    ... BelleGroup 已读 {len(belle_samples):,}")
     elif 'conversations' in first:
         # 原始 BelleGroup 格式
         with open(belle_path, encoding="utf-8") as f:
             for line in f:
+                if len(belle_samples) >= BELLE_LIMIT:
+                    break
                 try:
                     item = json.loads(line)
                 except json.JSONDecodeError:
@@ -334,6 +448,8 @@ for belle_path in ["data/sft/sft_data.jsonl",
                 if not asst or len(asst[0].strip()) < 10:
                     continue
                 belle_samples.append({"messages": messages})
+                if len(belle_samples) % 20000 == 0:
+                    print(f"    ... BelleGroup 已读 {len(belle_samples):,}")
     break
 
 print(f"  BelleGroup 总量: {len(belle_samples):,}")
@@ -367,21 +483,18 @@ print(f"样本数: {len(ds_out):,}")
 # 验证清洗效果 - 完整扫描
 print("\n=== 清洗验证 ===")
 check_patterns = {
-    '<e>': r'<e>',
-    'HTML<tag>': r'<(/?[a-zA-Z])[^<>]*>',
-    'Markdown##': r'(^|\n)#{1,6}\s',
-    'Markdown**': r'\*\*[^*]+\*\*',
-    'Markdown[..](..)': r'\[[^\]]+\]\([^)]+\)',
-    'Markdown```': r'```',
-    'URL http': r'https?://',
+    '<e>标签': r'<e>',
+    'HTML残留': r'</?(?:br|p|div|span|li|ul|ol|table|tr|td|th|hr|html|body|head|meta|h[1-6])(?:\s|>)',
+    '<|im_start|>': r'<\|im_start\|>',
+    '<|im_end|>': r'<\|im_end\|>',
     '字面\\n': r'\\n',
     '字面\\t': r'\\t',
     '字面\\u': r'\\u[0-9a-fA-F]{4}',
     '乱码�': r'�',
     '方框◼': r'[\u25a0-\u25ff]',
-    '连续句号...': r'\.{4,}',
-    '连续逗号,,,': r',{3,}',
-    '参考[1]': r'\[\d+\]',
+    '残缺URL': r'https?://\.\s|https?://\s',
+    '连续句号4+': r'\.{4,}',
+    '连续问号4+': r'\?{4,}',
 }
 
 total_bad = 0

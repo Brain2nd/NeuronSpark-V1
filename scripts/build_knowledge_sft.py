@@ -387,49 +387,11 @@ if os.path.isdir(dolly_path):
     for c, n in sorted(cat_counts.items(), key=lambda x: -x[1]):
         print(f"    {c}: {n}")
 
-# 2. trivia_qa - 英文事实问答
-trivia_path = "data/raw/trivia_qa"
-if os.path.isdir(trivia_path):
-    print("=== TriviaQA ===")
-    before = len(knowledge_samples)
-    count = 0
-    for fname in sorted(os.listdir(trivia_path)):
-        if not fname.endswith((".jsonl", ".json")):
-            continue
-        fpath = os.path.join(trivia_path, fname)
-        with open(fpath, encoding="utf-8") as f:
-            for line in f:
-                if count >= 30000:
-                    break
-                try:
-                    row = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                q = clean_text(row.get("question", ""))
-                # TriviaQA 的 answer 可能是 dict
-                ans = row.get("answer", "")
-                if isinstance(ans, dict):
-                    a = ans.get("value", "") or (ans.get("aliases", [""]) or [""])[0]
-                else:
-                    a = ans
-                a = clean_text(a if isinstance(a, str) else "")
-                a = clean_trivia_answer(a)
-                if not q or not a:
-                    continue
-                # 过滤 <unk> 等占位回答
-                if a.strip().lower() in ('<unk>', 'unk', 'none', 'n/a', '[unk]'):
-                    continue
-                if not is_quality(q, a, min_a_len=1):
-                    continue
-                knowledge_samples.append({
-                    "messages": [
-                        {"role": "system", "content": SYS_EN},
-                        {"role": "user", "content": q},
-                        {"role": "assistant", "content": a},
-                    ],
-                })
-                count += 1
-    print(f"  trivia_qa: {count}")
+# 2. TriviaQA 从 SFT 中移除：
+#    - answer 是 1-2 词的英文专有名词（"Easter", "Pilton"）
+#    - assistant 只有几个 token，每个是罕见子词，loss 飙到 10+
+#    - 已证实是 step 0/80 loss 飙升的主因
+#    - TriviaQA 更适合做 RL（答案明确可验证，但长度不适合 SFT）
 
 # 3. Alpaca-cleaned - 英文指令数据（备选）
 alpaca_path = "data/raw/alpaca-cleaned"

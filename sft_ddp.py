@@ -169,6 +169,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                     'lr': lr,
                     'tps': tokens_seen / spend_time_db if spend_time_db > 0 else 0,
                     'tokens_seen': tokens_seen,
+                    'ponder_cost': out.ponder_cost.item() if out.ponder_cost is not None else 0.0,
                     'memory_current_gb': torch.cuda.memory_allocated() / 1e9,
                     'memory_peak_gb': torch.cuda.max_memory_allocated() / 1e9,
                 }, raw_model, log_params=(step % args.log_interval == 0))

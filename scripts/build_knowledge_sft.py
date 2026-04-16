@@ -120,7 +120,9 @@ print(f"  simpleqa: {len(all_samples) - before} samples")
 # ============================================================
 print("=== school_math ===")
 before = len(all_samples)
-math_path = "data/pretrain_raw/belle_math/school_math_0.25M.json"
+math_path = os.environ.get("MATH_PATH", "data/pretrain_raw/belle_math/school_math_0.25M.json")
+if not os.path.exists(math_path):
+    math_path = "data/raw/belle_math/school_math_0.25M.json"
 if os.path.exists(math_path):
     count = 0
     with open(math_path) as f:

@@ -69,20 +69,10 @@ def clean_text(text):
     # 7. 残缺 URL（http://. 这种明显残缺的，删掉）
     text = re.sub(r'https?://[.,\s]*$', '', text)
     text = re.sub(r'https?://\.\s', ' ', text)
-    # 8. 分割线/重复符号垃圾（数据爬取残留）→ 删除
-    # ---- ____ ==== **** #### 等 4+ 重复直接删除（分割线无语义价值）
-    text = re.sub(r'[-_=*#~]{4,}', '', text)
-    text = re.sub(r'\.{4,}', '...', text)  # 省略号压缩
-    # 其他字符的重复（标点/符号），保留最多 3 个
-    text = re.sub(r'([^\w\s\u4e00-\u9fff])\1{3,}', r'\1\1\1', text)
-    # 9. 控制字符 + Unicode 私有使用区（U+E000-F8FF）
-    import unicodedata
-    # 先处理常见零宽字符
+    # 8. 省略号压缩（仅处理 ....... 这种明显合法但过长的）
+    text = re.sub(r'\.{4,}', '...', text)
+    # 9. 零宽字符不属于内容，删除（其他控制字符由 is_quality 判定丢弃）
     text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '').replace('\ufeff', '')
-    # 删除 Unicode 私有区（罕见字符，模型不认识）
-    text = re.sub(r'[\ue000-\uf8ff]', '', text)
-    # 删除其他控制字符（保留 \n \t）
-    text = ''.join(c for c in text if c in '\n\t' or not unicodedata.category(c).startswith('C'))
     # 9. 多个换行合并（最多保留 2 个）
     text = re.sub(r'\n{3,}', '\n\n', text)
     # 10. 多个空格合并
@@ -127,10 +117,23 @@ def is_quality(q, a, min_a_len=2):
     for p in refuse_phrases:
         if p in a_lower:
             return False
+    # 任何有 4+ 个相同非字母数字字符（垃圾分割线），整条丢弃
+    if re.search(r'([\W_])\1{3,}', a):
+        return False
+    # 任何有 4+ 个相同字母的（如 aaaaaa），丢弃
+    if re.search(r'([a-zA-Z])\1{3,}', a):
+        return False
     # 可打印语义字符占比过低（全是符号/空白，可能是垃圾残留）
     letters = sum(1 for c in a if c.isalpha() or '\u4e00' <= c <= '\u9fff' or c.isdigit())
     if letters < len(a_stripped) * 0.3:
         return False
+    # 包含控制字符或 Unicode 私有区（罕见编码，模型不认识）
+    if re.search(r'[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff]', a):
+        # 保留 \n \t
+        bad = re.findall(r'[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff]', a)
+        bad = [c for c in bad if c not in '\n\t']
+        if bad:
+            return False
     return True
 
 

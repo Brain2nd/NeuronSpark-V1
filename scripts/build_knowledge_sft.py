@@ -103,7 +103,30 @@ def is_quality(q, a, min_a_len=2):
     url_chars = sum(len(u) for u in re.findall(r'https?://\S+', a))
     if url_chars > len(a_stripped) * 0.3:
         return False
+    # 过滤 "As an AI" 拒答类回复（Alpaca 常见问题）
+    refuse_phrases = [
+        "as an ai language model",
+        "as an ai, i cannot",
+        "as an ai, i don't",
+        "i'm just an ai",
+        "i am just an ai",
+        "i don't have the ability",
+        "i cannot provide",
+    ]
+    a_lower = a.lower()
+    for p in refuse_phrases:
+        if p in a_lower:
+            return False
     return True
+
+
+def clean_trivia_answer(a):
+    """TriviaQA 答案有双引号转义，清理。"""
+    # "xxx" "yyy" → xxx yyy （去掉多余引号）
+    a = re.sub(r'""([^"]+)""', r'"\1"', a)  # """ → "
+    # 前后多余引号
+    a = a.strip('"')
+    return a
 
 
 # ============================================================
@@ -329,10 +352,13 @@ if os.path.isdir(trivia_path):
                 else:
                     a = ans
                 a = clean_text(a if isinstance(a, str) else "")
+                a = clean_trivia_answer(a)
                 if not q or not a:
                     continue
                 # 过滤 <unk> 等占位回答
                 if a.strip().lower() in ('<unk>', 'unk', 'none', 'n/a', '[unk]'):
+                    continue
+                if not is_quality(q, a, min_a_len=1):
                     continue
                 knowledge_samples.append({
                     "messages": [

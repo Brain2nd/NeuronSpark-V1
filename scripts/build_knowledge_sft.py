@@ -82,12 +82,25 @@ def clean_text(text):
     return text
 
 
-def is_quality(q, a, min_a_len=2):
-    """质量过滤。
+def is_junk(text):
+    """检测文本是否含垃圾模式（网页残留、乱码等）。"""
+    if not text:
+        return False
+    # 4+ 连续重复非字母数字字符（---- ____ ???? **** 等）
+    if re.search(r'([\W_])\1{3,}', text):
+        return True
+    # 4+ 连续相同字母（aaaaaa）
+    if re.search(r'([a-zA-Z])\1{3,}', text):
+        return True
+    # 控制字符 + Unicode 私有区
+    bad = [c for c in re.findall(r'[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff]', text) if c not in '\n\t']
+    if bad:
+        return True
+    return False
 
-    注意：min_a_len 默认 2，因为 Chinese-SimpleQA 等答案可能只有"北京"这样的短答案。
-    过短过滤主要靠调用时传入更高阈值（百科类 >=10）。
-    """
+
+def is_quality(q, a, min_a_len=2):
+    """质量过滤：检查 q 和 a，任一含垃圾就丢弃。"""
     if not q or not a:
         return False
     a_stripped = a.strip()
@@ -117,23 +130,13 @@ def is_quality(q, a, min_a_len=2):
     for p in refuse_phrases:
         if p in a_lower:
             return False
-    # 任何有 4+ 个相同非字母数字字符（垃圾分割线），整条丢弃
-    if re.search(r'([\W_])\1{3,}', a):
+    # q 或 a 含任何垃圾模式，丢弃
+    if is_junk(q) or is_junk(a):
         return False
-    # 任何有 4+ 个相同字母的（如 aaaaaa），丢弃
-    if re.search(r'([a-zA-Z])\1{3,}', a):
-        return False
-    # 可打印语义字符占比过低（全是符号/空白，可能是垃圾残留）
+    # assistant 语义字符占比过低（全是符号/空白）
     letters = sum(1 for c in a if c.isalpha() or '\u4e00' <= c <= '\u9fff' or c.isdigit())
     if letters < len(a_stripped) * 0.3:
         return False
-    # 包含控制字符或 Unicode 私有区（罕见编码，模型不认识）
-    if re.search(r'[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff]', a):
-        # 保留 \n \t
-        bad = re.findall(r'[\u0000-\u001f\u007f-\u009f\ue000-\uf8ff]', a)
-        bad = [c for c in bad if c not in '\n\t']
-        if bad:
-            return False
     return True
 
 
@@ -328,12 +331,10 @@ if os.path.isdir(dolly_path):
                 q = clean_text(row.get("instruction", ""))
                 a = clean_text(row.get("response", ""))
                 ctx = clean_text(row.get("context", ""))
-                if not q or not a:
-                    continue
-                if len(a.strip()) < 10:
-                    continue
                 # 如果有 context，拼接到问题里
                 user_content = q if not ctx else f"{ctx}\n\n{q}"
+                if not is_quality(user_content, a, min_a_len=10):
+                    continue
                 knowledge_samples.append({
                     "messages": [
                         {"role": "system", "content": SYS_EN},
@@ -408,9 +409,9 @@ if os.path.isdir(alpaca_path):
             q = clean_text(row.get("instruction", ""))
             a = clean_text(row.get("output", ""))
             inp = clean_text(row.get("input", ""))
-            if not q or not a or len(a.strip()) < 10:
-                continue
             user_content = q if not inp else f"{q}\n\n{inp}"
+            if not is_quality(user_content, a, min_a_len=10):
+                continue
             knowledge_samples.append({
                 "messages": [
                     {"role": "system", "content": SYS_EN},
@@ -452,12 +453,16 @@ for belle_path in ["data/sft/sft_data.jsonl",
                 if not isinstance(messages, list) or len(messages) < 2:
                     continue
                 cleaned = []
+                has_junk = False
                 for m in messages:
                     content = clean_text(m.get('content', ''))
                     if not content:
                         continue
+                    if is_junk(content):
+                        has_junk = True
+                        break
                     cleaned.append({"role": m['role'], "content": content})
-                if len(cleaned) < 2:
+                if has_junk or len(cleaned) < 2:
                     continue
                 asst = [m['content'] for m in cleaned if m['role'] == 'assistant']
                 if not asst or len(asst[0].strip()) < 10:
@@ -477,15 +482,19 @@ for belle_path in ["data/sft/sft_data.jsonl",
                     continue
                 convs = item.get('conversations', [])
                 messages = [{"role": "system", "content": SYS_CHAT}]
+                has_junk = False
                 for c in convs:
                     val = clean_text(c.get('value', ''))
                     if not val:
                         continue
+                    if is_junk(val):
+                        has_junk = True
+                        break
                     if c['from'] == 'human':
                         messages.append({"role": "user", "content": val})
                     elif c['from'] == 'assistant':
                         messages.append({"role": "assistant", "content": val})
-                if len(messages) < 3:
+                if has_junk or len(messages) < 3:
                     continue
                 asst = [m['content'] for m in messages if m['role'] == 'assistant']
                 if not asst or len(asst[0].strip()) < 10:

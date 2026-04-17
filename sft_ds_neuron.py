@@ -92,12 +92,11 @@ def init_model(args):
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device=device, dtype=torch.bfloat16)
 
-    # fp32 白名单: 神经元参数 + halt_proj
-    # halt_proj 必须 fp32, 因为 adamw_lr=5e-5 下单步更新 ~5e-6, 小于 halt 在 bf16 的量化墙 ~1.6e-4
+    # fp32 白名单: 仅 PLIF/SNN 神经元参数 (与 sft_ds.py 一致).
+    # halt_proj 保留 bf16: NeuronLangevin 的 ortho drift 每步 ~lr=2e-3 + Langevin 噪声 √(2·lr·T_halt) ~2e-3,
+    # 两者都远大于 bf16 quantum ~1.6e-4, 不需要 fp32 master; 且 halt fp32 与 autocast bf16 输入做 matmul 会报 dtype mismatch.
     for name, param in model.named_parameters():
         if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
-            param.data = param.data.float()
-        elif 'halt' in name:
             param.data = param.data.float()
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

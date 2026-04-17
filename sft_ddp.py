@@ -106,8 +106,11 @@ def init_model(args, local_rank, rank):
     model = model.to(device=device, dtype=torch.bfloat16)
 
     # 神经元参数提升到 fp32（和预训练一致）
+    # halt_proj 必须也是 fp32：Adam 步长 ~5e-5 小于 bf16 精度墙 ~1.6e-4，bf16 下更新会被截断
     for name, param in model.named_parameters():
         if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+            param.data = param.data.float()
+        elif 'halt' in name:
             param.data = param.data.float()
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

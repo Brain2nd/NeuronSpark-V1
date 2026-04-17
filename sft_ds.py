@@ -309,7 +309,7 @@ if __name__ == "__main__":
         ])
 
     # ==================== DeepSpeed 初始化 ====================
-    ds_config_path = getattr(args, 'deepspeed_config', 'ds_config.json')
+    ds_config_path = getattr(args, 'deepspeed_config', None) or 'ds_config.json'
     with open(ds_config_path) as f:
         ds_config = json.load(f)
     ds_config['train_micro_batch_size_per_gpu'] = args.batch_size

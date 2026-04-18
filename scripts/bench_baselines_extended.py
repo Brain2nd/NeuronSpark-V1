@@ -41,9 +41,11 @@ def run_eval(model_name, hf_id, tasks, device, tag):
     print(f"[{device}] Evaluating {model_name} ({hf_id}) on {tasks}")
     print(f"{'=' * 60}")
 
+    # 不在 model_args 里显式传 device: 在某些新模型 (Qwen3) 上会和 dtype 冲突;
+    # 改用 CUDA_VISIBLE_DEVICES 控制可见 GPU, lm-eval 自动落在 cuda:0
     results = lm_eval.simple_evaluate(
         model="hf",
-        model_args=f"pretrained={hf_id},dtype=bfloat16,trust_remote_code=True,device={device}",
+        model_args=f"pretrained={hf_id},dtype=bfloat16,trust_remote_code=True",
         tasks=tasks,
         batch_size=1,
     )

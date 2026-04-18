@@ -95,6 +95,10 @@ class NeuronSparkLM(LM):
 
 def run_eval(checkpoint, device, tasks, output_path):
     """单 GPU 测评指定任务子集。"""
+    # 在多进程下, 每个子进程继承 parent 的 current_device=cuda:0. 必须显式 set_device
+    # 否则 Triton kernel 或其它中间 tensor 会落在 cuda:0 造成跨设备/CPU 假象.
+    if device.startswith('cuda'):
+        torch.cuda.set_device(torch.device(device))
     print(f'[{device}] Running {len(tasks)} tasks on {checkpoint}...')
     results = lm_eval.simple_evaluate(
         model='neuronspark',

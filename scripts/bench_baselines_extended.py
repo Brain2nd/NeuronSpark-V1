@@ -1,16 +1,7 @@
 """扩展基线测评: 补齐 mmlu/piqa/openbookqa/lambada_openai/ceval-valid 5 项.
 
-与 bench_baselines.py 的差异:
-  - --tasks 可选子集 (默认扩展 5 项, 可和原 5 项叠加)
-  - --device 指定 cuda:N (多卡并行运行)
-  - --models 过滤要跑的模型
-  - 输出 exp/lm_eval_baseline_<model>_ext.json, 后续可 merge
-
-用法 (并行 2 卡):
-    CUDA_VISIBLE_DEVICES=2 python scripts/bench_baselines_extended.py \
-        --tasks openbookqa piqa lambada_openai --device cuda:0
-    CUDA_VISIBLE_DEVICES=3 python scripts/bench_baselines_extended.py \
-        --tasks ceval-valid mmlu --device cuda:0
+绕开 lm-eval HFLM (会硬塞 dtype kwarg 导致新 transformers 报错),
+自定义 LM 子类直接用 AutoModelForCausalLM.from_pretrained 加载.
 """
 
 import argparse
@@ -19,7 +10,11 @@ import os
 import datetime
 import gc
 import torch
+import torch.nn.functional as F
 import lm_eval
+from lm_eval.api.model import LM
+from lm_eval.api.registry import register_model
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODELS = {
     "pythia-1b": "EleutherAI/pythia-1b",
@@ -36,16 +31,97 @@ MODELS = {
 DEFAULT_EXT_TASKS = ["openbookqa", "piqa", "lambada_openai", "ceval-valid", "mmlu"]
 
 
+@register_model("hf_manual")
+class HFManualLM(LM):
+    """手动装载 HF 模型的 lm-eval wrapper.
+    绕开 HFLM 内置 dtype kwarg 与新 transformers 不兼容.
+    """
+    def __init__(self, pretrained: str, device: str = "cuda:0",
+                 dtype: str = "bfloat16", max_length: int = 2048, **kw):
+        super().__init__()
+        self._device = torch.device(device)
+        self._dtype = getattr(torch, dtype)
+        self._max_length = int(max_length)
+        torch.cuda.set_device(self._device)
+        print(f"  [hf_manual] loading {pretrained} ...")
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrained, trust_remote_code=True)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.model = AutoModelForCausalLM.from_pretrained(
+            pretrained,
+            torch_dtype=self._dtype,
+            trust_remote_code=True,
+        ).to(self._device).eval()
+
+    @property
+    def eot_token_id(self): return self.tokenizer.eos_token_id
+    @property
+    def max_length(self): return self._max_length
+    @property
+    def max_gen_toks(self): return 256
+    @property
+    def batch_size(self): return 1
+    @property
+    def device(self): return self._device
+    def tok_encode(self, s, **kw): return self.tokenizer.encode(s, add_special_tokens=False)
+    def tok_decode(self, t, **kw): return self.tokenizer.decode(t)
+
+    def loglikelihood(self, requests):
+        out = []
+        for req in requests:
+            ctx, cont = req.args[0], req.args[1]
+            ctx_ids = self.tokenizer.encode(ctx, add_special_tokens=False)
+            cont_ids = self.tokenizer.encode(cont, add_special_tokens=False)
+            all_ids = ctx_ids + cont_ids
+            if len(all_ids) > self.max_length:
+                all_ids = all_ids[-self.max_length:]
+            x = torch.tensor([all_ids], dtype=torch.long, device=self._device)
+            with torch.no_grad():
+                o = self.model(input_ids=x)
+            logits = o.logits[0, :-1, :]
+            labels = x[0, 1:]
+            lp = F.log_softmax(logits.float(), dim=-1)
+            cs = len(all_ids) - len(cont_ids) - 1
+            ll = 0.0
+            greedy = True
+            for i in range(len(cont_ids)):
+                pos = cs + i
+                if 0 <= pos < lp.shape[0]:
+                    tid = labels[pos].item()
+                    ll += lp[pos, tid].item()
+                    if lp[pos].argmax().item() != tid:
+                        greedy = False
+            out.append((ll, greedy))
+        return out
+
+    def loglikelihood_rolling(self, requests):
+        out = []
+        for req in requests:
+            ids = self.tokenizer.encode(req.args[0], add_special_tokens=False)
+            if len(ids) > self.max_length:
+                ids = ids[-self.max_length:]
+            x = torch.tensor([ids], dtype=torch.long, device=self._device)
+            with torch.no_grad():
+                o = self.model(input_ids=x)
+            logits = o.logits[0, :-1, :]
+            labels = x[0, 1:]
+            lp = F.log_softmax(logits.float(), dim=-1)
+            ll = sum(lp[i, labels[i].item()].item() for i in range(labels.shape[0]))
+            out.append((ll,))
+        return out
+
+    def generate_until(self, requests):
+        return [''] * len(requests)
+
+
 def run_eval(model_name, hf_id, tasks, device, tag):
     print(f"\n{'=' * 60}")
     print(f"[{device}] Evaluating {model_name} ({hf_id}) on {tasks}")
     print(f"{'=' * 60}")
 
-    # lm-eval 本次环境下 dtype/torch_dtype 都会被当成 __init__ kwarg 报错,
-    # 干脆不在 model_args 里指定 dtype, 默认 fp32 加载 (最大 ~7GB, 47GB 显存扛得住)
     results = lm_eval.simple_evaluate(
-        model="hf",
-        model_args=f"pretrained={hf_id},trust_remote_code=True",
+        model="hf_manual",
+        model_args=f"pretrained={hf_id},device={device},dtype=bfloat16",
         tasks=tasks,
         batch_size=1,
     )
@@ -55,27 +131,22 @@ def run_eval(model_name, hf_id, tasks, device, tag):
         for t, r in results["results"].items()
     }
 
-    print(f"\n--- {model_name} Results on {device} ---")
-    for task, metrics in summary.items():
-        acc = metrics.get("acc,none", metrics.get("acc", "?"))
-        acc_norm = metrics.get("acc_norm,none", "")
-        norm_str = f" (norm: {acc_norm:.4f})" if isinstance(acc_norm, float) else ""
+    for task, m in summary.items():
+        acc = m.get("acc,none", m.get("acc", "?"))
+        acc_n = m.get("acc_norm,none", "")
+        ns = f" (norm: {acc_n:.4f})" if isinstance(acc_n, float) else ""
         if isinstance(acc, float):
-            print(f"  {task:>20s}: {acc:.4f}{norm_str}")
+            print(f"  {task:>20s}: {acc:.4f}{ns}")
 
     os.makedirs("exp", exist_ok=True)
-    save_path = f"exp/lm_eval_baseline_{model_name}_{tag}.json"
-    out = {
-        "model": model_name,
-        "hf_id": hf_id,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "tasks": tasks,
-        "device": device,
-        "results": summary,
-    }
-    with open(save_path, "w") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
-    print(f"  Saved to {save_path}")
+    path = f"exp/lm_eval_baseline_{model_name}_{tag}.json"
+    with open(path, "w") as f:
+        json.dump({
+            "model": model_name, "hf_id": hf_id,
+            "timestamp": datetime.datetime.now().isoformat(),
+            "tasks": tasks, "device": device, "results": summary,
+        }, f, indent=2, ensure_ascii=False)
+    print(f"  Saved to {path}")
 
     del results
     gc.collect()
@@ -85,17 +156,13 @@ def run_eval(model_name, hf_id, tasks, device, tag):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--models", nargs="+", default=None,
-                        help=f"要测的模型 (可选: {', '.join(MODELS.keys())})")
-    parser.add_argument("--tasks", nargs="+", default=DEFAULT_EXT_TASKS,
-                        help=f"任务列表, 默认 {DEFAULT_EXT_TASKS}")
+    parser.add_argument("--models", nargs="+", default=None)
+    parser.add_argument("--tasks", nargs="+", default=DEFAULT_EXT_TASKS)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--tag", type=str, default="ext",
-                        help="输出文件后缀, 区分多次运行")
+    parser.add_argument("--tag", type=str, default="ext")
     args = parser.parse_args()
 
     selected = {k: MODELS[k] for k in (args.models or MODELS.keys()) if k in MODELS}
-
     for name, hf_id in selected.items():
         try:
             run_eval(name, hf_id, args.tasks, args.device, args.tag)

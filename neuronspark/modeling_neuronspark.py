@@ -1377,12 +1377,10 @@ class SNNFFN(MemoryModule):
         num_layers: int = 1,
         layer_idx: int = 0,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.D_ff = D_ff
-        self.activation_mode = activation_mode
 
         # ====== 三条投影路径（对标 SwiGLU: gate_proj, up_proj, down_proj） ======
         self.gate_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
@@ -1479,15 +1477,14 @@ class SNNFFN(MemoryModule):
             surrogate_function=surr,
         )
 
-        # 激活值: v2=(1-β)·V_post (泄漏量), v1=V_post (膜电位)
+        # 激活值: (1-β)·V_post (膜电位泄漏量)
         gate_v = V_post_merged[:, :, :D_ff]
         up_v = V_post_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        if self.activation_mode == 'v2':
-            gate_v = gate_v * (1.0 - beta_gate)
-            up_v = up_v * (1.0 - beta_up)
+        gate_v = gate_v * (1.0 - beta_gate)
+        up_v = up_v * (1.0 - beta_up)
 
         # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
         gated = gate_v * up_v  # (TK, batch, D_ff)
@@ -1515,9 +1512,8 @@ class SNNFFN(MemoryModule):
         _ = self.up_neuron(self.up_proj(x))
         up_v = self.up_neuron.v
 
-        if self.activation_mode == 'v2':
-            gate_v = (1.0 - self.gate_neuron.beta) * gate_v
-            up_v = (1.0 - self.up_neuron.beta) * up_v
+        gate_v = (1.0 - self.gate_neuron.beta) * gate_v
+        up_v = (1.0 - self.up_neuron.beta) * up_v
 
         # 连续门控（对标 SwiGLU）
         gated = gate_v * up_v
@@ -1827,12 +1823,10 @@ class SNNDecoderLayer(MemoryModule):
         K: int = 16,
         num_layers: int = 1,
         layer_idx: int = 0,
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.K = K
-        self.activation_mode = activation_mode
 
         self.snn_block = SNNBlock(
             D=D, N=N, v_th_min=v_th_min,
@@ -1842,7 +1836,6 @@ class SNNDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
-            activation_mode=activation_mode,
         )
 
         # Pre-LN 分支归一化: h → RMSNorm → PLIFNode
@@ -1918,9 +1911,7 @@ class SNNDecoderLayer(MemoryModule):
         )
 
         input_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
-        return V_post.to(input_dtype)  # 膜电位
+        return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
@@ -2037,8 +2028,7 @@ class SNNDecoderLayer(MemoryModule):
         # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差
         _ = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
         v_in = self.input_neuron1.v
-        if self.activation_mode == 'v2':
-            v_in = (1.0 - self.input_neuron1.beta) * v_in
+        v_in = (1.0 - self.input_neuron1.beta) * v_in
         cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
         h = h + res_block - res_block.mean(dim=-1, keepdim=True)
@@ -2046,8 +2036,7 @@ class SNNDecoderLayer(MemoryModule):
         # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差
         _ = self.input_neuron2(self.ffn_norm(h))
         v_in2 = self.input_neuron2.v
-        if self.activation_mode == 'v2':
-            v_in2 = (1.0 - self.input_neuron2.beta) * v_in2
+        v_in2 = (1.0 - self.input_neuron2.beta) * v_in2
         cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
         h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
@@ -2088,7 +2077,6 @@ class SNNAttentionDecoderLayer(MemoryModule):
         K: 每 token SNN 帧数
         num_layers: 总层数 (用于输出缩放)
         layer_idx: 当前层索引
-        activation_mode: v1/v2 激活模式
     """
 
     def __init__(
@@ -2103,14 +2091,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
         K: int = 12,
         num_layers: int = 1,
         layer_idx: int = 0,
-        activation_mode: str = 'v2',
     ):
         super().__init__()
         self.D = D
         self.K = K
         self.D_key = D_key
         self.D_value = D_value
-        self.activation_mode = activation_mode
 
         # ====== 子层 1: SNN-Attention ======
         self.attn_norm = RMSNorm(D)
@@ -2142,7 +2128,6 @@ class SNNAttentionDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
-            activation_mode=activation_mode,
         )
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
@@ -2176,9 +2161,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
             surrogate_function=input_neuron.surrogate_function,
         )
         input_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)
-        return V_post.to(input_dtype)
+        return ((1.0 - beta) * V_post).to(input_dtype)
 
     def _gate_neuron_parallel(self, h_normed):
         """PLIFNode gate 的 parallel scan, 返回标量门控。"""
@@ -2319,7 +2302,6 @@ class SNNLanguageModel(nn.Module):
         num_layers: int = 24,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
-        activation_mode: str = 'v2',
         memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
@@ -2331,7 +2313,6 @@ class SNNLanguageModel(nn.Module):
         self.K = K
         self.num_layers = num_layers
         self.D_ff = D_ff
-        self.activation_mode = activation_mode
         self.memory_layer_interval = memory_layer_interval
         self.v_th_min = v_th_min
         self.D_key = D_key
@@ -2368,7 +2349,6 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
-                    activation_mode=activation_mode,
                 ))
                 self.layer_types.append('memory')
             else:
@@ -2378,7 +2358,6 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
-                    activation_mode=activation_mode,
                 ))
                 self.layer_types.append('snn')
 
@@ -2458,9 +2437,7 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        if self.activation_mode == 'v2':
-            return ((1.0 - beta) * V_post).to(input_dtype)
-        return V_post.to(input_dtype)
+        return ((1.0 - beta) * V_post).to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。
@@ -2842,7 +2819,6 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             num_layers=config.num_layers,
             D_ff=config.D_ff,
             v_th_min=config.v_th_min,
-            activation_mode=config.activation_mode,
             memory_layer_interval=config.memory_layer_interval,
             D_key=config.D_key,
             D_value=config.D_value,

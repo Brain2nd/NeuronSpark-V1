@@ -2884,19 +2884,34 @@ class NeuronSparkForCausalLM(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        """覆写 from_pretrained 强制全量 fp32 加载.
+        """覆写 from_pretrained 强制全量 fp32 加载 + 重算 RoPE 非持久 buffer.
 
-        safetensors 中 neuron 是 fp32 / 矩阵是 bf16. 若直接用 bf16 加载会把
-        neuron 也降到 bf16 (精度不足); 若混合 (neuron fp32 + 矩阵 bf16) 又
-        和 model.py 原生路径 (upcast 一切到 fp32) 不一致, 累积精度差导致
-        argmax 飘. 全量 fp32 加载 + forward 内 autocast bf16 compute,
-        与原生路径 bit-exact 对齐.
+        1) dtype: safetensors 中 neuron 是 fp32 / 矩阵是 bf16. 若直接用 bf16
+           加载会把 neuron 降 bf16 (精度不足); 若混合 cast 又和 model.py
+           native (upcast 一切到 fp32) 不一致, argmax 飘. fp32 加载 + forward
+           内 autocast bf16 compute, 与原生 bit-exact 对齐.
+
+        2) RoPE buffer: SNNAttentionDecoderLayer 的 rope_cos/rope_sin 用
+           register_buffer(..., persistent=False), 不在 safetensors 里.
+           transformers 5.x 的 fast-init / meta-device 路径跳过 __init__
+           的 _precompute_rope_freqs 计算 → buffer 是未初始化内存 → 结果乱.
+           load 完后重新调用 _precompute_rope_freqs 重填.
         """
         import torch as _torch
         user_dtype = kwargs.get('dtype', kwargs.get('torch_dtype', None))
         if user_dtype is None:
             kwargs['dtype'] = _torch.float32
-        return super().from_pretrained(*args, **kwargs)
+        model = super().from_pretrained(*args, **kwargs)
+        # 重填 RoPE non-persistent buffer
+        for layer_mod in model.snn.layers:
+            if hasattr(layer_mod, 'rope_cos') and hasattr(layer_mod, 'rope_sin'):
+                D_key = layer_mod.rope_cos.shape[-1]
+                cos, sin = _precompute_rope_freqs(D_key)
+                device = layer_mod.rope_cos.device
+                dtype = layer_mod.rope_cos.dtype
+                layer_mod.rope_cos.data = cos.to(device=device, dtype=dtype)
+                layer_mod.rope_sin.data = sin.to(device=device, dtype=dtype)
+        return model
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids}

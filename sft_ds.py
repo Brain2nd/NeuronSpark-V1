@@ -288,6 +288,12 @@ if __name__ == "__main__":
                 Logger(f"    missing sample: {missing[:3]}")
             if unexpected:
                 Logger(f"    unexpected sample: {unexpected[:3]}")
+            # HF artifact 保存时 convert_to_hf 把所有 param cast 到 bf16,
+            # neuron 参数 (.w/.v_th/.b_*) 在训练时需要 fp32, 这里 load 后必须再提升一次
+            for name, p in model.named_parameters():
+                if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+                    p.data = p.data.float()
+            Logger(f"  Re-promoted neuron params to fp32 after HF load")
         else:
             load_model_weights(args.pretrained_ckpt, model, device)
             Logger(f"  Loaded pretrained weights (native): {args.pretrained_ckpt} (fresh optimizer)")

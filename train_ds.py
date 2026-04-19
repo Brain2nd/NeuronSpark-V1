@@ -250,11 +250,34 @@ if __name__ == "__main__":
     # Resume / Pretrained
     tokens_seen = 0
     start_step = 0
+    def _load_weights(ckpt_path):
+        """HF artifact 走 AutoModelForCausalLM, native 走 load_model_weights."""
+        is_hf = False
+        cfg_path = os.path.join(ckpt_path, 'config.json')
+        if os.path.isfile(cfg_path):
+            with open(cfg_path) as f:
+                _cfg = json.load(f)
+            is_hf = 'auto_map' in _cfg or 'architectures' in _cfg
+        if is_hf:
+            from transformers import AutoModelForCausalLM
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                ckpt_path, trust_remote_code=True,
+            )
+            missing, unexpected = model.load_state_dict(hf_model.snn.state_dict(), strict=False)
+            del hf_model
+            Logger(f"  Loaded HF via AutoModel. missing={len(missing)} unexpected={len(unexpected)}")
+            for name, p in model.named_parameters():
+                if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')) and p.dtype != torch.float32:
+                    p.data = p.data.float()
+        else:
+            load_model_weights(ckpt_path, model, device)
+            Logger(f"  Loaded native weights: {ckpt_path}")
+
     if args.pretrained_ckpt:
-        load_model_weights(args.pretrained_ckpt, model, device)
-        Logger(f"  Loaded pretrained weights: {args.pretrained_ckpt} (step=0, fresh optimizer)")
+        _load_weights(args.pretrained_ckpt)
+        Logger(f"  (fresh optimizer)")
     elif args.resume:
-        load_model_weights(args.resume, model, device)
+        _load_weights(args.resume)
         if os.path.isdir(args.resume):
             _ts = torch.load(os.path.join(args.resume, 'training_state.pth'),
                              map_location=device, weights_only=False)

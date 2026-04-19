@@ -37,24 +37,41 @@ from checkpoint_utils import load_config, load_model_weights
 
 
 def load_model(checkpoint_path, device):
-    """从 checkpoint 加载模型（支持 safetensors 目录和旧格式 .pth）。"""
+    """从 checkpoint 加载模型.
+    HF artifact (auto_map in config) → AutoModelForCausalLM, 返回裸 SNN (.snn).
+    Native ckpt → SNNLanguageModel + load_model_weights.
+    """
+    import os, json
     print(f"Loading model from {checkpoint_path}...")
 
-    config = load_config(checkpoint_path)
-    model = SNNLanguageModel(
-        vocab_size=config.get('vocab_size', 64000),
-        D=config.get('D', 1024),
-        N=config.get('N', 8),
-        K=config.get('K', 12),
-        num_layers=config.get('num_layers', 24),
-        D_ff=config.get('D_ff', 3072),
-    )
+    is_hf = False
+    cfg_path = os.path.join(checkpoint_path, 'config.json')
+    if os.path.isfile(cfg_path):
+        with open(cfg_path) as f:
+            _cfg = json.load(f)
+        is_hf = 'auto_map' in _cfg or 'architectures' in _cfg
 
-    load_model_weights(checkpoint_path, model, device)
-
-    model = model.to(device).eval()
-    print(f"  Model loaded (D={config.get('D')}, Layers={config.get('num_layers')})")
-    return model
+    if is_hf:
+        from transformers import AutoModelForCausalLM
+        wrap = AutoModelForCausalLM.from_pretrained(
+            checkpoint_path, trust_remote_code=True,
+        ).to(device).eval()
+        print(f"  HF artifact loaded (D={wrap.config.D}, Layers={wrap.config.num_layers})")
+        return wrap.snn
+    else:
+        config = load_config(checkpoint_path)
+        model = SNNLanguageModel(
+            vocab_size=config.get('vocab_size', 64000),
+            D=config.get('D', 1024),
+            N=config.get('N', 8),
+            K=config.get('K', 12),
+            num_layers=config.get('num_layers', 24),
+            D_ff=config.get('D_ff', 3072),
+        )
+        load_model_weights(checkpoint_path, model, device)
+        model = model.to(device).eval()
+        print(f"  Native ckpt loaded (D={config.get('D')}, Layers={config.get('num_layers')})")
+        return model
 
 
 def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,

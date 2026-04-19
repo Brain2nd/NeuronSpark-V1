@@ -27,7 +27,15 @@ class NeuronSparkLM(LM):
         config = NeuronSparkConfig(**snn_config)
         self.model = NeuronSparkForCausalLM(config)
         load_model_weights(checkpoint, self.model.snn, str(self._device))
-        self.model = self.model.to(device=self._device, dtype=self._dtype).eval()
+        # 混合精度: neuron 参数 fp32 (PLIF sigmoid(w)=beta 需要精度), 其余 bf16 (matmul 高效)
+        self.model = self.model.to(device=self._device).eval()
+        for name, param in self.model.named_parameters():
+            if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+                param.data = param.data.float()
+            else:
+                param.data = param.data.to(self._dtype)
+        for _, buf in self.model.named_buffers():
+            buf.data = buf.data.to(self._dtype)
 
     @property
     def eot_token_id(self): return self.tokenizer.eos_token_id

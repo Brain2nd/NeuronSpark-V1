@@ -78,17 +78,27 @@ def convert(checkpoint_path, tokenizer_path, output_dir):
     # 保存 HF artifact
     os.makedirs(output_dir, exist_ok=True)
 
-    # 转 bf16 存储（与 Qwen3 等标准模型一致，需要 fp32 的运算在 forward 内部显式上转）
-    model = model.to(torch.bfloat16)
+    # 混合精度: neuron 参数 (.w/.v_th/.b_beta/.b_alpha/.b_th) 保持 fp32, 其余 bf16.
+    # 训练时 neuron fp32 是必要的 (Adam 单步更新量 ~1e-6 远小于 bf16 量化阈值),
+    # 如果保存时 cast 到 bf16 就 irrecoverable lose 精度, 下一轮继续训练会退化.
+    for name, param in model.named_parameters():
+        if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+            param.data = param.data.float()
+        else:
+            param.data = param.data.to(torch.bfloat16)
+    # buffers 全 bf16
+    for name, buf in model.named_buffers():
+        buf.data = buf.data.to(torch.bfloat16)
 
     print(f"[5/8] Saving model via save_pretrained → {output_dir}")
     model.save_pretrained(output_dir)
 
-    # config.json dtype 修正为 bfloat16
+    # config.json dtype 留空或 auto, 让 from_pretrained 读 safetensors 原始 dtype
     import json
     config_path = os.path.join(output_dir, 'config.json')
     with open(config_path) as f:
         cfg = json.load(f)
+    # 主矩阵是 bf16, 标记 bfloat16 作为默认 dtype; neuron 的 fp32 由 safetensors per-tensor dtype 保留
     cfg['dtype'] = 'bfloat16'
     with open(config_path, 'w') as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)

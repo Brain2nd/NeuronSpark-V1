@@ -277,10 +277,11 @@ if __name__ == "__main__":
         if is_hf:
             from transformers import AutoModelForCausalLM
             Logger(f"  Loading HF artifact via AutoModelForCausalLM: {args.pretrained_ckpt}")
+            # 不传 dtype: from_pretrained 读 safetensors 里的 per-tensor dtype
+            # (fixed convert_to_hf 后: neuron fp32, 其余 bf16)
             hf_model = AutoModelForCausalLM.from_pretrained(
-                args.pretrained_ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+                args.pretrained_ckpt, trust_remote_code=True,
             )
-            # 把 HF 包装里的 SNN state dict 拷到我们的裸 SNNLanguageModel
             missing, unexpected = model.load_state_dict(hf_model.snn.state_dict(), strict=False)
             del hf_model
             Logger(f"  Loaded from HF. missing={len(missing)} unexpected={len(unexpected)}")
@@ -288,12 +289,10 @@ if __name__ == "__main__":
                 Logger(f"    missing sample: {missing[:3]}")
             if unexpected:
                 Logger(f"    unexpected sample: {unexpected[:3]}")
-            # HF artifact 保存时 convert_to_hf 把所有 param cast 到 bf16,
-            # neuron 参数 (.w/.v_th/.b_*) 在训练时需要 fp32, 这里 load 后必须再提升一次
+            # 防御性: 如果 HF ckpt 是旧版 (所有 param bf16), 这里补一次 fp32 提升
             for name, p in model.named_parameters():
-                if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+                if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')) and p.dtype != torch.float32:
                     p.data = p.data.float()
-            Logger(f"  Re-promoted neuron params to fp32 after HF load")
         else:
             load_model_weights(args.pretrained_ckpt, model, device)
             Logger(f"  Loaded pretrained weights (native): {args.pretrained_ckpt} (fresh optimizer)")

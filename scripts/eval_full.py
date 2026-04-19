@@ -65,6 +65,21 @@ class NeuronSparkLM(LM):
     def tok_encode(self, s, **kw): return self.tokenizer.encode(s, add_special_tokens=False)
     def tok_decode(self, t, **kw): return self.tokenizer.decode(t)
 
+    # --- chat template 支持: lm-eval 传 apply_chat_template=True 时调用 ---
+    @property
+    def tokenizer_name(self) -> str:
+        return getattr(self.tokenizer, 'name_or_path', 'neuronspark-tokenizer')
+
+    def chat_template(self, chat_template: bool | str = False) -> str:
+        """返回 tokenizer 的 jinja2 chat_template 字符串 (用于 cache key)."""
+        tpl = getattr(self.tokenizer, 'chat_template', None)
+        return tpl or ''
+
+    def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
+        return self.tokenizer.apply_chat_template(
+            chat_history, tokenize=False, add_generation_prompt=add_generation_prompt,
+        )
+
     def loglikelihood(self, requests):
         results = []
         for req in requests:
@@ -116,18 +131,22 @@ class NeuronSparkLM(LM):
         return [''] * len(requests)
 
 
-def run_eval(checkpoint, device, tasks, output_path):
+def run_eval(checkpoint, device, tasks, output_path, apply_chat_template=False,
+             system_instruction=None):
     """单 GPU 测评指定任务子集。"""
     # 在多进程下, 每个子进程继承 parent 的 current_device=cuda:0. 必须显式 set_device
     # 否则 Triton kernel 或其它中间 tensor 会落在 cuda:0 造成跨设备/CPU 假象.
     if device.startswith('cuda'):
         torch.cuda.set_device(torch.device(device))
-    print(f'[{device}] Running {len(tasks)} tasks on {checkpoint}...')
+    print(f'[{device}] Running {len(tasks)} tasks on {checkpoint} '
+          f'(chat_template={apply_chat_template})...')
     results = lm_eval.simple_evaluate(
         model='neuronspark',
         model_args=f'checkpoint={checkpoint},device={device}',
         tasks=tasks,
         batch_size=1,
+        apply_chat_template=apply_chat_template,
+        system_instruction=system_instruction,
     )
 
     for task, res in results['results'].items():
@@ -180,7 +199,18 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint', type=str, default='checkpoints/ckpt_step441000')
     parser.add_argument('--num_gpus', type=int, default=1)
     parser.add_argument('--output', type=str, default=None)
+    parser.add_argument('--apply_chat_template', action='store_true',
+                        help='按 SFT ChatML 格式包装 prompt (要求 LM 实现 apply_chat_template)')
+    parser.add_argument('--system_instruction', type=str, default=None,
+                        help='apply_chat_template 时的 system prompt, 默认对齐 SFT 训练')
+    parser.add_argument('--tag', type=str, default='',
+                        help='输出文件名额外后缀, 避免覆盖 (如 chat)')
     args = parser.parse_args()
+
+    # 默认 system 对齐 SFT 训练 (dataset.py apply_chat_template 时会用 tokenizer 的默认 system,
+    # 我们的 generate_sample.py 用 '你是一个AI助手', 这里保持一致)
+    if args.apply_chat_template and args.system_instruction is None:
+        args.system_instruction = '你是一个AI助手'
 
     all_tasks = [
         'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
@@ -189,10 +219,13 @@ if __name__ == '__main__':
     ]
 
     ckpt_name = os.path.basename(args.checkpoint)
-    output_path = args.output or f'exp/lm_eval_full_{ckpt_name}.json'
+    tag = f'_{args.tag}' if args.tag else ''
+    output_path = args.output or f'exp/lm_eval_full_{ckpt_name}{tag}.json'
 
     if args.num_gpus <= 1:
-        run_eval(args.checkpoint, 'cuda:0', all_tasks, output_path)
+        run_eval(args.checkpoint, 'cuda:0', all_tasks, output_path,
+                 apply_chat_template=args.apply_chat_template,
+                 system_instruction=args.system_instruction)
     else:
         # 按请求量均衡分配: mmlu 最重, ceval+hellaswag 次之
         task_groups = [
@@ -209,11 +242,12 @@ if __name__ == '__main__':
         procs = []
         for i, tasks in enumerate(task_groups):
             device = f'cuda:{i}'
-            pf = f'exp/lm_eval_{ckpt_name}_gpu{i}.json'
+            pf = f'exp/lm_eval_{ckpt_name}{tag}_gpu{i}.json'
             partial_files.append(pf)
             p = multiprocessing.Process(
                 target=run_eval,
-                args=(args.checkpoint, device, tasks, pf),
+                args=(args.checkpoint, device, tasks, pf,
+                      args.apply_chat_template, args.system_instruction),
             )
             p.start()
             procs.append(p)

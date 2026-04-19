@@ -2884,26 +2884,19 @@ class NeuronSparkForCausalLM(PreTrainedModel):
 
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        """覆写 from_pretrained: HF 标准 API 会把所有 param cast 到单一 dtype,
-        我们需要 per-tensor 混合 (neuron fp32 + 其余 bf16).
+        """覆写 from_pretrained 强制全量 fp32 加载.
 
-        策略: 强制以 fp32 加载 (安全上限), load 后把非 neuron 参数降 bf16,
-        neuron (.w/.v_th/.b_beta/.b_alpha/.b_th) 保持 fp32.
+        safetensors 中 neuron 是 fp32 / 矩阵是 bf16. 若直接用 bf16 加载会把
+        neuron 也降到 bf16 (精度不足); 若混合 (neuron fp32 + 矩阵 bf16) 又
+        和 model.py 原生路径 (upcast 一切到 fp32) 不一致, 累积精度差导致
+        argmax 飘. 全量 fp32 加载 + forward 内 autocast bf16 compute,
+        与原生路径 bit-exact 对齐.
         """
         import torch as _torch
-        # 若用户显式传 dtype, 尊重用户意图 (不做混合处理)
         user_dtype = kwargs.get('dtype', kwargs.get('torch_dtype', None))
         if user_dtype is None:
             kwargs['dtype'] = _torch.float32
-        model = super().from_pretrained(*args, **kwargs)
-        # 用户没显式指定时, 自动做混合精度 cast
-        if user_dtype is None:
-            for name, p in model.named_parameters():
-                if not name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
-                    p.data = p.data.to(_torch.bfloat16)
-            for _, b in model.named_buffers():
-                b.data = b.data.to(_torch.bfloat16)
-        return model
+        return super().from_pretrained(*args, **kwargs)
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
         return {"input_ids": input_ids}

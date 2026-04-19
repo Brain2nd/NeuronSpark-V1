@@ -2853,6 +2853,35 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             )
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
+    @torch.no_grad()
+    def generate(self, input_ids=None, max_new_tokens=256, temperature=1.0,
+                 top_k=50, top_p=1.0, repetition_penalty=1.0,
+                 eos_token_id=None, do_sample=True, pad_token_id=None,
+                 attention_mask=None, **kwargs):
+        """覆写 generate: 委托给 SNNLanguageModel.generate (stateful SNN 生成).
+
+        HF 默认 generate 每步调 forward() → SNNLanguageModel.forward() 内部
+        functional.reset_net() 会清 PLIF 状态 → 自回归生成每步都丢历史 →
+        输出垃圾 / 乱码. SNNLanguageModel.generate 保持跨 token 状态, 必须用它.
+        """
+        if input_ids is None:
+            raise ValueError('input_ids required')
+        # HF 常传 do_sample=False 做 greedy — 映射到 temperature<=0
+        if not do_sample:
+            temperature = 0.0  # SNNLanguageModel._sample: temperature<=0 → argmax
+        device_type = 'cuda' if input_ids.is_cuda else 'cpu'
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+            out = self.snn.generate(
+                prompt_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k if top_k else 0,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                eos_token_id=eos_token_id,
+            )
+        return out
+
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
         """覆写 from_pretrained: HF 标准 API 会把所有 param cast 到单一 dtype,

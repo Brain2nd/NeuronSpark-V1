@@ -2856,19 +2856,19 @@ class NeuronSparkForCausalLM(PreTrainedModel):
     @torch.no_grad()
     def generate(self, input_ids=None, max_new_tokens=256, temperature=1.0,
                  top_k=50, top_p=1.0, repetition_penalty=1.0,
-                 eos_token_id=None, do_sample=True, pad_token_id=None,
+                 eos_token_id=None, pad_token_id=None,
                  attention_mask=None, **kwargs):
         """覆写 generate: 委托给 SNNLanguageModel.generate (stateful SNN 生成).
 
         HF 默认 generate 每步调 forward() → SNNLanguageModel.forward() 内部
-        functional.reset_net() 会清 PLIF 状态 → 自回归生成每步都丢历史 →
-        输出垃圾 / 乱码. SNNLanguageModel.generate 保持跨 token 状态, 必须用它.
+        functional.reset_net() 清状态 → 每步丢历史 → 乱码.
+        SNNLanguageModel.generate 只在 prompt prefill 前 reset 一次,
+        之后跨 token 保持 PLIF .v 状态.
+
+        temperature 按用户传入透传, 不做 do_sample 自动重映射 (用户要 greedy 请传 temperature<=0).
         """
         if input_ids is None:
             raise ValueError('input_ids required')
-        # HF 常传 do_sample=False 做 greedy — 映射到 temperature<=0
-        if not do_sample:
-            temperature = 0.0  # SNNLanguageModel._sample: temperature<=0 → argmax
         device_type = 'cuda' if input_ids.is_cuda else 'cpu'
         with torch.amp.autocast(device_type, dtype=torch.bfloat16):
             out = self.snn.generate(

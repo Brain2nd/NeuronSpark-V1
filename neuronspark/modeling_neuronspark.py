@@ -2903,10 +2903,11 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             kwargs['dtype'] = _torch.float32
         model = super().from_pretrained(*args, **kwargs)
         # 重填 RoPE non-persistent buffer
+        # _precompute_rope_freqs(dim) 返回 (max_seq_len, dim//2), 所以 dim = shape[-1] * 2
         for layer_mod in model.snn.layers:
             if hasattr(layer_mod, 'rope_cos') and hasattr(layer_mod, 'rope_sin'):
-                D_key = layer_mod.rope_cos.shape[-1]
-                cos, sin = _precompute_rope_freqs(D_key)
+                dim = layer_mod.rope_cos.shape[-1] * 2
+                cos, sin = _precompute_rope_freqs(dim)
                 device = layer_mod.rope_cos.device
                 dtype = layer_mod.rope_cos.dtype
                 layer_mod.rope_cos.data = cos.to(device=device, dtype=dtype)

@@ -2834,7 +2834,11 @@ class NeuronSparkForCausalLM(PreTrainedModel):
         return None
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        out = self.snn(input_ids)
+        # neuron 参数 fp32, 矩阵 bf16: 用 autocast 让 forward 里的 matmul 自动匹配.
+        # (用户 AutoModel.from_pretrained 后直接 model(ids) 就能跑, 无需手动 autocast)
+        device_type = 'cuda' if (input_ids is not None and input_ids.is_cuda) else 'cpu'
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+            out = self.snn(input_ids)
         logits = out.logits
         loss = None
         if labels is not None:

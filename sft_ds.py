@@ -266,8 +266,31 @@ if __name__ == "__main__":
     start_step = 0
     start_epoch = 0
     if args.pretrained_ckpt:
-        load_model_weights(args.pretrained_ckpt, model, device)
-        Logger(f"  Loaded pretrained weights: {args.pretrained_ckpt} (fresh optimizer)")
+        # 自动检测 HF artifact (含 auto_map 字段) vs 原生 ckpt
+        is_hf = False
+        cfg_path = os.path.join(args.pretrained_ckpt, 'config.json')
+        if os.path.isfile(cfg_path):
+            with open(cfg_path) as f:
+                _cfg = json.load(f)
+            is_hf = 'auto_map' in _cfg or 'architectures' in _cfg
+
+        if is_hf:
+            from transformers import AutoModelForCausalLM
+            Logger(f"  Loading HF artifact via AutoModelForCausalLM: {args.pretrained_ckpt}")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                args.pretrained_ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+            )
+            # 把 HF 包装里的 SNN state dict 拷到我们的裸 SNNLanguageModel
+            missing, unexpected = model.load_state_dict(hf_model.snn.state_dict(), strict=False)
+            del hf_model
+            Logger(f"  Loaded from HF. missing={len(missing)} unexpected={len(unexpected)}")
+            if missing:
+                Logger(f"    missing sample: {missing[:3]}")
+            if unexpected:
+                Logger(f"    unexpected sample: {unexpected[:3]}")
+        else:
+            load_model_weights(args.pretrained_ckpt, model, device)
+            Logger(f"  Loaded pretrained weights (native): {args.pretrained_ckpt} (fresh optimizer)")
     elif args.resume:
         load_model_weights(args.resume, model, device)
         if os.path.isdir(args.resume):

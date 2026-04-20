@@ -91,6 +91,7 @@ deepspeed --num_gpus=8 sft_ds.py \
     --log_interval 50 \
     --save_interval 500 \
     --dashboard_dir "runs/${RUN_NAME}" \
-    --deepspeed configs/ds_config_sft_v2.json \
+    --deepspeed \
+    --deepspeed_config configs/ds_config_sft_v2.json \
     "$@" \
     2>&1 | tee "logs/${RUN_NAME}.log"

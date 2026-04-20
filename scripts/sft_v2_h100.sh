@@ -72,6 +72,10 @@ DSEOF
 # ================ 4. 训练 ================
 mkdir -p logs "$OUT_DIR" runs
 
+# H100 torch 2.4.1 + FakeTensor 对 torch.compile(inductor) 报错, 禁用 dynamo eager 回退.
+# (atomic_ops/snn_decoder_layer.py + snn_block.py 有 @torch.compile decorator)
+export TORCHDYNAMO_DISABLE=1
+
 # 命名规范: {kind}_{git_short_hash}, 对齐仓库旧 runs (ddp_ec4964b / sft_7f1cd8e)
 GIT_HASH=$(git rev-parse --short HEAD)
 RUN_NAME="sft_v2_${GIT_HASH}"

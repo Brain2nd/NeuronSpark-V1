@@ -202,15 +202,12 @@ if __name__ == '__main__':
     parser.add_argument('--apply_chat_template', action='store_true',
                         help='按 SFT ChatML 格式包装 prompt (要求 LM 实现 apply_chat_template)')
     parser.add_argument('--system_instruction', type=str, default=None,
-                        help='apply_chat_template 时的 system prompt, 默认对齐 SFT 训练')
+                        help='apply_chat_template 时的 system prompt. 默认 None — 对齐 SFT '
+                             '训练数据 (benchmark_sft_mix 90000 条样本均无 system message). '
+                             '显式传该参数只在训练时也带 system 的场景下有意义.')
     parser.add_argument('--tag', type=str, default='',
                         help='输出文件名额外后缀, 避免覆盖 (如 chat)')
     args = parser.parse_args()
-
-    # 默认 system 对齐 SFT 训练 (dataset.py apply_chat_template 时会用 tokenizer 的默认 system,
-    # 我们的 generate_sample.py 用 '你是一个AI助手', 这里保持一致)
-    if args.apply_chat_template and args.system_instruction is None:
-        args.system_instruction = '你是一个AI助手'
 
     all_tasks = [
         'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
@@ -227,12 +224,12 @@ if __name__ == '__main__':
                  apply_chat_template=args.apply_chat_template,
                  system_instruction=args.system_instruction)
     else:
-        # 按请求量均衡分配: mmlu 最重, ceval+hellaswag 次之
+        # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag 各独占一卡
         task_groups = [
-            ['mmlu'],                                          # GPU 0 (~14K reqs)
-            ['ceval-valid', 'hellaswag'],                      # GPU 1 (~11K reqs)
-            ['arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~8K reqs)
-            ['piqa', 'openbookqa', 'lambada_openai'],          # GPU 3 (~8K reqs)
+            ['mmlu'],                                                       # GPU 0 (~14K reqs)
+            ['hellaswag'],                                                  # GPU 1 (~10K reqs)
+            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~1.3+2+1+1.3+3=~8.6K)
+            ['piqa', 'openbookqa', 'lambada_openai'],                       # GPU 3 (~1.8+0.5+5=~7.3K)
         ]
         # 如果 GPU 数不足 4，合并剩余任务到最后一组
         while len(task_groups) > args.num_gpus:

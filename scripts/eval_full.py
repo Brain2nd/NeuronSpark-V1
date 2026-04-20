@@ -211,10 +211,11 @@ if __name__ == '__main__':
                         help='输出文件名额外后缀, 避免覆盖 (如 chat)')
     args = parser.parse_args()
 
+    # 注意: lambada_openai 已移除 — chat/SFT 模型上任务形式与训练分布错位,
+    # 末词专名预测在 ChatML 下系统性崩溃, 业界对 instruct 模型也不报 lambada. 不再评测.
     all_tasks = [
         'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
-        'mmlu', 'piqa', 'openbookqa', 'lambada_openai',
-        'ceval-valid',
+        'mmlu', 'piqa', 'openbookqa', 'ceval-valid',
     ]
 
     ckpt_name = os.path.basename(args.checkpoint)
@@ -230,8 +231,8 @@ if __name__ == '__main__':
         task_groups = [
             ['mmlu'],                                                       # GPU 0 (~14K reqs)
             ['hellaswag'],                                                  # GPU 1 (~10K reqs)
-            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~1.3+2+1+1.3+3=~8.6K)
-            ['piqa', 'openbookqa', 'lambada_openai'],                       # GPU 3 (~1.8+0.5+5=~7.3K)
+            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~8.6K)
+            ['piqa', 'openbookqa'],                                         # GPU 3 (~2.3K)
         ]
         # 如果 GPU 数不足 4，合并剩余任务到最后一组
         while len(task_groups) > args.num_gpus:

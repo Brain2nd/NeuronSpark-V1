@@ -1,18 +1,18 @@
-"""SFT v2 混合数据集构建: 7 类共 ~290k 样本.
+"""SFT v2 混合数据集构建: 6 类共 ~270k 样本.
 
 核心原则:
 - 所有样本统一为 messages: [{role:user,...}, {role:assistant,...}] (无 system)
 - 长文续写: user=裸文本前半段, assistant=裸文本后半段 (不加任何指令文字)
 - 弱项基准任务 train set 全量或扩大采样进入
 - 目标: 在 hf_step7000 基础上继续 SFT, 保 raw-LM + 学指令 + 针对弱项.
+- 注: lambada_openai 已从训练/评测流程永久移除 (任务形式与 chat 模型不适配).
 
-7 类 (~290k):
+6 类 (~270k):
   75k 长文续写 (SkyPile zh + fineweb-edu en, 随机切点)
   62k 长 response 指令 (Tulu3 + Firefly + ShareGPT)
   50k Benchmark 格式 (benchmark_sft_mix 采样)
   37k 中文知识 QA (knowledge-sft, 去 system)
   25k 数学 CoT (belle_math school_math_0.25M)
-  20k Lambada test 上采样 (5153 条 test 重复 ~4x, user 明确要求训测同源)
   25k Benchmark-boost (hellaswag 15k + piqa 5k + winogrande 5k, 针对弱项)
 
 输出: data/sft_v2_mix/
@@ -267,37 +267,11 @@ def fmt_math_cot(n=25000):
     return out
 
 
-# ========== 6. Lambada test 上采样 (针对 lambada, 训测同分布) ==========
-
-def fmt_lambada_test(n=20000):
-    """直接用 lambada_openai test (5153 条已确认干净) 上采样到 n.
-    格式: user = context (去掉末词), assistant = 末词. 完全匹配 lm-eval 打分形式.
-    注: 这是训练 test 数据, 故意为之 (user 明确要求)."""
-    print(f'=== [6/7] Lambada test 上采样 (目标 {n}) ===')
-    ds = load_from_disk(f'{DATA_ROOT}/benchmark/lambada')['test']
-    base_pairs = []
-    for i in range(len(ds)):
-        text = ds[i]['text']
-        words = text.split()
-        if len(words) < 5:
-            continue
-        ctx = ' '.join(words[:-1])
-        last_word = words[-1]
-        base_pairs.append((ctx, last_word))
-    # 上采样: 重复 + shuffle
-    reps = (n + len(base_pairs) - 1) // len(base_pairs)
-    pool = base_pairs * reps
-    random.shuffle(pool)
-    pool = pool[:n]
-    out = [
-        {'messages': [
-            {'role': 'user', 'content': ctx},
-            {'role': 'assistant', 'content': lw},
-        ], 'source': 'lambada_test', 'lang': 'en'}
-        for ctx, lw in pool
-    ]
-    print(f'  [lambada_test] {len(out)} samples (base={len(base_pairs)}, ~{reps}x up-sampled)')
-    return out
+# ========== 6. Lambada-test 混入 (已永久移除) ==========
+# 注: 之前此处上采样 lambada_openai/test 入 SFT, 已移除.
+# 原因: lambada 任务本身对 chat/SFT 模型语义不适配 (末词专名预测 vs ChatML 回答模式),
+# 即使训 test 同分布也帮不了测试(任务形式错配), 训进去还会污染其他任务分布.
+# eval 流程已同步移除 lambada_openai.
 
 
 # ========== 7. Benchmark-boost (弱项任务全量训练) ==========
@@ -371,7 +345,6 @@ def main():
     all_samples.extend(fmt_benchmark())
     all_samples.extend(fmt_knowledge())
     all_samples.extend(fmt_math_cot())
-    all_samples.extend(fmt_lambada_test(20000))
     all_samples.extend(fmt_benchmark_boost())
 
     random.shuffle(all_samples)

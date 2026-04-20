@@ -30,7 +30,7 @@ MODELS = {
     "mamba-1.4b": "state-spaces/mamba-1.4b-hf",
 }
 
-DEFAULT_EXT_TASKS = ["openbookqa", "piqa", "lambada_openai", "ceval-valid", "mmlu"]
+DEFAULT_EXT_TASKS = ["openbookqa", "piqa", "ceval-valid", "mmlu"]  # lambada_openai 已移除 (chat 模型不适用)
 
 
 @register_model("hf_manual")

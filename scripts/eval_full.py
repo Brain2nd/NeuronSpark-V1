@@ -124,7 +124,9 @@ class NeuronSparkLM(LM):
             log_probs = F.log_softmax(shift_logits.float(), dim=-1)
             total_ll = sum(log_probs[i, shift_labels[i].item()].item()
                           for i in range(shift_labels.shape[0]))
-            results.append((total_ll,))
+            # lm-eval 新版 loglikelihood_rolling 期望纯 float (wikitext metric weighted_mean
+            # 依赖于此), 不能像 loglikelihood 那样返回 tuple.
+            results.append(total_ll)
         return results
 
     def generate_until(self, requests):

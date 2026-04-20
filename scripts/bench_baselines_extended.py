@@ -26,6 +26,8 @@ MODELS = {
     "qwen2.5-1.5b": "Qwen/Qwen2.5-1.5B",
     "qwen3-0.6b": "Qwen/Qwen3-0.6B-Base",
     "qwen3-1.7b": "Qwen/Qwen3-1.7B-Base",
+    "mamba-790m": "state-spaces/mamba-790m-hf",
+    "mamba-1.4b": "state-spaces/mamba-1.4b-hf",
 }
 
 DEFAULT_EXT_TASKS = ["openbookqa", "piqa", "lambada_openai", "ceval-valid", "mmlu"]

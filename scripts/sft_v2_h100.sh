@@ -70,7 +70,12 @@ cat > configs/ds_config_sft_v2.json <<'DSEOF'
 DSEOF
 
 # ================ 4. 训练 ================
-mkdir -p logs "$OUT_DIR"
+mkdir -p logs "$OUT_DIR" runs
+
+# 命名规范: {kind}_{git_short_hash}, 对齐仓库旧 runs (ddp_ec4964b / sft_7f1cd8e)
+GIT_HASH=$(git rev-parse --short HEAD)
+RUN_NAME="sft_v2_${GIT_HASH}"
+echo "[$(date)] Run name: $RUN_NAME"
 
 deepspeed --num_gpus=8 sft_ds.py \
     --pretrained_ckpt "$BASE_CKPT_DIR" \
@@ -85,7 +90,7 @@ deepspeed --num_gpus=8 sft_ds.py \
     --neuron_lr_mult $NEURON_LR_MULT \
     --log_interval 50 \
     --save_interval 500 \
-    --dashboard_dir "runs/sft_v2_$(date +%m%d_%H%M)" \
+    --dashboard_dir "runs/${RUN_NAME}" \
     --deepspeed configs/ds_config_sft_v2.json \
     "$@" \
-    2>&1 | tee logs/sft_v2_$(date +%m%d_%H%M).log
+    2>&1 | tee "logs/${RUN_NAME}.log"

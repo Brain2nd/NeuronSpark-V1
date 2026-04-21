@@ -132,9 +132,15 @@ class NeuronSparkLM(LM):
     def generate_until(self, requests):
         """生成式评测 (GSM8K/MATH 等 exact_match 任务需要).
         lm-eval 传入 (ctx, gen_kwargs), gen_kwargs 包含 until 停止符列表 + max_gen_toks.
+        显式 tqdm 进度条, 因为 lm-eval 内部在 custom LM 的 generate 循环里不自动包装.
         """
+        from tqdm import tqdm
         results = []
-        for req in requests:
+        total = len(requests)
+        pbar = tqdm(requests, desc=f'generate_until [{getattr(self, "_device", "?")}]',
+                    total=total, ncols=90, dynamic_ncols=False, mininterval=5.0,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        for req in pbar:
             ctx = req.args[0]
             gen_kwargs = req.args[1] if len(req.args) > 1 else {}
             until = gen_kwargs.get('until', []) or []
@@ -161,13 +167,13 @@ class NeuronSparkLM(LM):
                 )
             gen_ids = out[0][input_ids.shape[1]:]
             text = self.tokenizer.decode(gen_ids, skip_special_tokens=True)
-            # 在第一个 until 字符串处截断
             for u in until:
                 idx = text.find(u)
                 if idx >= 0:
                     text = text[:idx]
                     break
             results.append(text)
+        pbar.close()
         return results
 
 

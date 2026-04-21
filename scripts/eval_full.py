@@ -236,15 +236,27 @@ if __name__ == '__main__':
                  apply_chat_template=args.apply_chat_template,
                  system_instruction=args.system_instruction)
     else:
-        # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag 各独占一卡.
-        # Phase A (wikitext/sst2/mnli/xnli_zh) 按各自大小分到较轻负载的卡.
-        task_groups = [
-            ['mmlu'],                                                                      # GPU 0 (~14K)
-            ['hellaswag'],                                                                 # GPU 1 (~10K)
-            ['mnli', 'sst2', 'xnli_zh'],                                                   # GPU 2 (~13K)
-            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq',
-             'piqa', 'openbookqa', 'wikitext'],                                            # GPU 3 (~11K)
-        ]
+        # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag / mnli 各独占一卡.
+        # 支持 4 / 8 GPU 两种布局 (H100 8 卡 / 4090 4 卡).
+        if args.num_gpus >= 8:
+            task_groups = [
+                ['mmlu'],                               # GPU 0 (~56K reqs)
+                ['hellaswag'],                          # GPU 1 (~40K)
+                ['mnli'],                               # GPU 2 (~30K)
+                ['xnli_zh', 'arc_easy'],                # GPU 3 (~17K)
+                ['arc_challenge', 'boolq'],             # GPU 4 (~11K)
+                ['ceval-valid', 'piqa'],                # GPU 5 (~9K)
+                ['openbookqa', 'winogrande', 'sst2'],   # GPU 6 (~6K)
+                ['wikitext'],                           # GPU 7 (tiny)
+            ]
+        else:  # 4 GPU
+            task_groups = [
+                ['mmlu'],                                                                      # GPU 0 (~14K)
+                ['hellaswag'],                                                                 # GPU 1 (~10K)
+                ['mnli', 'sst2', 'xnli_zh'],                                                   # GPU 2 (~13K)
+                ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq',
+                 'piqa', 'openbookqa', 'wikitext'],                                            # GPU 3 (~11K)
+            ]
         # 如果 GPU 数不足 4，合并剩余任务到最后一组
         while len(task_groups) > args.num_gpus:
             task_groups[-2].extend(task_groups.pop())

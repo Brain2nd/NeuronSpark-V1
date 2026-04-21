@@ -211,11 +211,20 @@ if __name__ == '__main__':
                         help='输出文件名额外后缀, 避免覆盖 (如 chat)')
     args = parser.parse_args()
 
-    # 注意: lambada_openai 已移除 — chat/SFT 模型上任务形式与训练分布错位,
-    # 末词专名预测在 ChatML 下系统性崩溃, 业界对 instruct 模型也不报 lambada. 不再评测.
+    # Task suite (ALL models go through these by default, 2026-04-21 起扩充):
+    #   9 main multi-choice/knowledge tasks (zero-shot loglik):
+    #     arc_easy / arc_challenge / hellaswag / winogrande / boolq / mmlu / piqa / openbookqa / ceval-valid
+    #   4 Phase A raw-LM probes:
+    #     wikitext (word perplexity via loglikelihood_rolling), sst2, mnli, xnli_zh
+    # 已永久移除:
+    #   lambada_openai — chat/SFT 模型任务形式错配 (ppl 爆 1M+), 不再评测
+    # 可选单独加 (默认不启用):
+    #   blimp — 67 英文 subtask, 我们的 torch.compile PLIF kernel 在变长输入上 cache miss 会 hang
+    #     若需评测, 手动传 --tasks blimp_adjunct_island blimp_... (avoiding blimp_nl_* 荷兰语变体)
     all_tasks = [
         'arc_easy', 'arc_challenge', 'hellaswag', 'winogrande', 'boolq',
         'mmlu', 'piqa', 'openbookqa', 'ceval-valid',
+        'wikitext', 'sst2', 'mnli', 'xnli_zh',
     ]
 
     ckpt_name = os.path.basename(args.checkpoint)
@@ -227,12 +236,14 @@ if __name__ == '__main__':
                  apply_chat_template=args.apply_chat_template,
                  system_instruction=args.system_instruction)
     else:
-        # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag 各独占一卡
+        # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag 各独占一卡.
+        # Phase A (wikitext/sst2/mnli/xnli_zh) 按各自大小分到较轻负载的卡.
         task_groups = [
-            ['mmlu'],                                                       # GPU 0 (~14K reqs)
-            ['hellaswag'],                                                  # GPU 1 (~10K reqs)
-            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq'],  # GPU 2 (~8.6K)
-            ['piqa', 'openbookqa'],                                         # GPU 3 (~2.3K)
+            ['mmlu'],                                                                      # GPU 0 (~14K)
+            ['hellaswag'],                                                                 # GPU 1 (~10K)
+            ['mnli', 'sst2', 'xnli_zh'],                                                   # GPU 2 (~13K)
+            ['ceval-valid', 'arc_easy', 'arc_challenge', 'winogrande', 'boolq',
+             'piqa', 'openbookqa', 'wikitext'],                                            # GPU 3 (~11K)
         ]
         # 如果 GPU 数不足 4，合并剩余任务到最后一组
         while len(task_groups) > args.num_gpus:

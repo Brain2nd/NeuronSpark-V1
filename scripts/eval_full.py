@@ -3,8 +3,7 @@ import sys, os, torch, json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
-from checkpoint_utils import load_config, load_model_weights
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
 import lm_eval
 from lm_eval.api.model import LM
@@ -23,26 +22,10 @@ class NeuronSparkLM(LM):
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
-        # 自动检测 HF artifact vs native. HF 走 AutoModelForCausalLM (含 RoPE buffer 重算 + fp32 load),
-        # native 走 load_model_weights. 二者对同一 ckpt 应产出 bit-exact 相同模型.
-        import os, json
-        is_hf = False
-        cfg_path = os.path.join(checkpoint, 'config.json')
-        if os.path.isfile(cfg_path):
-            with open(cfg_path) as f:
-                _cfg = json.load(f)
-            is_hf = 'auto_map' in _cfg or 'architectures' in _cfg
-        if is_hf:
-            from transformers import AutoModelForCausalLM as _AMLM
-            self.model = _AMLM.from_pretrained(
-                checkpoint, trust_remote_code=True,
-            ).to(self._device).eval()
-        else:
-            snn_config = load_config(checkpoint)
-            config = NeuronSparkConfig(**snn_config)
-            self.model = NeuronSparkForCausalLM(config)
-            load_model_weights(checkpoint, self.model.snn, str(self._device))
-            self.model = self.model.to(self._device).eval()
+        # v3 全部是 HF checkpoint, from_pretrained 内置 RoPE buffer 重算 + fp32 load
+        self.model = AutoModelForCausalLM.from_pretrained(
+            checkpoint, trust_remote_code=True,
+        ).to(self._device).eval()
         # 混合精度统一 (neuron fp32, 其余 bf16): autocast 负责 compute
         for name, param in self.model.named_parameters():
             if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):

@@ -13,7 +13,7 @@ from lm_eval.api.registry import register_model
 @register_model('neuronspark')
 class NeuronSparkLM(LM):
     def __init__(self, checkpoint='checkpoints/ckpt_step441000',
-                 tokenizer_path='./tokenizer/', device='cuda:0',
+                 tokenizer_path='./tokenizer_v3/', device='cuda:0',
                  batch_size=1, dtype='bfloat16', **kw):
         super().__init__()
         self._device = torch.device(device)

@@ -52,7 +52,17 @@ class SNNDashboard:
     # ====== public ======
 
     def cache_grad_norms(self, model):
-        """Before optimizer.step(), capture per-param grad norm (all-reduced across ranks)."""
+        """Before optimizer.step(), capture per-param grad norm.
+
+        Multi-GPU note (ZeRO-2):
+          Parameters are replicated across ranks but gradients are reduce-scatter
+          SHARDED — each rank holds only 1/world_size of the full gradient.
+          We all-reduce the squared norm across ranks to get the GLOBAL grad
+          norm (mathematically correct: ||g||² = Σ_rank ||g_rank||²).
+          This gives correct scalar norms but NOT full gradient tensors —
+          histograms / per-element distributions are NOT reconstructible here
+          without expensive all-gather (see `_log_histograms`, disabled under ZeRO).
+        """
         use_dist = dist.is_initialized() and dist.get_world_size() > 1
         cache: dict[str, float] = {}
         for name, p in _inner_snn(model).named_parameters():
@@ -66,6 +76,8 @@ class SNNDashboard:
                 clean = clean[len("module."):]
             cache[clean] = local_sq.sqrt().item()
         self._grad_cache = cache
+        # Mark distributed mode for histogram gating
+        self._is_distributed_sharded = use_dist
 
     def log_step(self, step, metrics_dict, model, log_params: bool = True):
         if not self._enabled:
@@ -78,7 +90,8 @@ class SNNDashboard:
         self._log_beta_distribution(step, snn)
         self._log_dynamic_k(step, snn)
         self._log_associative_memory(step, snn)
-        self._log_ponder_collapse(step, snn)   # v3: K collapse detection
+        self._log_ponder_collapse(step, snn)       # v3: K collapse statistics
+        self._log_ponder_gradients(step, snn)      # v3: k_predictor grad health
         self._log_health(step, snn)
 
     def log_save_point(self, step, model):
@@ -391,6 +404,80 @@ class SNNDashboard:
             w.add_scalar("ponder/global/collapse_any_frac",
                          (collapse_count_block + collapse_count_ffn) / total, step)
 
+    # ====== 7b. v3 PonderNet k_predictor gradient health ======
+
+    def _log_ponder_gradients(self, step, snn):
+        """Surface k_predictor-specific gradient + weight norms.
+
+        Why separate from generic param monitoring:
+          - If Gumbel-Softmax Straight-Through breaks, k_predictor.net gets
+            ZERO gradient → silent collapse. Need explicit visibility.
+          - Two layers of net (Linear + SiLU + Linear); either saturated →
+            predictor freezes.
+          - Multi-GPU ZeRO-2: grad cache is already all-reduced-norm-squared,
+            so values here are GLOBAL norms (correct across ranks).
+
+        Metrics per (layer, sublayer):
+          - net0_grad_norm / net0_weight_norm / net0_update_ratio
+          - net1_grad_norm / net1_weight_norm / net1_update_ratio
+          - net0_grad_zero_flag (1 if grad norm < 1e-8 → broken)
+          - net1_grad_zero_flag (same)
+        """
+        w = self._writer
+        cache = self._grad_cache
+        lr = 1e-4  # fallback if called outside log_step; typically dashboard has lr in metrics
+        # Try to read last-seen lr from scalar log buffer if available
+        # (For simplicity, use fixed sentinel — ratio only meaningful at display time.)
+
+        broken_count = 0
+        total_count = 0
+
+        for i, layer in enumerate(snn.layers):
+            for sublayer_name, attr in (("block", "block_k_predictor"),
+                                         ("ffn", "ffn_k_predictor")):
+                kp = getattr(layer, attr, None)
+                if kp is None:
+                    continue
+                # net is Sequential(Linear, SiLU, Linear). Index 0 and 2 are Linear.
+                # Full parameter names (relative to snn): layers.{i}.{attr}.net.0.weight etc.
+                prefix = f"layers.{i}.{attr}.net"
+                tag_prefix = f"ponder_grads/layer_{i:02d}/{sublayer_name}"
+
+                for j, sub_idx in [(0, "0"), (1, "2")]:  # j used for display name, sub_idx = PyTorch Sequential index
+                    weight_key = f"{prefix}.{sub_idx}.weight"
+                    bias_key = f"{prefix}.{sub_idx}.bias"
+                    w_norm = 0.0
+                    g_norm = 0.0
+
+                    # Find the Linear module to read its weight directly
+                    try:
+                        lin = kp.net[int(sub_idx)]
+                    except (IndexError, TypeError):
+                        continue
+                    if not hasattr(lin, "weight"):
+                        continue
+                    with torch.no_grad():
+                        w_norm = lin.weight.data.norm().item()
+                    g_norm = cache.get(weight_key, 0.0)
+                    g_bias_norm = cache.get(bias_key, 0.0)
+
+                    w.add_scalar(f"{tag_prefix}/net{j}_weight_norm", w_norm, step)
+                    w.add_scalar(f"{tag_prefix}/net{j}_grad_norm", g_norm, step)
+                    w.add_scalar(f"{tag_prefix}/net{j}_grad_bias_norm", g_bias_norm, step)
+                    if w_norm > 0:
+                        w.add_scalar(f"{tag_prefix}/net{j}_update_ratio", g_norm / w_norm, step)
+
+                    is_broken = g_norm < 1e-8 and g_bias_norm < 1e-8
+                    w.add_scalar(f"{tag_prefix}/net{j}_grad_broken_flag",
+                                 1.0 if is_broken else 0.0, step)
+                    if is_broken:
+                        broken_count += 1
+                    total_count += 1
+
+        if total_count > 0:
+            w.add_scalar("ponder_grads/global/broken_net_fraction",
+                         broken_count / total_count, step)
+
     # ====== 7. health ======
 
     @staticmethod
@@ -484,12 +571,19 @@ class SNNDashboard:
     # ====== 8. histograms ======
 
     def _log_histograms(self, step):
+        """Weight histograms are always valid (parameters replicated in ZeRO-2).
+        Gradient histograms are only meaningful when grad is NOT sharded:
+          - Single GPU: grad is full, plot OK
+          - ZeRO-2 multi-GPU: grad is sharded (each rank ~1/W of full grad),
+            histograms would show misleading partial distributions → SKIP
+        """
         w = self._writer
+        is_sharded = getattr(self, "_is_distributed_sharded", False)
         for name, (tag, p) in self._registry.items():
             if not p.requires_grad:
                 continue
             w.add_histogram(f"histograms/{tag}/weight", p.data, step)
-            if p.grad is not None:
+            if p.grad is not None and not is_sharded:
                 w.add_histogram(f"histograms/{tag}/grad", p.grad, step)
 
     # ====== 9. compensation factors ======

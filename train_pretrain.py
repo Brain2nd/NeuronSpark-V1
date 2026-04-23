@@ -163,6 +163,10 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
         is_boundary = (step + 1) % args.accumulation_steps == 0
         if is_boundary:
             engine.module.snn.compensate_modulation_gradients()
+            # Capture per-param grad norms BEFORE engine.step() clears them.
+            # ALL ranks must call: dist.all_reduce inside is a collective.
+            if dashboard is not None:
+                dashboard.cache_grad_norms(engine.module)
         engine.step()
 
         # v3 PonderNet: gradient-free bias balancing (AFTER step)

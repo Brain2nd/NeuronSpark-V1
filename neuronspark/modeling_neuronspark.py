@@ -1791,6 +1791,137 @@ def _fused_geometric_halt(halt_logits):
     halt_weights = halt_weights / (halt_weights.sum(dim=1, keepdim=True) + 1e-8)
     return halt_weights
 
+
+# ============================================================
+# Section: v3 PonderNet (input-conditioned per-token k_t)
+# ============================================================
+
+class KPredictor(nn.Module):
+    """Input-conditioned one-shot compute-budget predictor.
+
+    Mamba-Δ analog: takes per-token input embedding, outputs K-way logits over
+    the "how many PLIF integration steps this token needs" decision.
+
+    Training: Gumbel-Softmax Straight-Through hard-pick + DeepSpeek-V3 style
+    gradient-free bias balancing + forced exploration to prevent halt-distribution
+    collapse at deep k positions.
+
+    Inference: pure argmax over logits (no Gumbel, no exploration).
+
+    Spec: docs/v3_ponder_spec.md §2.1
+    """
+
+    _BIAS_CLAMP = 5.0      # prevent runaway bias drift
+    _MIN_USAGE = 1.0 / 1024  # floor to avoid log(0) in stats
+
+    def __init__(self, D: int, K: int, hidden: int | None = None):
+        super().__init__()
+        h = hidden or max(D // 4, 64)
+        self.D = D
+        self.K = K
+        self.net = nn.Sequential(
+            nn.Linear(D, h),
+            nn.SiLU(),
+            nn.Linear(h, K),
+        )
+        # Gradient-free balancing bias (not a learnable parameter)
+        self.register_buffer("bias", torch.zeros(K))
+        # Running usage stats for EMA-smoothed bias updates
+        self.register_buffer("_usage_ema", torch.full((K,), 1.0 / K))
+
+        # Xavier-init the two linears; small scale so initial logits are near zero
+        for m in self.net:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                m.weight.data.mul_(0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, input_emb: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input_emb: (..., D) per-token embedding (un-repeated by K)
+        Returns:
+            logits: (..., K) halt-step distribution logits (bias added)
+        """
+        return self.net(input_emb) + self.bias
+
+    @torch.no_grad()
+    def update_bias(
+        self,
+        y_hard: torch.Tensor,
+        lr_bias: float,
+        ema_decay: float = 0.99,
+    ) -> None:
+        """Gradient-free bias balancing (DeepSeek-V3 aux-loss-free style).
+
+        Called once per training step AFTER optimizer.step().
+
+        Args:
+            y_hard: (..., K) one-hot selection tensor from this step's forward
+            lr_bias: bias learning rate (typical 1e-3)
+            ema_decay: EMA smoothing factor for usage statistics
+        """
+        if y_hard.numel() == 0:
+            return
+        # Aggregate y_hard over all leading dims except K
+        usage = y_hard.float().reshape(-1, self.K).mean(dim=0)  # (K,)
+        # EMA-smooth
+        self._usage_ema.mul_(ema_decay).add_(usage, alpha=1.0 - ema_decay)
+        # Deviation from uniform
+        diff = self._usage_ema - (1.0 / self.K)
+        # Underused → raise bias; overused → lower bias
+        self.bias.add_(-lr_bias * diff)
+        # Clamp to avoid runaway drift
+        self.bias.clamp_(-self._BIAS_CLAMP, self._BIAS_CLAMP)
+
+
+def _ponder_v3_pick(
+    k_logits: torch.Tensor,
+    training: bool,
+    temperature: float,
+    eps_explore: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gumbel-ST hard-pick (training) or argmax (inference).
+
+    Args:
+        k_logits: (..., K) logits (already include KPredictor.bias)
+        training: True if in training mode
+        temperature: Gumbel temperature (>0)
+        eps_explore: forced-exploration probability (0 disables)
+
+    Returns:
+        y_st: (..., K) — straight-through tensor (forward=y_hard, backward=y_soft)
+        y_hard: (..., K) — the actual one-hot selection (detached)
+    """
+    K = k_logits.shape[-1]
+    if training:
+        gumbel = -torch.log(-torch.log(torch.rand_like(k_logits) + 1e-9) + 1e-9)
+        logits_noisy = (k_logits + gumbel) / max(temperature, 1e-4)
+        y_soft = F.softmax(logits_noisy, dim=-1)
+        y_hard = F.one_hot(y_soft.argmax(dim=-1), K).to(y_soft.dtype)
+
+        # Forced exploration: ε probability to replace y_hard with uniform random
+        if eps_explore > 0:
+            leading_shape = k_logits.shape[:-1]
+            random_k = torch.randint(0, K, leading_shape, device=k_logits.device)
+            explore_mask = torch.rand(leading_shape, device=k_logits.device) < eps_explore
+            y_hard_rand = F.one_hot(random_k, K).to(y_soft.dtype)
+            y_hard = torch.where(
+                explore_mask.unsqueeze(-1).expand_as(y_hard),
+                y_hard_rand,
+                y_hard,
+            )
+
+        # Straight-through: forward=y_hard, backward gradient flows via y_soft
+        y_st = y_hard + y_soft - y_soft.detach()
+    else:
+        # Inference: pure argmax, no noise
+        y_hard = F.one_hot(k_logits.argmax(dim=-1), K).to(k_logits.dtype)
+        y_st = y_hard
+    return y_st, y_hard.detach()
+
+
 class SNNDecoderLayer(MemoryModule):
     """
     单个 SNN 解码层（连续残差流 + K 帧聚合版本）。
@@ -1823,6 +1954,7 @@ class SNNDecoderLayer(MemoryModule):
         K: int = 16,
         num_layers: int = 1,
         layer_idx: int = 0,
+        k_predictor_hidden: int | None = None,
     ):
         super().__init__()
         self.D = D
@@ -1860,21 +1992,25 @@ class SNNDecoderLayer(MemoryModule):
         self.block_out_proj = nn.Linear(D, D, bias=False)
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
-        # ====== 动态 K: 停止投影（突触: SNN 输出 → 停止概率） ======
-        # halt_proj: D → 1，每步每 token 产生一个停止 logit
-        # PonderNet 几何分布加权，替代 uniform mean 聚合
-        self.block_halt = nn.Linear(D, 1, bias=False)
-        self.ffn_halt = nn.Linear(D, 1, bias=False)
+        # ====== v3 动态 K: input-conditioned KPredictor（取代 halt_proj） ======
+        # 每子层独立一个 KPredictor：block 子层和 FFN 子层看到的 input 不同，
+        # 期望它们学不同的 k_t 分配策略。Gumbel-ST 训练 + argmax 推理在
+        # _ponder_aggregate_v3 里实现。
+        self.block_k_predictor = KPredictor(D=D, K=K, hidden=k_predictor_hidden)
+        self.ffn_k_predictor = KPredictor(D=D, K=K, hidden=k_predictor_hidden)
 
         # 残差输出缩放初始化（GPT-2 style: σ = 0.02 / √(2·num_layers)）
         std = 0.02 / math.sqrt(2 * num_layers)
         nn.init.normal_(self.block_out_proj.weight, std=std)
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
 
-        # halt 初始化: 小权重 → 输出接近 0 → sigmoid ≈ 0.5 → 接近 uniform 聚合
-        for halt in [self.block_halt, self.ffn_halt]:
-            nn.init.xavier_uniform_(halt.weight)
-            halt.weight.data.mul_(0.01)
+        # v3 PonderNet runtime state (set by SNNLanguageModel per step)
+        self.ponder_T = 1.0       # Gumbel temperature
+        self.eps_explore = 0.0    # forced exploration rate
+
+        # Cached y_hard per sub-layer for post-step bias update (detached)
+        self._last_y_hard_block = None
+        self._last_y_hard_ffn = None
 
     def _input_neuron_parallel(self, input_neuron, x):
         """
@@ -1913,102 +2049,136 @@ class SNNDecoderLayer(MemoryModule):
         input_neuron.v = V_post[-1].detach()
         return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
 
-    def _adaptive_aggregate(self, frames, halt_proj):
-        """
-        PonderNet 式自适应 K 帧聚合（动态 K 核心，torch.compile 融合优化）。
+    def _ponder_aggregate_v3(
+        self,
+        frames: torch.Tensor,
+        input_emb: torch.Tensor,
+        k_predictor: "KPredictor",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """v3 PonderNet: input-conditioned hard-pick of k_t per token.
 
-        每步计算停止概率 p_k，用几何分布权重加权聚合，
-        使不同 token 有不同的有效步数。
+        Spec: docs/v3_ponder_spec.md §3.2
 
-        优化: _fused_geometric_halt 将 sigmoid+log1p+cumsum+exp+normalize
-        融合为单 inductor kernel（参见 snn_block._fused_modulation 同一模式）。
+        Training:
+            1. k_predictor(input_emb) → K-way logits (含 bias)
+            2. Gumbel-Softmax Straight-Through 硬采样 k_t (forward=one-hot)
+            3. output = Σ y_st[k] · frame[k] 前向值 = frame[k_t], 反向梯度经 y_soft
+            4. 三层反坍缩：Gumbel 温度 + forced exploration + bias balancing（后者在 update_bias）
 
-        数学:
-          p_k = σ(halt_proj(frame_k))                 — 停止概率
-          S_k = ∏_{j<k} (1-p_j)                       — 生存概率
-          λ_k = p_k · S_k                             — 几何分布权重
-          λ̂_k = λ_k / Σ λ_k                           — 归一化
-          output = Σ λ̂_k · frame_k                    — 加权聚合
-          E[K] = Σ k · λ̂_k                            — 期望步数（ponder cost）
+        Inference:
+            pure argmax 单步选择，无 Gumbel / exploration
 
         Args:
             frames: (seq_len, K, batch, D) — SNN 子层 K 帧输出
-            halt_proj: nn.Linear(D, 1)    — 停止投影（突触）
+            input_emb: (seq_len, batch, D) — 该子层 token-level 输入 (K 维之前)
+            k_predictor: 该子层对应的 KPredictor 模块
 
         Returns:
-            aggregated: (seq_len, batch, D) — 加权聚合结果
-            ponder_cost: scalar             — 期望步数均值（正则化用）
+            aggregated: (seq_len, batch, D) — 单一 k_t 位置的 frame
+            ponder_cost: scalar — E[k_t]（log 用，Stage 1 不进 loss）
+            expected_k: (seq_len, batch) — 每 token 的 E[k_t]（诊断用, detached）
+            y_hard: (seq_len, batch, K) — 本次选择的 one-hot（detached，给 bias update）
         """
         seq_len, K, batch, D = frames.shape
 
-        # ====== 1. halt_proj matmul（cuBLAS）+ 融合几何权重（inductor） ======
-        halt_logits = halt_proj(frames).squeeze(-1)    # (seq_len, K, batch)
-        halt_weights = _fused_geometric_halt(halt_logits)  # (seq_len, K, batch), 归一化
+        # Step 1: per-token input-conditioned logits
+        k_logits = k_predictor(input_emb)              # (seq_len, batch, K)
 
-        # ====== 2. 加权聚合 ======
-        # (seq_len, K, batch, 1) × (seq_len, K, batch, D) → sum → (seq_len, batch, D)
-        aggregated = (frames * halt_weights.unsqueeze(-1)).sum(dim=1)
+        # Step 2: Gumbel-ST (train) / argmax (eval)
+        y_st, y_hard = _ponder_v3_pick(
+            k_logits,
+            training=self.training,
+            temperature=self.ponder_T,
+            eps_explore=self.eps_explore,
+        )                                                # y_st: (seq_len, batch, K)
 
-        # ====== 3. Ponder cost: E[K] per token ======
+        # Step 3: 硬选聚合 output = Σ y_st[k] · frame[k]
+        # y_st: (seq_len, batch, K) → (seq_len, K, batch, 1) for broadcast
+        y_st_b = y_st.permute(0, 2, 1).unsqueeze(-1)    # (seq_len, K, batch, 1)
+        aggregated = (y_st_b * frames).sum(dim=1)       # (seq_len, batch, D)
+
+        # Step 4: 期望 k_t 统计（diagnostic / log 用）
         steps = torch.arange(1, K + 1, device=frames.device, dtype=frames.dtype)
-        expected_k = (halt_weights * steps[None, :, None]).sum(dim=1)  # (seq_len, batch)
-        ponder_cost = expected_k.mean()               # scalar
+        expected_k = (y_st.detach() * steps[None, None, :]).sum(-1)  # (seq_len, batch)
+        ponder_cost = expected_k.mean()
 
-        return aggregated, ponder_cost, expected_k.detach()
+        return aggregated, ponder_cost, expected_k.detach(), y_hard
 
     def forward_parallel(self, h):
         """
-        并行前向传播：连续残差流 + 动态 K 帧聚合。
+        并行前向传播：连续残差流 + v3 PonderNet 硬选 k_t。
 
-        SNN 子层在 TK 维度处理（K 步时间动力学），输出后用 PonderNet
-        自适应聚合 K 帧（不同 token 有效步数不同），经 out_proj 投影后
-        广播回 TK 做残差。
+        每子层流程:
+          1. Pre-LN + PLIF(V_post) 输入神经元 → SNN 子层 K 帧输出
+          2. v3 PonderNet: k_predictor(input_emb) → Gumbel-ST 硬选 k_t 位置
+          3. output = frame[k_t] (单一时刻膜电位状态)
+          4. out_proj + 残差中心化 → 广播回 TK
 
         Args:
             h: (TK, batch, D) — 连续值输入
 
         Returns:
             h: (TK, batch, D) — 连续值输出
-            ponder_cost: scalar — 两个子层的平均期望步数（正则化用）
+            ponder_cost: scalar — 两个子层的平均 E[k_t]（仅 log 用）
         """
         TK, batch, D = h.shape
         K = self.K
         seq_len = TK // K
 
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → 动态K聚合 → out_proj → 残差
+        # ==== 子层 1: SNNBlock ====
+        # input_emb 取第 0 帧作为 token-level 输入给 k_predictor
+        h_block_input = h.view(seq_len, K, batch, D)[:, 0]  # (seq_len, batch, D)
         v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
-        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
+        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D)
 
-        # 动态 K 帧聚合（PonderNet）: (TK, batch, D) → (seq_len, K, batch, D) → 加权 → (seq_len, batch, D)
         frames_block = cont_block.view(seq_len, K, batch, D)
-        combined_block, pc_block, ek_block = self._adaptive_aggregate(frames_block, self.block_halt)
+        combined_block, pc_block, ek_block, y_hard_block = self._ponder_aggregate_v3(
+            frames_block, h_block_input, self.block_k_predictor,
+        )
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
-        res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
-
-        # 广播回 TK：每 token 的残差复制 K 份
+        res_block = res_block - res_block.mean(dim=-1, keepdim=True)
         h = h + res_block.repeat_interleave(K, dim=0)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → 动态K聚合 → out_proj → 残差
+        # ==== 子层 2: SNNFFN ====
+        h_ffn_input = h.view(seq_len, K, batch, D)[:, 0]
         v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn, pc_ffn, ek_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        combined_ffn, pc_ffn, ek_ffn, y_hard_ffn = self._ponder_aggregate_v3(
+            frames_ffn, h_ffn_input, self.ffn_k_predictor,
+        )
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
-
         h = h + res_ffn.repeat_interleave(K, dim=0)
 
-        ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均
+        ponder_cost = (pc_block + pc_ffn) / 2.0
 
-        # 存储 per-token E[K] 范围（诊断用，不影响计算图）
-        # ek_block/ek_ffn: (seq_len, batch), detached
+        # Cache y_hard for post-step bias update
+        self._last_y_hard_block = y_hard_block
+        self._last_y_hard_ffn = y_hard_ffn
+
+        # Diagnostic: per-token E[k_t] range
         with torch.no_grad():
             all_ek = torch.cat([ek_block.flatten(), ek_ffn.flatten()])
             self._ek_min = all_ek.min().item()
             self._ek_max = all_ek.max().item()
 
         return h, ponder_cost
+
+    def update_bias(self, lr_bias: float = 1e-3, ema_decay: float = 0.99) -> None:
+        """Apply gradient-free bias balancing to both sub-layer k_predictors.
+
+        Call once per training step AFTER optimizer.step().
+        """
+        if self._last_y_hard_block is not None:
+            self.block_k_predictor.update_bias(
+                self._last_y_hard_block, lr_bias=lr_bias, ema_decay=ema_decay,
+            )
+        if self._last_y_hard_ffn is not None:
+            self.ffn_k_predictor.update_bias(
+                self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
+            )
 
     def single_step_forward(self, h):
         """
@@ -2131,16 +2301,20 @@ class SNNAttentionDecoderLayer(MemoryModule):
         )
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
-        # PonderNet halt (子层 2)
-        self.ffn_halt = nn.Linear(D, 1, bias=False)
+        # v3 PonderNet: FFN 子层的 KPredictor (海马体层只有 FFN 子层需要 K 聚合,
+        # attention 子层是 T 维 cumsum 不涉及 K 聚合)
+        self.ffn_k_predictor = KPredictor(D=D, K=K, hidden=None)
 
         # ====== 初始化 ======
         std = 0.02 / math.sqrt(2 * num_layers)
         nn.init.xavier_uniform_(self.qkv_proj.weight)
         nn.init.normal_(self.attn_out_proj.weight, std=std)
         nn.init.normal_(self.ffn_out_proj.weight, std=std)
-        nn.init.xavier_uniform_(self.ffn_halt.weight)
-        self.ffn_halt.weight.data.mul_(0.01)
+
+        # v3 runtime state
+        self.ponder_T = 1.0
+        self.eps_explore = 0.0
+        self._last_y_hard_ffn = None
 
     def _input_neuron_parallel(self, input_neuron, x):
         """PLIFNode parallel scan, 返回激活值。复用 SNNDecoderLayer 的逻辑。"""
@@ -2185,16 +2359,27 @@ class SNNAttentionDecoderLayer(MemoryModule):
         gate_activation = (1.0 - beta_g) * V_post_g
         return gate_activation.mean(dim=-1, keepdim=True).to(input_dtype)
 
-    def _adaptive_aggregate(self, frames, halt_proj):
-        """复用 SNNDecoderLayer 的 PonderNet 聚合。"""
+    def _ponder_aggregate_v3(
+        self,
+        frames: torch.Tensor,
+        input_emb: torch.Tensor,
+        k_predictor: "KPredictor",
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """复用 SNNDecoderLayer 的 v3 PonderNet 聚合 (硬选 k_t)。"""
         seq_len, K, batch, D = frames.shape
-        halt_logits = halt_proj(frames).squeeze(-1)
-        halt_weights = _fused_geometric_halt(halt_logits)
-        aggregated = (frames * halt_weights.unsqueeze(-1)).sum(dim=1)
+        k_logits = k_predictor(input_emb)
+        y_st, y_hard = _ponder_v3_pick(
+            k_logits,
+            training=self.training,
+            temperature=self.ponder_T,
+            eps_explore=self.eps_explore,
+        )
+        y_st_b = y_st.permute(0, 2, 1).unsqueeze(-1)
+        aggregated = (y_st_b * frames).sum(dim=1)
         steps = torch.arange(1, K + 1, device=frames.device, dtype=frames.dtype)
-        expected_k = (halt_weights * steps[None, :, None]).sum(dim=1)
+        expected_k = (y_st.detach() * steps[None, None, :]).sum(-1)
         ponder_cost = expected_k.mean()
-        return aggregated, ponder_cost, expected_k.detach()
+        return aggregated, ponder_cost, expected_k.detach(), y_hard
 
     def forward_parallel(self, h):
         """
@@ -2248,16 +2433,22 @@ class SNNAttentionDecoderLayer(MemoryModule):
         # 广播回 TK 帧 + 残差
         h = h + res_attn.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
 
-        # ====== 子层 2: SNNFFN (和 SNNDecoderLayer 完全一致) ======
+        # ====== 子层 2: SNNFFN (v3 PonderNet) ======
+        h_ffn_input = h.view(seq_len, K, batch, D)[:, 0]
         v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn, pc_ffn, ek_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        combined_ffn, pc_ffn, ek_ffn, y_hard_ffn = self._ponder_aggregate_v3(
+            frames_ffn, h_ffn_input, self.ffn_k_predictor,
+        )
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
         h = h + res_ffn.repeat_interleave(K, dim=0)
+
+        # Cache y_hard for bias update
+        self._last_y_hard_ffn = y_hard_ffn
 
         # 存储 E[K] 诊断
         with torch.no_grad():
@@ -2265,6 +2456,13 @@ class SNNAttentionDecoderLayer(MemoryModule):
             self._ek_max = ek_ffn.max().item()
 
         return h, pc_ffn
+
+    def update_bias(self, lr_bias: float = 1e-3, ema_decay: float = 0.99) -> None:
+        """Gradient-free bias balancing for the FFN sub-layer k_predictor."""
+        if self._last_y_hard_ffn is not None:
+            self.ffn_k_predictor.update_bias(
+                self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
+            )
 
 
 # ============================================================
@@ -2381,6 +2579,30 @@ class SNNLanguageModel(nn.Module):
         # 每 token 重复 K 次: (batch, seq_len, D) → (batch, seq_len*K, D) → (TK, batch, D)
         emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
         return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
+
+    def set_ponder_temperature(self, T: float) -> None:
+        """Set Gumbel temperature on every layer's KPredictor path.
+
+        Call from training loop each step to anneal T_init → T_final.
+        """
+        for layer in self.layers:
+            if hasattr(layer, "ponder_T"):
+                layer.ponder_T = float(T)
+
+    def set_ponder_exploration(self, eps: float) -> None:
+        """Set forced-exploration probability on every layer."""
+        for layer in self.layers:
+            if hasattr(layer, "eps_explore"):
+                layer.eps_explore = float(eps)
+
+    def update_ponder_bias(self, lr_bias: float = 1e-3, ema_decay: float = 0.99) -> None:
+        """Apply DeepSeek-V3 style gradient-free bias balancing across all layers.
+
+        Call once per training step AFTER optimizer.step().
+        """
+        for layer in self.layers:
+            if hasattr(layer, "update_bias"):
+                layer.update_bias(lr_bias=lr_bias, ema_decay=ema_decay)
 
     def snn_forward(self, h_seq: torch.Tensor):
         """SNN 核心：h_seq → (h_out, ponder_cost)。
@@ -2699,8 +2921,8 @@ class SNNLanguageModel(nn.Module):
             # 残差流组件
             'residual_projs': [],
             'input_neurons': [],
-            # 动态 K: 停止投影
-            'halt_projs': [],
+            # v3 动态 K: input-conditioned KPredictor 参数 (取代 halt_projs)
+            'k_predictors': [],
             # SNNBlock 参数
             'W_in': [],
             'W_beta': [],
@@ -2738,7 +2960,7 @@ class SNNLanguageModel(nn.Module):
                     layer_module.attn_out_norm.weight,
                     layer_module.ffn_norm.weight,
                 ])
-                groups['halt_projs'].extend(list(layer_module.ffn_halt.parameters()))
+                groups['k_predictors'].extend(list(layer_module.ffn_k_predictor.net.parameters()))
                 # SNNFFN 参数
                 ffn = layer_module.snn_ffn
                 groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
@@ -2770,9 +2992,9 @@ class SNNLanguageModel(nn.Module):
                 layer_module.ffn_norm.weight,
             ])
 
-            # 动态 K: 停止投影参数
-            groups['halt_projs'].extend(list(layer_module.block_halt.parameters()))
-            groups['halt_projs'].extend(list(layer_module.ffn_halt.parameters()))
+            # v3 KPredictor 参数（仅 net 可训练，bias buffer 不在 autograd 图）
+            groups['k_predictors'].extend(list(layer_module.block_k_predictor.net.parameters()))
+            groups['k_predictors'].extend(list(layer_module.ffn_k_predictor.net.parameters()))
 
             # SNNBlock 参数
             groups['W_in'].append(block.W_in.weight)

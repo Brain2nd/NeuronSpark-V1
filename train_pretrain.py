@@ -59,6 +59,26 @@ def cosine_lr(step, total_steps, base_lr, warmup):
     return min_lr + 0.5 * (base_lr - min_lr) * (1.0 + math.cos(math.pi * decay))
 
 
+def ponder_temperature(step: int, total_steps: int, T_init: float, T_final: float,
+                        tau_frac: float = 0.1) -> float:
+    """Exponential decay T(step) = T_final + (T_init - T_final) * exp(-step / tau).
+
+    tau = tau_frac * total_steps controls how fast T anneals.
+    Default tau_frac=0.1 → 10% of training spent annealing T.
+    """
+    tau = max(tau_frac * total_steps, 1.0)
+    return T_final + (T_init - T_final) * math.exp(-step / tau)
+
+
+def ponder_exploration(step: int, total_steps: int, eps_init: float,
+                        eps_final: float = 0.01) -> float:
+    """Linear decay of forced-exploration probability over training."""
+    if total_steps <= 1:
+        return eps_final
+    frac = min(step / total_steps, 1.0)
+    return eps_init + (eps_final - eps_init) * frac
+
+
 def load_model(args) -> tuple[NeuronSparkForCausalLM, AutoTokenizer, torch.device]:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
@@ -111,9 +131,21 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
         Y = Y.to(device, non_blocking=True)
         loss_mask = loss_mask.to(device, non_blocking=True)
 
-        lr = cosine_lr(step, args.epochs * iters_per_epoch, args.learning_rate, args.warmup_iters)
+        total_steps = args.epochs * iters_per_epoch
+        lr = cosine_lr(step, total_steps, args.learning_rate, args.warmup_iters)
         for g in engine.optimizer.param_groups:
             g["lr"] = lr * g.get("lr_mult", 1.0)
+
+        # v3 PonderNet: temperature + exploration schedule (set BEFORE forward)
+        cur_T = ponder_temperature(
+            step, total_steps, args.ponder_T_init, args.ponder_T_final,
+            tau_frac=args.ponder_tau_frac,
+        )
+        cur_eps = ponder_exploration(
+            step, total_steps, args.eps_explore_init, args.eps_explore_final,
+        )
+        engine.module.snn.set_ponder_temperature(cur_T)
+        engine.module.snn.set_ponder_exploration(cur_eps)
 
         # Access inner SNNLanguageModel for last_loss + ponder_cost
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -132,6 +164,13 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
         if is_boundary:
             engine.module.snn.compensate_modulation_gradients()
         engine.step()
+
+        # v3 PonderNet: gradient-free bias balancing (AFTER step)
+        if is_boundary:
+            engine.module.snn.update_ponder_bias(
+                lr_bias=args.bias_balancing_lr,
+                ema_decay=args.bias_balancing_ema,
+            )
 
         valid = loss_mask.sum()
         if world > 1:
@@ -206,7 +245,23 @@ def main():
     ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
     ap.add_argument("--warmup_iters", type=int, default=500)
     ap.add_argument("--grad_clip", type=float, default=1.0)
-    ap.add_argument("--ponder_weight", type=float, default=0.0)
+    ap.add_argument("--ponder_weight", type=float, default=0.0,
+                    help="Weight for ponder_cost (E[k_t]) added to CE loss. 0 = pure CE.")
+    # v3 PonderNet schedule
+    ap.add_argument("--ponder_T_init", type=float, default=2.0,
+                    help="Initial Gumbel temperature (high = explore)")
+    ap.add_argument("--ponder_T_final", type=float, default=0.3,
+                    help="Final Gumbel temperature (low = near hard argmax)")
+    ap.add_argument("--ponder_tau_frac", type=float, default=0.1,
+                    help="T anneal time constant as fraction of total_steps")
+    ap.add_argument("--eps_explore_init", type=float, default=0.05,
+                    help="Forced-exploration prob at step 0")
+    ap.add_argument("--eps_explore_final", type=float, default=0.01,
+                    help="Forced-exploration prob at end of training")
+    ap.add_argument("--bias_balancing_lr", type=float, default=1e-3,
+                    help="Gradient-free bias update step size")
+    ap.add_argument("--bias_balancing_ema", type=float, default=0.99,
+                    help="EMA decay for usage statistics")
     # Checkpoint
     ap.add_argument("--out_dir", default="checkpoints_v3/")
     ap.add_argument("--resume", default=None, help="resume (load model + step/tokens)")

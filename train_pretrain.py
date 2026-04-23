@@ -128,6 +128,11 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             if step % 10000 == 0 and rank == 0:
                 print(f"  [skip→resume] {step}/{start_step}")
             continue
+        # Smoke-test early stop
+        if args.max_steps is not None and step >= args.max_steps:
+            if is_main():
+                log(f"  Reached --max_steps {args.max_steps}, exiting.")
+            return tokens_seen
 
         X = X.to(device, non_blocking=True)
         Y = Y.to(device, non_blocking=True)
@@ -250,6 +255,8 @@ def main():
     ap.add_argument("--num_workers", type=int, default=8)
     # Training
     ap.add_argument("--epochs", type=int, default=1)
+    ap.add_argument("--max_steps", type=int, default=None,
+                    help="Early-stop training after N steps (smoke tests).")
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--accumulation_steps", type=int, default=64)
     ap.add_argument("--learning_rate", type=float, default=2e-4,

@@ -22,7 +22,31 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
+from neuronspark import modeling_neuronspark as mns
 from utils.param_groups import promote_neuron_params_fp32
+
+
+def _install_v1_shims():
+    """Monkey-patch plif_*_forward_v2 to use V1 kernels, for A/B comparison.
+
+    V1 returns (output, V_post, None) / (output, V_post). We need v2 signature
+    (output, v_last) — but since v_last semantically is V_post[-1], we just
+    return (output, V_post[-1]) where V_post[-1] is a VIEW (the original V1
+    behavior of holding the storage across steps).
+    """
+    _orig_parallel = mns.plif_parallel_forward
+    _orig_rowparam = mns.plif_rowparam_forward
+
+    def _v1_parallel(beta, u, v_th, v_init):
+        output, V_post, _ = _orig_parallel(beta, u, v_th, v_init)
+        return output, V_post[-1]    # VIEW — pins V_post storage via .v assignment
+
+    def _v1_rowparam(beta_row, u, v_th_row, v_init):
+        output, V_post = _orig_rowparam(beta_row, u, v_th_row, v_init)
+        return output, V_post[-1]    # VIEW
+
+    mns.plif_parallel_forward_v2 = _v1_parallel
+    mns.plif_rowparam_forward_v2 = _v1_rowparam
 
 
 def run_model(batch: int, seq: int, cfg_kwargs: dict, n_steps: int = 2):
@@ -65,14 +89,21 @@ if __name__ == "__main__":
     ap.add_argument("--layers", type=int, default=6)
     ap.add_argument("--D_ff", type=int, default=1536)
     ap.add_argument("--vocab_size", type=int, default=1024)
+    ap.add_argument("--use_v1", action="store_true",
+                    help="Monkey-patch plif_*_forward_v2 to use V1 (V_post view) for A/B comparison.")
     args = ap.parse_args()
 
     cfg = dict(
         D=args.D, N=args.N, K=args.K, num_layers=args.layers, D_ff=args.D_ff,
         vocab_size=args.vocab_size, memory_layer_interval=4,
     )
+    mode = "V1 (V_post view)" if args.use_v1 else "V2 (v_last clone)"
     print(f"Config: {cfg}")
+    print(f"Mode:   {mode}")
     print(f"Batch={args.batch}, Seq={args.seq}, n_steps=2\n")
+
+    if args.use_v1:
+        _install_v1_shims()
 
     peak, nparams = run_model(args.batch, args.seq, cfg, n_steps=2)
     print(f"Peak GPU memory: {peak:.3f} GB (params: {nparams:.3f} B)")

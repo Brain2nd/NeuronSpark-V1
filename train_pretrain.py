@@ -33,7 +33,9 @@ from transformers import AutoTokenizer
 from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
 from nsdata.pretrain_dataset import PretrainDataset
 from utils.dashboard import SNNDashboard
-from utils.param_groups import build_param_groups, promote_neuron_params_fp32
+from utils.param_groups import (
+    build_param_groups, build_muon_param_groups, promote_neuron_params_fp32,
+)
 
 warnings.filterwarnings("ignore")
 
@@ -250,7 +252,14 @@ def main():
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--accumulation_steps", type=int, default=64)
-    ap.add_argument("--learning_rate", type=float, default=2e-4)
+    ap.add_argument("--learning_rate", type=float, default=2e-4,
+                    help="Base LR for Adam (non-Muon params). Neuron LR = base * neuron_lr_mult.")
+    ap.add_argument("--optimizer", choices=["muon", "adam"], default="muon",
+                    help="muon = MuonWithAuxAdam hybrid (default, forces ZeRO stage=0). "
+                         "adam = pure Adam.")
+    ap.add_argument("--muon_lr", type=float, default=0.02,
+                    help="Muon LR for matrix params (only used when --optimizer muon).")
+    ap.add_argument("--muon_momentum", type=float, default=0.95)
     ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
     ap.add_argument("--warmup_iters", type=int, default=500)
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -300,11 +309,38 @@ def main():
             tokens_seen = ts.get("tokens_seen", 0)
             log(f"  Resume: step={start_step}, tokens={tokens_seen:,}")
 
-    # Optimizer
-    param_groups = build_param_groups(
-        model, learning_rate=args.learning_rate, neuron_lr_mult=args.neuron_lr_mult,
-    )
-    optimizer = torch.optim.Adam(param_groups)
+    # Optimizer: Muon (default) or Adam
+    if args.optimizer == "muon":
+        from muon import MuonWithAuxAdam
+        param_groups = build_muon_param_groups(
+            model,
+            muon_lr=args.muon_lr,
+            muon_momentum=args.muon_momentum,
+            adam_base_lr=args.learning_rate,
+            adam_embed_lr=args.learning_rate,
+            neuron_lr_mult=args.neuron_lr_mult,
+        )
+        optimizer = MuonWithAuxAdam(param_groups)
+        # Muon asserts strict group keys on init; inject lr_mult AFTER init
+        # so cosine_lr scheduler can scale per-group LR properly.
+        for g in optimizer.param_groups:
+            if g.get("use_muon"):
+                g["lr_mult"] = 1.0              # Muon LR not cosine-scaled by neuron_lr_mult
+            else:
+                # Detect neuron group by larger initial LR
+                ratio = g["lr"] / args.learning_rate if args.learning_rate > 0 else 1.0
+                g["lr_mult"] = round(ratio, 4)  # 1.0 for embed/norm, neuron_lr_mult for neuron group
+        log(f"Optimizer: MuonWithAuxAdam (matrix→Muon lr={args.muon_lr} | "
+            f"embed/norm→Adam lr={args.learning_rate} | "
+            f"neuron→Adam lr={args.learning_rate * args.neuron_lr_mult})")
+    elif args.optimizer == "adam":
+        param_groups = build_param_groups(
+            model, learning_rate=args.learning_rate, neuron_lr_mult=args.neuron_lr_mult,
+        )
+        optimizer = torch.optim.Adam(param_groups)
+        log(f"Optimizer: Adam (base lr={args.learning_rate}, neuron × {args.neuron_lr_mult})")
+    else:
+        raise ValueError(f"Unknown --optimizer {args.optimizer}; choose 'muon' or 'adam'")
 
     # DeepSpeed
     ds_cfg_path = getattr(args, "deepspeed_config", "ds_config.json")
@@ -313,6 +349,11 @@ def main():
     ds_cfg["train_micro_batch_size_per_gpu"] = args.batch_size
     ds_cfg["gradient_accumulation_steps"] = args.accumulation_steps
     ds_cfg["gradient_clipping"] = args.grad_clip
+    # Muon has its own distributed-update mechanism (round-robin params + all_gather),
+    # incompatible with ZeRO-2 optimizer sharding. Force ZeRO stage=0 when using Muon.
+    if args.optimizer == "muon":
+        ds_cfg.setdefault("zero_optimization", {})["stage"] = 0
+        log(f"  (Muon requires ZeRO stage=0, config overridden)")
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_cfg,

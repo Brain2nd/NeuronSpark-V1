@@ -2858,6 +2858,7 @@ class SNNLanguageModel(nn.Module):
             'W_gate': [],
             'W_skip': [],
             'W_out': [],
+            'conv1d': [],               # Mamba-style depthwise short conv (3D weight)
             'b_beta': [],
             'b_alpha': [],
             'b_th': [],
@@ -2931,6 +2932,11 @@ class SNNLanguageModel(nn.Module):
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
+            # Depthwise short conv (Mamba-style). 3D weight (C, 1, kernel) — not
+            # matrix-orthogonalizable, so exclude from Muon group in downstream.
+            groups['conv1d'].append(block.conv1d.weight)
+            if block.conv1d.bias is not None:
+                groups['conv1d'].append(block.conv1d.bias)
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)

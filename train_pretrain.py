@@ -105,7 +105,11 @@ def load_model(args) -> tuple[NeuronSparkForCausalLM, AutoTokenizer, torch.devic
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
-    model = model.to(device=device, dtype=torch.bfloat16)
+    # Keep params in fp32. DeepSpeed manages bf16 mixed precision (bf16.enabled=true in
+    # ds_config.json): bf16 compute + fp32 master copy + fp32 optimizer state.
+    # Previously we did model.to(bfloat16) WITHOUT fp32 master → numerical drift on 1B+
+    # training. Fixed 2026-04-23.
+    model = model.to(device=device)
     n_promoted = promote_neuron_params_fp32(model)
     log(f"  Promoted {n_promoted} neuron params to fp32 master weights")
 

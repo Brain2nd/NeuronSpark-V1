@@ -128,6 +128,70 @@ def test_4_bias_update(engine):
     print(f"  ✓ bias Δ={bias_delta:.6f}, EMA Δ={ema_delta:.6f}, dtype=fp32")
 
 
+def test_7_ds_checkpoint_roundtrip(engine, ds_config_path):
+    """Verify save_checkpoint + load_checkpoint restores optimizer state.
+
+    Flow:
+      1. Take optimizer state snapshot
+      2. Save DS checkpoint
+      3. Take a training step (to dirty optimizer state)
+      4. Load DS checkpoint → optimizer should match snapshot
+    """
+    print("=== Test 7: DeepSpeed save_checkpoint / load_checkpoint round-trip ===")
+    import deepspeed, tempfile
+
+    cfg = engine.module.config
+    device = next(engine.parameters()).device
+
+    # Do one optimizer step to populate state
+    x = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
+    y = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
+    engine.module.snn.set_ponder_temperature(1.0)
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+        out = engine.module.snn(x, y)
+        loss = out.last_loss.mean()
+    engine.backward(loss)
+    engine.step()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # Save checkpoint
+        engine.save_checkpoint(tmp, tag="deepspeed")
+        # Verify directory created
+        ds_dir = os.path.join(tmp, "deepspeed")
+        assert os.path.isdir(ds_dir), f"deepspeed/ dir not created under {tmp}"
+
+        # Take snapshot of bias/ema
+        l0 = engine.module.snn.layers[0].ffn_k_predictor
+        snapshot_bias = l0.bias.clone()
+        snapshot_ema = l0._usage_ema.clone()
+
+        # Dirty the state: more steps + bias updates
+        for _ in range(3):
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = engine.module.snn(x, y)
+                loss = out.last_loss.mean()
+            engine.backward(loss)
+            engine.step()
+            engine.module.snn.update_ponder_bias(lr_bias=1e-3, ema_decay=0.99)
+
+        # Verify state has changed
+        bias_changed = (l0.bias - snapshot_bias).abs().max().item()
+        ema_changed = (l0._usage_ema - snapshot_ema).abs().max().item()
+        assert bias_changed > 0 or ema_changed > 0, "State did not diverge after extra steps"
+
+        # Load checkpoint
+        load_path, _ = engine.load_checkpoint(tmp, tag="deepspeed")
+        assert load_path is not None, "load_checkpoint returned None"
+
+        # Verify state restored
+        bias_diff = (l0.bias - snapshot_bias).abs().max().item()
+        ema_diff = (l0._usage_ema - snapshot_ema).abs().max().item()
+        print(f"  ✓ After restore: bias diff={bias_diff:.6e}, EMA diff={ema_diff:.6e}")
+        assert bias_diff < 1e-5, f"Bias not restored (diff={bias_diff})"
+        assert ema_diff < 1e-5, f"EMA not restored (diff={ema_diff})"
+        print(f"  ✓ DeepSpeed round-trip preserves optimizer + bias + EMA state")
+
+
 def test_5_gumbel_rng_determinism():
     print("=== Test 5: Gradient-checkpoint + Gumbel RNG determinism ===")
     cfg = make_config()
@@ -194,13 +258,14 @@ def main():
     test_5_gumbel_rng_determinism()
     test_6_save_load_roundtrip()
 
-    # Tests 2-4 need DeepSpeed engine
+    # Tests 2-4 + 7 need DeepSpeed engine
     if args.deepspeed_config and os.path.isfile(args.deepspeed_config):
         engine = test_2_ds_engine_wrap(args.deepspeed_config)
         test_3_fwd_bwd(engine)
         test_4_bias_update(engine)
+        test_7_ds_checkpoint_roundtrip(engine, args.deepspeed_config)
     else:
-        print("=== Tests 2-4 SKIPPED (no --deepspeed_config) ===")
+        print("=== Tests 2-4, 7 SKIPPED (no --deepspeed_config) ===")
         print("    Run with: deepspeed --num_gpus=1 scripts/test_v3_ponder_ds.py --deepspeed_config ds_config.json")
 
     print("\nAll compat tests passed ✓")

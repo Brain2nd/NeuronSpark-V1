@@ -202,20 +202,25 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             )
 
         if (step + 1) % args.save_interval == 0:
+            save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
+            # HF-format weights (rank 0 only, for eval / HF publish)
             if is_main():
                 engine.module.eval()
-                save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
                 torch.save({
                     "step": step + 1,
                     "epoch": epoch,
                     "tokens_seen": tokens_seen,
                 }, os.path.join(save_dir, "training_state.pth"))
-                log(f"  → saved {save_dir}")
+                log(f"  → saved HF weights to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
                 engine.module.train()
             dist.barrier()
+            # DeepSpeed checkpoint (ALL ranks call, writes ZeRO-sharded optimizer state)
+            engine.save_checkpoint(save_dir, tag="deepspeed")
+            if is_main():
+                log(f"  → saved DeepSpeed optimizer state to {save_dir}/deepspeed/")
 
     return tokens_seen
 
@@ -308,6 +313,25 @@ def main():
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_cfg,
     )
+
+    # Resume DeepSpeed checkpoint (ZeRO-sharded optimizer state + model weights)
+    # Must happen AFTER deepspeed.initialize(). All ranks participate.
+    if args.resume and os.path.isdir(args.resume):
+        ds_tag_dir = os.path.join(args.resume, "deepspeed")
+        if os.path.isdir(ds_tag_dir):
+            log(f"Resuming DeepSpeed checkpoint from {args.resume}/deepspeed/")
+            load_path, client_state = engine.load_checkpoint(
+                args.resume, tag="deepspeed",
+                load_optimizer_states=True,
+                load_lr_scheduler_states=True,
+                load_module_only=False,
+            )
+            if load_path is None:
+                raise RuntimeError(f"DeepSpeed resume failed from {args.resume}/deepspeed/")
+            log(f"  ✓ DeepSpeed state restored (optimizer + model weights)")
+        else:
+            log(f"WARN: --resume dir has no deepspeed/ subdir; "
+                f"model weights already loaded via from_pretrained, optimizer is FRESH.")
 
     # Data
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0

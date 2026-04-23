@@ -78,6 +78,7 @@ class SNNDashboard:
         self._log_beta_distribution(step, snn)
         self._log_dynamic_k(step, snn)
         self._log_associative_memory(step, snn)
+        self._log_ponder_collapse(step, snn)   # v3: K collapse detection
         self._log_health(step, snn)
 
     def log_save_point(self, step, model):
@@ -286,6 +287,109 @@ class SNNDashboard:
                         if s[0] > 1e-8:
                             eff_rank = (s / s[0]).sum().item()
                             w.add_scalar(f"memory/layer_{i:02d}/effective_rank", eff_rank, step)
+
+    # ====== 7a. v3 PonderNet K-collapse detection ======
+
+    def _log_ponder_collapse(self, step, snn):
+        """Detect per-layer halt-distribution collapse (v3 PonderNet).
+
+        Per KPredictor (`block_k_predictor` / `ffn_k_predictor`), we inspect the
+        running usage EMA (batch-averaged soft-halt probabilities across tokens)
+        and the gradient-free `bias` buffer:
+
+          1. usage_entropy      = H(usage_ema) / log(K)         in [0, 1]
+                                  0 = full collapse to single k
+                                  1 = uniform across k
+          2. usage_min / max    = smallest / largest bin's EMA share
+          3. dead_k             = fraction of k bins with EMA < 0.01 (under-used)
+          4. bias_range         = max(bias) - min(bias)
+          5. bias_at_clamp      = count of bias components at ±5 clamp
+          6. global summary     : fraction of layers in collapse state
+
+        Plus per-step diagnostic:
+          7. y_hard_entropy     = entropy of the current step's batch one-hot
+                                  (high = diverse token picks, low = all pick same k)
+        """
+        import math
+        w = self._writer
+        collapse_count_block = 0
+        collapse_count_ffn = 0
+        total_block = total_ffn = 0
+
+        for i, layer in enumerate(snn.layers):
+            # Per-sublayer: block (only SNNDecoderLayer) + ffn (both layer types)
+            for sublayer_name, attr in (("block", "block_k_predictor"),
+                                         ("ffn", "ffn_k_predictor")):
+                kp = getattr(layer, attr, None)
+                if kp is None:
+                    continue
+                K = kp.K
+
+                with torch.no_grad():
+                    usage = kp._usage_ema.float()          # (K,)
+                    bias = kp.bias.float()                  # (K,)
+
+                    # Normalize usage (should already sum to ~1)
+                    usage = usage / usage.sum().clamp(min=1e-8)
+
+                    # 1. Entropy / log(K) ∈ [0, 1]
+                    ent = -(usage * torch.log(usage.clamp(min=1e-8))).sum().item()
+                    norm_ent = ent / math.log(K)
+
+                    # 2. min / max bin share
+                    usage_min = usage.min().item()
+                    usage_max = usage.max().item()
+
+                    # 3. dead k fraction (usage < 0.01 = less than 1% of mass)
+                    dead_k = (usage < 0.01).float().mean().item()
+
+                    # 4. bias range (imbalance)
+                    bias_range = (bias.max() - bias.min()).item()
+                    # 5. bias saturation (at ±5 clamp)
+                    bias_at_clamp = ((bias.abs() > 4.9).float().sum().item())
+
+                    tag = f"ponder/layer_{i:02d}/{sublayer_name}"
+                    w.add_scalar(f"{tag}/usage_entropy_norm", norm_ent, step)
+                    w.add_scalar(f"{tag}/usage_min", usage_min, step)
+                    w.add_scalar(f"{tag}/usage_max", usage_max, step)
+                    w.add_scalar(f"{tag}/dead_k_fraction", dead_k, step)
+                    w.add_scalar(f"{tag}/bias_range", bias_range, step)
+                    w.add_scalar(f"{tag}/bias_at_clamp_count", bias_at_clamp, step)
+
+                    # Detailed usage histogram per bin
+                    for kk in range(K):
+                        w.add_scalar(f"{tag}/usage_k{kk:02d}", usage[kk].item(), step)
+
+                    # 7. Current-step y_hard entropy (batch-averaged)
+                    last_y_attr = f"_last_y_hard_{sublayer_name}"
+                    last_y = getattr(layer, last_y_attr, None)
+                    if last_y is not None and last_y.numel() > 0:
+                        # last_y: (..., K) one-hot. Batch-mean gives per-k usage this step.
+                        step_usage = last_y.float().reshape(-1, K).mean(dim=0)
+                        step_usage = step_usage / step_usage.sum().clamp(min=1e-8)
+                        step_ent = -(step_usage * torch.log(step_usage.clamp(min=1e-8))).sum().item()
+                        w.add_scalar(f"{tag}/step_entropy_norm", step_ent / math.log(K), step)
+
+                    # Collapse threshold: norm_entropy < 0.5 AND dead_k > 0.3
+                    collapsed = (norm_ent < 0.5) and (dead_k > 0.3)
+                    if sublayer_name == "block":
+                        total_block += 1
+                        if collapsed: collapse_count_block += 1
+                    else:
+                        total_ffn += 1
+                        if collapsed: collapse_count_ffn += 1
+
+        # Global summary
+        if total_block > 0:
+            w.add_scalar("ponder/global/collapsed_block_layers_frac",
+                         collapse_count_block / total_block, step)
+        if total_ffn > 0:
+            w.add_scalar("ponder/global/collapsed_ffn_layers_frac",
+                         collapse_count_ffn / total_ffn, step)
+        total = total_block + total_ffn
+        if total > 0:
+            w.add_scalar("ponder/global/collapse_any_frac",
+                         (collapse_count_block + collapse_count_ffn) / total, step)
 
     # ====== 7. health ======
 

@@ -113,7 +113,10 @@ def main():
         print("  ✓ 3 training steps, loss decreasing, no NaN")
 
     # ==== DS save/load round-trip ====
-    shared_dir = "/tmp/muon_ds_ckpt_test"
+    # Use /workspace (data disk) not /tmp (20G system disk) to avoid filling up
+    shared_dir = os.environ.get("MUON_TEST_CKPT_DIR",
+                                 "/workspace/tmp/muon_ds_ckpt_test"
+                                 if os.path.isdir("/workspace") else "/tmp/muon_ds_ckpt_test")
     if rank == 0:
         if os.path.isdir(shared_dir):
             shutil.rmtree(shared_dir)

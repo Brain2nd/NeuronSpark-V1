@@ -39,6 +39,12 @@ def main():
                     help="keller = upstream KellerJordan; moonshot = our Moonshot-scaled variant.")
     ap.add_argument("--zero_stage", type=int, default=0, choices=[0, 1, 2],
                     help="DeepSpeed ZeRO stage to force for this test (default 0).")
+    ap.add_argument("--optimizer", choices=["muon", "adam"], default="muon",
+                    help="muon = MuonWithAuxAdam, adam = plain AdamW (for ZeRO-2 compat test).")
+    ap.add_argument("--config", default=None,
+                    help="Optional path to a NeuronSparkConfig JSON (overrides tiny defaults).")
+    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--seq", type=int, default=16)
     args, _ = ap.parse_known_args()
 
     import deepspeed
@@ -47,24 +53,29 @@ def main():
     else:
         from utils.muon_moonshot import MoonshotMuonWithAuxAdam as MuonWithAuxAdam
 
-    cfg = NeuronSparkConfig(
-        D=128, N=2, K=6, num_layers=4, D_ff=256,
-        vocab_size=256, memory_layer_interval=2,
-    )
+    if args.config:
+        cfg = NeuronSparkConfig(**json.load(open(args.config)))
+    else:
+        cfg = NeuronSparkConfig(
+            D=128, N=2, K=6, num_layers=4, D_ff=256,
+            vocab_size=256, memory_layer_interval=2,
+        )
     m = NeuronSparkForCausalLM(cfg).cuda().to(torch.bfloat16)
     promote_neuron_params_fp32(m)
 
-    pg = build_muon_param_groups(m)
-    opt = MuonWithAuxAdam(pg)
-    # Inject lr_mult post-init (Muon asserts strict group keys on init)
-    for g in opt.param_groups:
-        g["lr_mult"] = 1.0
+    if args.optimizer == "muon":
+        pg = build_muon_param_groups(m)
+        opt = MuonWithAuxAdam(pg)
+        # Inject lr_mult post-init (Muon asserts strict group keys on init)
+        for g in opt.param_groups:
+            g["lr_mult"] = 1.0
+    else:  # adam
+        opt = torch.optim.AdamW(m.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
 
     with open(args.deepspeed_config) as f:
         ds_cfg = json.load(f)
-    ds_cfg["train_micro_batch_size_per_gpu"] = 1
+    ds_cfg["train_micro_batch_size_per_gpu"] = args.batch
     ds_cfg["gradient_accumulation_steps"] = 1
-    # Force requested ZeRO stage (Muon was historically locked to 0)
     ds_cfg.setdefault("zero_optimization", {})["stage"] = args.zero_stage
 
     engine, optimizer, _, _ = deepspeed.initialize(
@@ -73,13 +84,15 @@ def main():
     rank = dist.get_rank()
     world = dist.get_world_size()
     if rank == 0:
-        print(f"=== Muon({args.muon_variant}) + DS ZeRO-{args.zero_stage} on {world} GPUs ===")
+        print(f"=== {args.optimizer}({args.muon_variant if args.optimizer=='muon' else ''}) + DS ZeRO-{args.zero_stage} "
+              f"on {world} GPUs, bs={args.batch} seq={args.seq} ===")
 
     device = next(engine.parameters()).device
-    x = torch.randint(0, cfg.vocab_size, (1, 16), device=device)
-    y = torch.randint(0, cfg.vocab_size, (1, 16), device=device)
+    x = torch.randint(0, cfg.vocab_size, (args.batch, args.seq), device=device)
+    y = torch.randint(0, cfg.vocab_size, (args.batch, args.seq), device=device)
 
     # ==== Training steps ====
+    torch.cuda.reset_peak_memory_stats(device)
     losses = []
     for step in range(3):
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -89,6 +102,9 @@ def main():
         engine.step()
         assert not torch.isnan(loss).item(), f"rank {rank}: NaN at step {step}"
         losses.append(loss.item())
+    peak_mem = torch.cuda.max_memory_allocated(device) / 1e9
+    if rank == 0:
+        print(f"  peak memory (rank 0): {peak_mem:.2f} GB")
     if rank == 0:
         print(f"  step losses (rank 0): {[f'{l:.4f}' for l in losses]}")
         assert losses[-1] < losses[0] or losses[-1] < 5.8, f"Loss not decreasing: {losses}"

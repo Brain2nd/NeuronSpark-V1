@@ -1857,6 +1857,12 @@ class KPredictor(nn.Module):
 
         Called once per training step AFTER optimizer.step().
 
+        DeepSpeed compat:
+          - Buffers are replicated across ranks (not sharded by ZeRO-2).
+          - Each rank sees only its own micro-batch in `y_hard`, so without sync
+            every rank would drift to a different bias → we all-reduce usage
+            across ranks so the update is identical everywhere.
+
         Args:
             y_hard: (..., K) one-hot selection tensor from this step's forward
             lr_bias: bias learning rate (typical 1e-3)
@@ -1864,14 +1870,18 @@ class KPredictor(nn.Module):
         """
         if y_hard.numel() == 0:
             return
-        # Aggregate y_hard over all leading dims except K
+        # Aggregate y_hard over all leading dims except K (cast to fp32 for stable mean)
         usage = y_hard.float().reshape(-1, self.K).mean(dim=0)  # (K,)
-        # EMA-smooth
-        self._usage_ema.mul_(ema_decay).add_(usage, alpha=1.0 - ema_decay)
+        # All-reduce usage across ranks so bias stays in sync
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(usage, op=dist.ReduceOp.AVG)
+        # EMA-smooth (fp32 arithmetic via _usage_ema being promoted to fp32)
+        self._usage_ema.mul_(ema_decay).add_(usage.to(self._usage_ema.dtype), alpha=1.0 - ema_decay)
         # Deviation from uniform
         diff = self._usage_ema - (1.0 / self.K)
         # Underused → raise bias; overused → lower bias
-        self.bias.add_(-lr_bias * diff)
+        self.bias.add_(-lr_bias * diff.to(self.bias.dtype))
         # Clamp to avoid runaway drift
         self.bias.clamp_(-self._BIAS_CLAMP, self._BIAS_CLAMP)
 
@@ -2622,6 +2632,9 @@ class SNNLanguageModel(nn.Module):
             return layer_mod.forward_parallel(x)  # 统一返回 (h, ponder_cost)
 
         for layer_module in self.layers:
+            # use_reentrant=False 在 PyTorch 2.x 默认自动 preserve RNG state,
+            # 所以 Gumbel-Softmax 的 torch.rand 在 forward / backward recompute
+            # 产生相同随机序列 → _last_y_hard_block/ffn 在 recompute 后仍是原值.
             h, pc = checkpoint(
                 _layer_forward, layer_module, h,
                 use_reentrant=False,

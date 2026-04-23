@@ -31,19 +31,28 @@ def _get_inner_snn(model: nn.Module):
 
 
 def promote_neuron_params_fp32(model: nn.Module) -> int:
-    """Cast neuron-specific parameters to fp32 master weights.
+    """Cast neuron-specific parameters + PonderNet bias buffers to fp32.
 
-    These parameters (LIF β/α/threshold, gain `w`, `v_th`) need fp32 precision
+    Neuron parameters (LIF β/α/threshold, gain `w`, `v_th`) need fp32 precision
     because sigmoid/softplus saturate in bf16 and tiny updates get quantized
-    away. Matrix weights stay bf16 via autocast in model forward.
+    away. PonderNet `bias` / `_usage_ema` buffers need fp32 because
+    EMA-accumulation of small fractions in bf16 loses signal entirely.
 
-    Returns number of parameters promoted.
+    Matrix weights stay bf16 via autocast in model forward.
+
+    Returns number of tensors promoted.
     """
     count = 0
     for name, p in model.named_parameters():
         if name.endswith((".w", ".v_th", ".b_beta", ".b_alpha", ".b_th")):
             if p.dtype != torch.float32:
                 p.data = p.data.float()
+                count += 1
+    # PonderNet KPredictor buffers: bias + _usage_ema
+    for name, buf in model.named_buffers():
+        if name.endswith((".bias", "._usage_ema")) and "k_predictor" in name:
+            if buf.dtype != torch.float32:
+                buf.data = buf.data.float()
                 count += 1
     return count
 

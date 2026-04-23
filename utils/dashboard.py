@@ -125,13 +125,18 @@ class SNNDashboard:
             prefix = f"layer_{i:02d}"
 
             if not hasattr(layer, "snn_block"):
-                # Associative-memory layer
-                for name in ("neuron_k", "neuron_v", "neuron_q", "neuron_gate"):
+                # v3 SNNAttentionDecoderLayer: gate_neuron (write gate) + input_neuron2 (FFN)
+                for name in ("gate_neuron", "input_neuron2"):
                     neuron = getattr(layer, name, None)
                     if neuron is not None and hasattr(neuron, "w"):
                         semantics.append(
                             (f"{prefix}/mem_{name}_beta", neuron.w, torch.sigmoid, "beta")
                         )
+                # FFN PLIF neurons in memory layers (gate/up)
+                if hasattr(layer, "snn_ffn"):
+                    ffn = layer.snn_ffn
+                    semantics.append((f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w, torch.sigmoid, "beta"))
+                    semantics.append((f"{prefix}/ffn_up_beta", ffn.up_neuron.w, torch.sigmoid, "beta"))
                 continue
 
             block = layer.snn_block
@@ -209,28 +214,19 @@ class SNNDashboard:
     # ====== 4. PonderNet E[K] ======
 
     def _log_dynamic_k(self, step, snn):
+        """Per-layer E[k_t] extrema (set by each layer's forward as diagnostic).
+
+        v3: `block_halt` / `ffn_halt` modules removed; detailed k_predictor weight
+        monitoring lives in `_log_ponder_gradients`. This method keeps only the
+        cheap _ek_min/_ek_max scalars set by `_ponder_aggregate_v3` for timeline.
+        """
         w = self._writer
         for i, layer in enumerate(snn.layers):
-            if hasattr(layer, "block_halt"):
-                ek_min = getattr(layer, "_ek_min", None)
-                ek_max = getattr(layer, "_ek_max", None)
-                if ek_min is not None:
-                    w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
-                    w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
-                with torch.no_grad():
-                    for name, halt in [("block_halt", layer.block_halt),
-                                        ("ffn_halt", layer.ffn_halt)]:
-                        w.add_scalar(f"halt/layer_{i:02d}/{name}/weight_norm",
-                                     halt.weight.data.norm().item(), step)
-            elif hasattr(layer, "ffn_halt"):
-                ek_min = getattr(layer, "_ek_min", None)
-                ek_max = getattr(layer, "_ek_max", None)
-                if ek_min is not None:
-                    w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
-                    w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
-                with torch.no_grad():
-                    w.add_scalar(f"halt/layer_{i:02d}/ffn_halt/weight_norm",
-                                 layer.ffn_halt.weight.data.norm().item(), step)
+            ek_min = getattr(layer, "_ek_min", None)
+            ek_max = getattr(layer, "_ek_max", None)
+            if ek_min is not None:
+                w.add_scalar(f"ponder/layer_{i:02d}/ek_min", ek_min, step)
+                w.add_scalar(f"ponder/layer_{i:02d}/ek_max", ek_max, step)
 
     # ====== 5. β distribution ======
 
@@ -285,21 +281,32 @@ class SNNDashboard:
     # ====== 6. associative memory ======
 
     def _log_associative_memory(self, step, snn):
+        """v3 SNNAttentionDecoderLayer M_state monitoring.
+
+        Each SNNAttentionDecoderLayer maintains `self.M_state` — a per-forward
+        cumulative K-V associative memory. Dashboard tracks its norm and
+        effective rank as diagnostics for long-range retrieval health.
+        """
         w = self._writer
         for i, layer in enumerate(snn.layers):
-            if not hasattr(layer, "neuron_gate"):
-                continue
-            M = getattr(layer, "M", None)
-            if M is not None and not isinstance(M, float):
-                for g in range(M.shape[0]):
-                    w.add_scalar(f"memory/layer_{i:02d}/M_group{g}_norm", M[g].norm().item(), step)
-                with torch.no_grad():
-                    M_last = M[-1, 0] if M.dim() == 4 else M[-1]
-                    if M_last.numel() > 0:
-                        s = torch.linalg.svdvals(M_last.float())
-                        if s[0] > 1e-8:
-                            eff_rank = (s / s[0]).sum().item()
-                            w.add_scalar(f"memory/layer_{i:02d}/effective_rank", eff_rank, step)
+            M = getattr(layer, "M_state", None)
+            if M is None or isinstance(M, (int, float)):
+                continue  # 未初始化 / 非联想记忆层
+            with torch.no_grad():
+                w.add_scalar(f"memory/layer_{i:02d}/M_state_norm", M.norm().item(), step)
+                # 有效秩: if 2D+ matrix, compute σ-ratio-based effective rank
+                if M.dim() >= 2 and M.numel() > 0:
+                    M_last = M[-1] if M.dim() >= 3 else M
+                    if M_last.dim() >= 2 and M_last.numel() > 0:
+                        try:
+                            s = torch.linalg.svdvals(M_last.float())
+                            if s[0] > 1e-8:
+                                eff_rank = (s / s[0]).sum().item()
+                                w.add_scalar(
+                                    f"memory/layer_{i:02d}/effective_rank", eff_rank, step,
+                                )
+                        except RuntimeError:
+                            pass  # SVD may fail on tiny/degenerate M
 
     # ====== 7a. v3 PonderNet K-collapse detection ======
 

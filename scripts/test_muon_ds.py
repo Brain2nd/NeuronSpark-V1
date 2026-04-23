@@ -71,8 +71,8 @@ def main():
         # Inject lr_mult post-init (Muon asserts strict group keys on init)
         for g in opt.param_groups:
             g["lr_mult"] = 1.0
-    else:  # adam
-        opt = torch.optim.AdamW(m.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
+    else:  # adam (plain, matches train_pretrain.py production)
+        opt = torch.optim.Adam(m.parameters(), lr=1e-4, betas=(0.9, 0.95), eps=1e-8)
 
     with open(args.deepspeed_config) as f:
         ds_cfg = json.load(f)

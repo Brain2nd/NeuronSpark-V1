@@ -37,6 +37,8 @@ def main():
     ap.add_argument("--local_rank", type=int, default=-1)
     ap.add_argument("--muon_variant", choices=["keller", "moonshot"], default="moonshot",
                     help="keller = upstream KellerJordan; moonshot = our Moonshot-scaled variant.")
+    ap.add_argument("--zero_stage", type=int, default=0, choices=[0, 1, 2],
+                    help="DeepSpeed ZeRO stage to force for this test (default 0).")
     args, _ = ap.parse_known_args()
 
     import deepspeed
@@ -62,8 +64,8 @@ def main():
         ds_cfg = json.load(f)
     ds_cfg["train_micro_batch_size_per_gpu"] = 1
     ds_cfg["gradient_accumulation_steps"] = 1
-    # Muon requires ZeRO stage=0 (its own distributed strategy)
-    ds_cfg.setdefault("zero_optimization", {})["stage"] = 0
+    # Force requested ZeRO stage (Muon was historically locked to 0)
+    ds_cfg.setdefault("zero_optimization", {})["stage"] = args.zero_stage
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=m, optimizer=opt, config=ds_cfg,
@@ -71,7 +73,7 @@ def main():
     rank = dist.get_rank()
     world = dist.get_world_size()
     if rank == 0:
-        print(f"=== Muon({args.muon_variant}) + DS ZeRO-0 on {world} GPUs ===")
+        print(f"=== Muon({args.muon_variant}) + DS ZeRO-{args.zero_stage} on {world} GPUs ===")
 
     device = next(engine.parameters()).device
     x = torch.randint(0, cfg.vocab_size, (1, 16), device=device)

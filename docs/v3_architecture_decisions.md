@@ -170,6 +170,75 @@ Token 预算 10/25/80B、EN/ZH 比例、代码多语种、context 长度、pretr
 
 ---
 
+## v3 PLIF 神经元生物化改造 (2026-04-23, 已实现)
+
+### 动机
+
+V2.5 传层间信号是 `(1-β)·V_post` "膜电位泄漏量" —— 几乎永不为零 (~100% 稠密)。
+脉冲稀疏 bench (Stage 2) 证明：这种架构下"spike=0 跳 GEMM 行"的思路不成立。
+
+用户提出生物学修正：**神经元发放的实际电流 = 超阈量 (V_pre - V_th)，离子流直到 V 降回 V_th**。
+这与 IF/LIF 神经元模型的传统"配额发放 (每次减 V_th)"不同，更符合钠通道打开的物理机制。
+
+### 具体改动 (neuronspark/modeling_neuronspark.py)
+
+**数学**：
+
+```
+V_pre[k]  = β · V_post[k-1] + u[k]            (充电, 与 V2.5 相同)
+output[k] = max(V_pre[k] - V_th, 0)            (★新: 超阈电流, ReLU, 天然稀疏)
+V_post[k] = V_pre[k] - output[k] = min(V_pre[k], V_th)   (★新: 降到阈值)
+```
+
+**相比 V2.5 变化**：
+- 输出从 `(1-β)·V_post` (连续幅度泄漏，稠密) → `max(V_pre - V_th, 0)` (超阈电流，稀疏)
+- Soft reset 从 `V_post = V_pre - V_th·spike` → `V_post = min(V_pre, V_th)`
+- Surrogate Sigmoid 梯度替换为精确 ReLU 梯度 (无近似, 训练更稳)
+
+**生物语义**：
+- 神经元发放 = 超过阈值触发钠通道 → 离子流出量 = V_pre - V_th
+- 离子持续流出直到 V 降回 V_th (而非配额地减 V_th)
+- 未发放 (V_pre ≤ V_th) 时无电流流出，output = 0
+
+### 实测稀疏度 (小模型 D=128 K=6 4 层, untrained)
+
+| Tensor | 严格零比例 | 说明 |
+|---|---:|---|
+| gate_out (PLIF gate 输出) | 89% | 发放率 ~11% |
+| up_out (PLIF up 输出) | 89% | 同上 |
+| gate × up | **98.5%** | 两个 sparse 乘积, 进 down_proj 的输入 |
+
+down_proj GEMM 输入 98% 稀疏 → Stage 3 写 Triton sparse kernel 时有真实加速空间。
+
+### 涉及代码位置
+
+- 2 个 Triton forward kernel + 2 个 backward kernel (`_fused_plif_fwd/bwd_kernel` / `_fused_plif_fwd/bwd_rowparam_kernel`)
+- 2 个 autograd Function (`_TritonPLIFForward` / `_TritonPLIFRowParamForward`)
+- `plif_parallel_forward` / `plif_rowparam_forward` Python wrappers (含 CPU fallback)
+- `PLIFNode.forward` (single_step)
+- `SelectivePLIFNode.single_step_forward`
+- `SNNBlock.forward_parallel` (`output_hidden` → W_out，之前传 V_post_hidden)
+- `SNNFFN.forward_parallel` + `single_step_forward`
+- `SNNDecoderLayer._input_neuron_parallel`
+- `SNNAttentionDecoderLayer._input_neuron_parallel` + `_gate_neuron_parallel`
+- `SNNLanguageModel._output_neuron_parallel`
+
+### 回归测试 (通过)
+
+- CUDA forward + backward (non-DS): ✓
+- DS engine wrap + forward/backward/step: ✓
+- update_ponder_bias under DS: ✓
+- save_pretrained / from_pretrained round-trip: ✓
+- Gumbel RNG determinism: ✓
+
+### 待观察
+
+- 训练初期稀疏率会怎么演化 (初始化随机, 后期训练可能稳在 30-70%)
+- V_th 和 β 初始化需要调以获得合理初始发放率 (当前偏高 89%)
+- bf16 下 abs_mean ≈ 1e-3 量级, 需留意是否有 underflow 风险
+
+---
+
 ## 已放弃方案（避免回头讨论）
 
 - ❌ **MoE / Spike-gated MoE**：1B 规模不值得

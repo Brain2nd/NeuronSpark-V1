@@ -387,21 +387,24 @@ if _HAS_TRITON:
     @triton.jit
     def _fused_plif_fwd_kernel(
         BETA_ptr, U_ptr, VTH_ptr, INIT_ptr,
-        SPIKE_ptr, VPOST_ptr,
+        OUTPUT_ptr, VPOST_ptr,
         K, num_cols,
         BLOCK: tl.constexpr,
     ):
-        """Fused PLIF forward: single-pass sequential scan with inline spike + soft reset.
+        """Bio-inspired PLIF forward: super-threshold current output (ReLU-like).
 
-        Exact computation — sequential scan IS the ground truth.
-        Replaces the 3-phase approach (linear scan + spike iteration + correction).
-
-        Per column (parallel across batch*D):
+        NEW semantics (v3, 2026-04-22):
           v = v_init
           for k = 0..K-1:
-            v_pre = beta[k]*v + u[k]
-            spike[k] = Θ(v_pre - v_th[k])
-            v = v_pre - v_th[k]*spike[k]
+            v_pre[k] = beta[k]*v + u[k]
+            output[k] = max(v_pre[k] - v_th[k], 0)   # super-threshold ion current
+            v = v_pre[k] - output[k]                  # = min(v_pre[k], v_th[k])
+
+        Biological interpretation:
+          - output[k] is the current (ions) flowing out when v_pre exceeds threshold.
+          - Reset: membrane clamps to v_th (after complete discharge to equilibrium).
+          - output is naturally SPARSE (= 0 when v_pre <= v_th), enabling sparse GEMM
+            downstream. ReLU gradient is exact (no surrogate approximation needed).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -416,35 +419,41 @@ if _HAS_TRITON:
             vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             v_pre = beta * v + u
-            spike = tl.where(v_pre >= vth, 1.0, 0.0)
-            v = v_pre - vth * spike  # soft reset
+            output = tl.maximum(v_pre - vth, 0.0)   # super-threshold current (ReLU)
+            v = v_pre - output                       # = min(v_pre, vth) (clamp)
 
-            tl.store(SPIKE_ptr + off, spike, mask=mask)
+            tl.store(OUTPUT_ptr + off, output, mask=mask)
             tl.store(VPOST_ptr + off, v, mask=mask)
 
     @triton.jit
     def _fused_plif_bwd_kernel(
-        BETA_ptr, VTH_ptr, INIT_ptr, VPOST_ptr, SPIKE_ptr,
-        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        BETA_ptr, VTH_ptr, INIT_ptr, VPOST_ptr, OUTPUT_ptr,
+        GRAD_OUTPUT_ptr, GRAD_VPOST_ptr,
         GRAD_BETA_ptr, GRAD_U_ptr, GRAD_VTH_ptr, GRAD_INIT_ptr,
-        K, num_cols, ALPHA,
+        K, num_cols,
         BLOCK: tl.constexpr,
     ):
-        """Fused PLIF backward: single reverse pass with Sigmoid surrogate gradient.
+        """Bio-inspired PLIF backward: exact ReLU gradient (no surrogate).
 
-        V_pre[k] = V_post[k] + v_th[k]*spike[k]  (reconstructed)
-        surrogate_grad(x) = alpha * sigmoid(alpha*x) * (1 - sigmoid(alpha*x))
-        where x = V_pre[k] - v_th[k] = V_post[k] - v_th[k]*(1 - spike[k])
+        Forward:
+          v_pre[k]   = beta[k] * v_post[k-1] + u[k]
+          s[k]       = 1 if v_pre[k] > v_th[k] else 0    (fire indicator)
+          output[k]  = max(v_pre[k] - v_th[k], 0) = (v_pre[k] - v_th[k]) · s[k]
+          v_post[k]  = v_pre[k] - output[k] = v_pre[k]·(1-s[k]) + v_th[k]·s[k]
+
+        Partial derivatives:
+          ∂output/∂v_pre = s       ∂output/∂v_th = -s
+          ∂v_post/∂v_pre = 1 - s   ∂v_post/∂v_th = s
 
         Reverse accumulation:
           acc = 0
           for k = K-1 downto 0:
-            total_gV = grad_V_post[k] + acc
-            sg = surrogate_grad(V_pre[k] - v_th[k])
-            grad_v_pre = grad_spike[k]*sg + total_gV
-            grad_beta[k] = grad_v_pre * V_post[k-1]
-            grad_u[k] = grad_v_pre
-            grad_v_th[k] = -grad_spike[k]*sg - total_gV*spike[k]
+            s = (output[k] > 0) ? 1 : 0
+            total_gV = grad_v_post[k] + acc
+            grad_v_pre = grad_output[k] * s + total_gV * (1 - s)
+            grad_u[k]  = grad_v_pre
+            grad_beta[k] = grad_v_pre * v_post[k-1]
+            grad_v_th[k] = s * (total_gV - grad_output[k])
             acc = grad_v_pre * beta[k]
           grad_v_init = acc
         """
@@ -459,14 +468,12 @@ if _HAS_TRITON:
             off = k * num_cols + cols
 
             beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            v_post = tl.load(VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            output = tl.load(OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
-            g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            g_out = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
             g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
-            # V_post[k-1]
+            # v_post[k-1]
             if k > 0:
                 v_prev = tl.load(
                     VPOST_ptr + (k - 1) * num_cols + cols,
@@ -475,19 +482,15 @@ if _HAS_TRITON:
             else:
                 v_prev = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-            # Sigmoid surrogate gradient
-            x = v_post - vth * (1.0 - spike)  # = V_pre - v_th
-            neg_ax = -ALPHA * x
-            neg_ax = tl.where(neg_ax > 88.0, 88.0, neg_ax)  # prevent exp overflow
-            sig = 1.0 / (1.0 + tl.exp(neg_ax))
-            sg = ALPHA * sig * (1.0 - sig)
+            # Exact ReLU gradient: s = 1 if fired (output > 0) else 0
+            s = tl.where(output > 0.0, 1.0, 0.0)
 
             total_gV = g_V + acc
-            grad_v_pre = g_s * sg + total_gV
+            grad_v_pre = g_out * s + total_gV * (1.0 - s)
 
             tl.store(GRAD_BETA_ptr + off, grad_v_pre * v_prev, mask=mask)
             tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
-            tl.store(GRAD_VTH_ptr + off, -g_s * sg - total_gV * spike, mask=mask)
+            tl.store(GRAD_VTH_ptr + off, s * (total_gV - g_out), mask=mask)
 
             acc = grad_v_pre * beta
 
@@ -501,14 +504,17 @@ if _HAS_TRITON:
     @triton.jit
     def _fused_plif_fwd_rowparam_kernel(
         BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, INIT_ptr,
-        SPIKE_ptr, VPOST_ptr,
+        OUTPUT_ptr, VPOST_ptr,
         K, num_cols,
         BLOCK: tl.constexpr,
     ):
-        """Fused PLIF forward with row-parameter beta and v_th.
+        """Bio-inspired PLIF forward (row-parameter β/v_th, constant across K).
 
-        beta and v_th are (*shape) — constant across K steps, loaded once into registers.
-        Reduces global memory reads from 3 per step (beta, u, v_th) to 1 (u only).
+        Same math as _fused_plif_fwd_kernel but β/v_th are row-constant, loaded
+        once into registers. Reduces HBM reads from 3 per step to 1 (u only).
+
+          output[k] = max(beta*v + u[k] - v_th, 0)
+          v         = min(beta*v + u[k], v_th)
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -523,31 +529,30 @@ if _HAS_TRITON:
             u = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             v_pre = beta * v + u
-            spike = tl.where(v_pre >= vth, 1.0, 0.0)
-            v = v_pre - vth * spike
+            output = tl.maximum(v_pre - vth, 0.0)
+            v = v_pre - output                       # = min(v_pre, vth)
 
-            tl.store(SPIKE_ptr + off, spike, mask=mask)
+            tl.store(OUTPUT_ptr + off, output, mask=mask)
             tl.store(VPOST_ptr + off, v, mask=mask)
 
     @triton.jit
     def _fused_plif_bwd_rowparam_kernel(
-        BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr, VPOST_ptr, SPIKE_ptr,
-        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr, VPOST_ptr, OUTPUT_ptr,
+        GRAD_OUTPUT_ptr, GRAD_VPOST_ptr,
         GRAD_BETA_ROW_ptr, GRAD_U_ptr, GRAD_VTH_ROW_ptr, GRAD_INIT_ptr,
-        K, num_cols, ALPHA,
+        K, num_cols,
         BLOCK: tl.constexpr,
     ):
-        """Fused PLIF backward with row-parameter beta/v_th.
+        """Bio-inspired PLIF backward (row-parameter, exact ReLU gradient).
 
-        Gradients for beta and v_th are accumulated over K steps (reduction in registers).
-        Returns grad_beta_row (*shape) and grad_v_th_row (*shape) instead of per-step gradients.
+        beta/v_th accumulate gradients over K steps in registers.
+        Recovery: s = (output > 0), no surrogate needed.
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
 
         beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-        vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_beta = tl.zeros([BLOCK], dtype=tl.float32)
@@ -557,10 +562,9 @@ if _HAS_TRITON:
             k = K - 1 - k_rev
             off = k * num_cols + cols
 
-            v_post = tl.load(VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            output = tl.load(OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
-            g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            g_out = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
             g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             if k > 0:
@@ -571,21 +575,16 @@ if _HAS_TRITON:
             else:
                 v_prev = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-            # Sigmoid surrogate gradient
-            x = v_post - vth * (1.0 - spike)
-            neg_ax = -ALPHA * x
-            neg_ax = tl.where(neg_ax > 88.0, 88.0, neg_ax)
-            sig = 1.0 / (1.0 + tl.exp(neg_ax))
-            sg = ALPHA * sig * (1.0 - sig)
+            # Exact ReLU gradient
+            s = tl.where(output > 0.0, 1.0, 0.0)
 
             total_gV = g_V + acc
-            grad_v_pre = g_s * sg + total_gV
+            grad_v_pre = g_out * s + total_gV * (1.0 - s)
 
             tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
 
-            # Accumulate gradients for row parameters (reduction over K in registers)
             acc_grad_beta += grad_v_pre * v_prev
-            acc_grad_vth += -g_s * sg - total_gV * spike
+            acc_grad_vth += s * (total_gV - g_out)
 
             acc = grad_v_pre * beta
 
@@ -603,7 +602,7 @@ if _HAS_TRITON:
         _BLOCK = 128
 
         @staticmethod
-        def forward(ctx, beta_row, u, v_th_row, v_init, alpha):
+        def forward(ctx, beta_row, u, v_th_row, v_init):
             beta_row_c = beta_row.contiguous()
             u_c = u.contiguous()
             v_th_row_c = v_th_row.contiguous()
@@ -612,7 +611,7 @@ if _HAS_TRITON:
             K = u_c.shape[0]
             num_cols = u_c[0].numel()
 
-            spike = torch.empty_like(u_c)
+            output = torch.empty_like(u_c)
             V_post = torch.empty_like(u_c)
 
             BLOCK = _TritonPLIFRowParamForward._BLOCK
@@ -620,32 +619,30 @@ if _HAS_TRITON:
 
             _fused_plif_fwd_rowparam_kernel[grid](
                 beta_row_c, u_c, v_th_row_c, v_init_c,
-                spike, V_post,
+                output, V_post,
                 K, num_cols,
                 BLOCK=BLOCK,
             )
 
             if any(ctx.needs_input_grad[:4]):
-                ctx.save_for_backward(beta_row_c, v_th_row_c, v_init_c, V_post, spike)
+                ctx.save_for_backward(beta_row_c, v_th_row_c, v_init_c, V_post, output)
             ctx.K = K
             ctx.num_cols = num_cols
-            ctx.alpha = alpha
 
-            return spike, V_post
+            return output, V_post
 
         @staticmethod
-        def backward(ctx, grad_spike, grad_V_post):
-            beta_row, v_th_row, v_init, V_post, spike = ctx.saved_tensors
+        def backward(ctx, grad_output, grad_V_post):
+            beta_row, v_th_row, v_init, V_post, output = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
-            alpha = ctx.alpha
 
-            if grad_spike is None:
-                grad_spike = torch.zeros_like(spike)
+            if grad_output is None:
+                grad_output = torch.zeros_like(output)
             if grad_V_post is None:
                 grad_V_post = torch.zeros_like(V_post)
 
-            grad_spike_c = grad_spike.contiguous()
+            grad_output_c = grad_output.contiguous()
             grad_V_post_c = grad_V_post.contiguous()
 
             grad_beta_row = torch.empty_like(beta_row)
@@ -657,14 +654,14 @@ if _HAS_TRITON:
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
 
             _fused_plif_bwd_rowparam_kernel[grid](
-                beta_row, v_th_row, v_init, V_post, spike,
-                grad_spike_c, grad_V_post_c,
+                beta_row, v_th_row, v_init, V_post, output,
+                grad_output_c, grad_V_post_c,
                 grad_beta_row, grad_u, grad_v_th_row, grad_v_init,
-                K, num_cols, float(alpha),
+                K, num_cols,
                 BLOCK=BLOCK,
             )
 
-            return grad_beta_row, grad_u, grad_v_th_row, grad_v_init, None
+            return grad_beta_row, grad_u, grad_v_th_row, grad_v_init
 
     class _TritonPLIFForward(torch.autograd.Function):
         """Fused Triton PLIF forward + backward.
@@ -683,7 +680,7 @@ if _HAS_TRITON:
         _BLOCK = 128
 
         @staticmethod
-        def forward(ctx, beta, u, v_th, v_init, alpha):
+        def forward(ctx, beta, u, v_th, v_init):
             beta_c = beta.contiguous()
             u_c = u.contiguous()
             v_th_c = v_th.contiguous()
@@ -692,7 +689,7 @@ if _HAS_TRITON:
             K = beta_c.shape[0]
             num_cols = beta_c[0].numel()
 
-            spike = torch.empty_like(u_c)
+            output = torch.empty_like(u_c)
             V_post = torch.empty_like(u_c)
 
             BLOCK = _TritonPLIFForward._BLOCK
@@ -700,32 +697,30 @@ if _HAS_TRITON:
 
             _fused_plif_fwd_kernel[grid](
                 beta_c, u_c, v_th_c, v_init_c,
-                spike, V_post,
+                output, V_post,
                 K, num_cols,
                 BLOCK=BLOCK,
             )
 
             if any(ctx.needs_input_grad[:4]):
-                ctx.save_for_backward(beta_c, v_th_c, v_init_c, V_post, spike)
+                ctx.save_for_backward(beta_c, v_th_c, v_init_c, V_post, output)
             ctx.K = K
             ctx.num_cols = num_cols
-            ctx.alpha = alpha
 
-            return spike, V_post
+            return output, V_post
 
         @staticmethod
-        def backward(ctx, grad_spike, grad_V_post):
-            beta, v_th, v_init, V_post, spike = ctx.saved_tensors
+        def backward(ctx, grad_output, grad_V_post):
+            beta, v_th, v_init, V_post, output = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
-            alpha = ctx.alpha
 
-            if grad_spike is None:
-                grad_spike = torch.zeros_like(spike)
+            if grad_output is None:
+                grad_output = torch.zeros_like(output)
             if grad_V_post is None:
                 grad_V_post = torch.zeros_like(V_post)
 
-            grad_spike_c = grad_spike.contiguous()
+            grad_output_c = grad_output.contiguous()
             grad_V_post_c = grad_V_post.contiguous()
 
             grad_beta = torch.empty_like(beta)
@@ -737,14 +732,14 @@ if _HAS_TRITON:
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
 
             _fused_plif_bwd_kernel[grid](
-                beta, v_th, v_init, V_post, spike,
-                grad_spike_c, grad_V_post_c,
+                beta, v_th, v_init, V_post, output,
+                grad_output_c, grad_V_post_c,
                 grad_beta, grad_u, grad_v_th, grad_v_init,
-                K, num_cols, float(alpha),
+                K, num_cols,
                 BLOCK=BLOCK,
             )
 
-            return grad_beta, grad_u, grad_v_th, grad_v_init, None
+            return grad_beta, grad_u, grad_v_th, grad_v_init
 
 # ============================================================
 # Hillis-Steele parallel prefix scan (CPU fallback)
@@ -825,144 +820,88 @@ def plif_parallel_forward(
     v_th: torch.Tensor,
     v_init: torch.Tensor,
     max_iter: int = 3,
-    surrogate_function=None,
+    surrogate_function=None,  # kept for API-compat; ignored in bio-ReLU path
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    PLIF 神经元的并行前向传播（soft reset，surrogate gradient 兼容）。
+    Bio-inspired PLIF forward pass (v3, super-threshold current output).
 
-    求解:
-      V_pre[k] = beta[k] * V_post[k-1] + u[k]
-      s[k] = Θ(V_pre[k] - v_th[k])
-      V_post[k] = V_pre[k] - v_th[k] * s[k]
+    Computes:
+        V_pre[k]  = beta[k] * V_post[k-1] + u[k]
+        output[k] = max(V_pre[k] - v_th[k], 0)   # ReLU: super-threshold amount
+        V_post[k] = V_pre[k] - output[k]          # = min(V_pre[k], v_th[k])
 
-    方法:
-      Phase 1: 线性轨迹 parallel scan（有梯度）
-      Phase 2: spike 不动点迭代（detach，确定离散 spike pattern）
-      Phase 3: 用 converged spike pattern 重算 V_post（有梯度），
-               surrogate_function(V_pre - v_th) 生成可微 spike 输出
+    Triton path (CUDA): fused kernel, exact ReLU gradient.
+    CPU fallback: sequential Python loop (slow but correct).
 
     Args:
         beta:  (K, *shape) — 衰减系数
         u:     (K, *shape) — 输入 α·I
         v_th:  (K, *shape) — 动态阈值
         v_init: (*shape) — 初始膜电位
-        max_iter: spike 不动点迭代次数上限
-        surrogate_function: surrogate gradient 函数（如 surrogate.Sigmoid(alpha=4.0)）
-                           None 时退化为硬阈值（无梯度）
+        max_iter / surrogate_function: deprecated no-ops (kept for call-site compat)
 
     Returns:
-        spike: (K, *shape) — spike 模式（有 surrogate gradient）
-        V_post: (K, *shape) — 发放后膜电位
-        V_pre: (K, *shape) — 发放前膜电位（fused path 返回 None）
+        output: (K, *shape) — 超阈值电流 (sparse, ReLU)
+        V_post: (K, *shape) — 发放后膜电位 (= min(V_pre, v_th))
+        V_pre:  always None (no longer reconstructed)
     """
-    # Fused Triton path: single-pass sequential scan (exact, no iteration)
-    # Replaces 3-phase approach with 1 kernel launch — ~3x faster forward, ~5x faster backward
-    if (_HAS_TRITON and beta.is_cuda and surrogate_function is not None
-            and hasattr(surrogate_function, 'alpha')
-            and type(surrogate_function).__name__ == 'Sigmoid'):
-        alpha = float(surrogate_function.alpha)
-        spike, V_post = _TritonPLIFForward.apply(beta, u, v_th, v_init, alpha)
-        return spike, V_post, None
+    if _HAS_TRITON and beta.is_cuda:
+        output, V_post = _TritonPLIFForward.apply(beta, u, v_th, v_init)
+        return output, V_post, None
 
-    # Fallback: 3-phase approach (CPU, non-Sigmoid surrogates, or no surrogate)
-    # Phase 1: 线性轨迹 V_L (假设从不发放)
-    V_L = linear_recurrence(beta, u, v_init)  # (K, *shape)
+    # CPU / non-CUDA fallback: sequential loop (correct, slow)
+    K = u.shape[0]
+    outputs = []
+    V_posts = []
+    v = v_init if isinstance(v_init, torch.Tensor) else torch.zeros_like(u[0])
+    for k in range(K):
+        v_pre = beta[k] * v + u[k]
+        output = F.relu(v_pre - v_th[k])   # super-threshold current (sparse)
+        v = v_pre - output                  # = min(v_pre, v_th[k])
+        outputs.append(output)
+        V_posts.append(v)
+    return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0), None
 
-    # Phase 2: Spike 不动点迭代（全部 detach，不建立梯度图）
-    # 目的：确定哪些神经元在哪些步发放（离散决策）
-    with torch.no_grad():
-        V_L_det = V_L.detach()
-        beta_det = beta.detach()
-        v_th_det = v_th.detach()
-        v_init_det = v_init.detach() if isinstance(v_init, torch.Tensor) else v_init
-
-        spike_pattern = (V_L_det >= v_th_det).float()
-
-        for _ in range(max_iter - 1):
-            # 计算 ΔS: ΔS[k] = beta[k] * ΔS[k-1] + v_th[k] * s[k]
-            delta_S = linear_recurrence(
-                beta_det, v_th_det * spike_pattern,
-                torch.zeros_like(v_init_det) if isinstance(v_init_det, torch.Tensor)
-                else torch.zeros_like(V_L_det[0]),
-            )
-
-            # ΔS_prev = ΔS[k-1]（位移一步）
-            delta_S_prev = torch.zeros_like(delta_S)
-            delta_S_prev[1:] = delta_S[:-1]
-
-            # V_pre = V_L - beta * ΔS_prev
-            V_pre_det = V_L_det - beta_det * delta_S_prev
-
-            # 更新 spike
-            spike_new = (V_pre_det >= v_th_det).float()
-
-            # 收敛检查
-            if torch.equal(spike_new, spike_pattern):
-                break
-            spike_pattern = spike_new
-
-    # Phase 3: 用 converged spike pattern 重算 V_post（有完整梯度）
-    # spike_pattern 是 detached 的，作为常数参与计算
-    # 梯度通过 u, v_th, beta, v_init 流动
-    u_eff = u - v_th * spike_pattern
-    V_post = linear_recurrence(beta, u_eff, v_init)  # (K, *shape)
-
-    # 重建 V_pre（有梯度，用于 surrogate gradient）
-    V_post_prev = torch.zeros_like(V_post)
-    if isinstance(v_init, torch.Tensor):
-        V_post_prev[0] = v_init
-    V_post_prev[1:] = V_post[:-1]
-    V_pre = beta * V_post_prev + u
-
-    # 生成可微 spike 输出
-    if surrogate_function is not None:
-        # forward: Heaviside(V_pre - v_th), backward: surrogate gradient
-        spike = surrogate_function(V_pre - v_th)
-    else:
-        # 退化模式：硬阈值，无梯度
-        spike = (V_pre >= v_th).float()
-
-    return spike, V_post, V_pre
 
 def plif_rowparam_forward(
     beta_row: torch.Tensor,
     u: torch.Tensor,
     v_th_row: torch.Tensor,
     v_init: torch.Tensor,
-    surrogate_function=None,
+    surrogate_function=None,  # deprecated, kept for API-compat
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    行参数 PLIF 前向：beta 和 v_th 在 K 步中保持恒定。
-
-    比 plif_parallel_forward 快 ~40%（省去 expand+contiguous，减少 2/3 显存读取）。
-    用于 ParametricLIFNode（固定 beta/v_th）或合并多个固定参数神经元。
+    Bio-inspired PLIF forward (row-parameter, β/v_th constant across K).
 
     Args:
-        beta_row: (*shape) — 每列的衰减率（所有 K 步相同）
-        u:        (K, *shape) — 每步输入
-        v_th_row: (*shape) — 每列的阈值（所有 K 步相同）
+        beta_row: (*shape) — 每列的衰减率 (所有 K 步相同)
+        u:        (K, *shape) — 每步输入 (α·I)
+        v_th_row: (*shape) — 每列的阈值 (所有 K 步相同)
         v_init:   (*shape) — 初始膜电位
-        surrogate_function: surrogate gradient 函数
+        surrogate_function: deprecated no-op (kept for call-site compat)
 
     Returns:
-        spike:  (K, *shape) — spike 模式
+        output: (K, *shape) — 超阈值电流 (sparse)
         V_post: (K, *shape) — 发放后膜电位
     """
-    if (_HAS_TRITON and u.is_cuda and surrogate_function is not None
-            and hasattr(surrogate_function, 'alpha')
-            and type(surrogate_function).__name__ == 'Sigmoid'):
-        alpha = float(surrogate_function.alpha)
-        spike, V_post = _TritonPLIFRowParamForward.apply(
-            beta_row, u, v_th_row, v_init, alpha,
+    if _HAS_TRITON and u.is_cuda:
+        output, V_post = _TritonPLIFRowParamForward.apply(
+            beta_row, u, v_th_row, v_init,
         )
-        return spike, V_post
+        return output, V_post
 
-    # Fallback: expand to full (K, *shape) and use standard path
+    # CPU fallback: sequential loop
     K = u.shape[0]
-    beta = beta_row.unsqueeze(0).expand(K, *u.shape[1:]).contiguous()
-    v_th = v_th_row.unsqueeze(0).expand(K, *u.shape[1:]).contiguous()
-    spike, V_post, _ = plif_parallel_forward(beta, u, v_th, v_init, surrogate_function=surrogate_function)
-    return spike, V_post
+    outputs = []
+    V_posts = []
+    v = v_init if isinstance(v_init, torch.Tensor) else torch.zeros_like(u[0])
+    for k in range(K):
+        v_pre = beta_row * v + u[k]
+        output = F.relu(v_pre - v_th_row)
+        v = v_pre - output
+        outputs.append(output)
+        V_posts.append(v)
+    return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0)
 
 def plif_fixed_param_forward(
     beta,
@@ -1076,23 +1015,21 @@ class PLIFNode(MemoryModule):
 
     def forward(self, x):
         """
-        单步前向传播。
-
-        V[t] = β · V[t-1] + (1-β) · x[t], spike = Θ(V-V_th), soft reset。
-
-        Args:
-            x: 输入电流, shape (batch, dim)
+        单步 bio-inspired PLIF 前向:
+          V_pre  = β · V_{t-1} + (1-β) · x
+          output = max(V_pre - V_th, 0)   # 超阈电流 (ReLU, sparse)
+          V_t    = V_pre - output         # = min(V_pre, V_th) (降到阈值)
 
         Returns:
-            spike: 二值脉冲, shape (batch, dim), 值域 {0, 1}
+            output: 连续值 (超阈电流), shape (batch, dim), 非发放位置 == 0
         """
         if isinstance(self.v, float):
             self.v = torch.zeros_like(x)
         beta = self.beta
-        self.v = beta * self.v + (1.0 - beta) * x
-        spike = self.surrogate_function(self.v - self.v_th)
-        self.v = self.v - spike * self.v_th  # soft reset
-        return spike
+        v_pre = beta * self.v + (1.0 - beta) * x
+        output = F.relu(v_pre - self.v_th)
+        self.v = v_pre - output
+        return output
 
 
 # ============================================================
@@ -1136,7 +1073,10 @@ class SelectivePLIFNode(BaseNode):
         v_th: torch.Tensor,
     ) -> torch.Tensor:
         """
-        单步前向传播。
+        Bio-inspired 单步前向 (v3 超阈电流):
+          V_pre  = β(t) · V[t-1] + α(t) · I[t]
+          output = max(V_pre - V_th(t), 0)    # 超阈电流 (ReLU, sparse)
+          V[t]   = V_pre - output             # = min(V_pre, V_th(t))
 
         Args:
             x:    输入电流 I[t],   shape (batch, D*N)
@@ -1145,27 +1085,14 @@ class SelectivePLIFNode(BaseNode):
             v_th: 动态阈值 V_th(t), shape (batch, D*N), 值域 R+
 
         Returns:
-            spike: 二值脉冲 s[t],  shape (batch, D*N), 值域 {0, 1}
+            output: 超阈电流 (连续, sparse), shape (batch, D*N), 非发放位置 == 0
         """
-        # Phase 0: 首步将 v 从 float 扩展为与输入同形的张量
         self.v_float_to_tensor(x)
 
-        # Phase 1: Charge — 膜电位更新
-        # V[t] = β(t) · V[t-1] + α(t) · I[t]
-        self.v = beta * self.v + alpha * x
-
-        # Phase 2: Fire — 使用动态 v_th（不是 self.v_threshold）
-        # spike = Heaviside(V[t] - V_th(t))，反向用 surrogate gradient
-        spike = self.surrogate_function(self.v - v_th)
-
-        # Phase 3: Soft Reset — V[t] -= V_th(t) · s[t]
-        if self.detach_reset:
-            spike_d = spike.detach()
-        else:
-            spike_d = spike
-        self.v = self.v - spike_d * v_th
-
-        return spike
+        v_pre = beta * self.v + alpha * x
+        output = F.relu(v_pre - v_th)
+        self.v = v_pre - output
+        return output
 
     def extra_repr(self) -> str:
         return (
@@ -1471,23 +1398,19 @@ class SNNFFN(MemoryModule):
             v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
-        # Row-param PLIF scan: beta/v_th 从寄存器读取，不占显存带宽
-        spike_merged, V_post_merged = plif_rowparam_forward(
+        # Row-param bio-PLIF scan: output = max(V_pre - v_th, 0) (super-threshold current, sparse)
+        output_merged, V_post_merged = plif_rowparam_forward(
             beta_row, u_merged, v_th_row, v_init_merged,
-            surrogate_function=surr,
         )
 
-        # 激活值: (1-β)·V_post (膜电位泄漏量)
-        gate_v = V_post_merged[:, :, :D_ff]
-        up_v = V_post_merged[:, :, D_ff:]
+        # 超阈电流输出 (sparse): 非发放位置严格 == 0, 发放位置 = V_pre - V_th > 0
+        gate_out = output_merged[:, :, :D_ff]
+        up_out = output_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        gate_v = gate_v * (1.0 - beta_gate)
-        up_v = up_v * (1.0 - beta_up)
-
         # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
-        gated = gate_v * up_v  # (TK, batch, D_ff)
+        gated = gate_out * up_out  # (TK, batch, D_ff), sparser than gate_out alone
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
@@ -1496,31 +1419,25 @@ class SNNFFN(MemoryModule):
 
     def single_step_forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        单步前向传播。
-
-        Args:
-            x: 连续激活输入, shape (batch, D)
-
-        Returns:
-            continuous_out: 连续输出, shape (batch, D)
+        单步前向（推理 autoregressive 模式）。与 forward_parallel 等价:
+          output = max(β·v + (1-β)·proj(x) - v_th, 0)
         """
-        # 门控路径
-        _ = self.gate_neuron(self.gate_proj(x))
-        gate_v = self.gate_neuron.v
+        # 门控路径: 超阈电流输出
+        gate_u = (1.0 - self.gate_neuron.beta) * self.gate_proj(x)
+        gate_v_pre = self.gate_neuron.beta * self.gate_neuron.v + gate_u
+        gate_out = F.relu(gate_v_pre - self.gate_neuron.v_th)
+        self.gate_neuron.v = gate_v_pre - gate_out  # = min(v_pre, v_th)
 
         # 值路径
-        _ = self.up_neuron(self.up_proj(x))
-        up_v = self.up_neuron.v
+        up_u = (1.0 - self.up_neuron.beta) * self.up_proj(x)
+        up_v_pre = self.up_neuron.beta * self.up_neuron.v + up_u
+        up_out = F.relu(up_v_pre - self.up_neuron.v_th)
+        self.up_neuron.v = up_v_pre - up_out
 
-        gate_v = (1.0 - self.gate_neuron.beta) * gate_v
-        up_v = (1.0 - self.up_neuron.beta) * up_v
-
-        # 连续门控（对标 SwiGLU）
-        gated = gate_v * up_v
-
-        # 降维 + 残差
-        I_out = self.down_proj(gated) + self.skip_proj(x)  # R^D
-        return I_out  # 连续值
+        # SwiGLU 风格门控 + down
+        gated = gate_out * up_out
+        I_out = self.down_proj(gated) + self.skip_proj(x)
+        return I_out
 
 
 # ============================================================
@@ -1706,20 +1623,20 @@ class SNNBlock(MemoryModule):
         if isinstance(v_init_hidden, float):
             v_init_hidden = torch.zeros(batch, DN, device=flat.device, dtype=flat.dtype)
 
-        s_hidden, V_post_hidden, _ = plif_parallel_forward(
-            beta_all, u_hidden, v_th_all, v_init_hidden, max_iter=3,
-            surrogate_function=self.hidden_neuron.surrogate_function,
+        output_hidden, V_post_hidden, _ = plif_parallel_forward(
+            beta_all, u_hidden, v_th_all, v_init_hidden,
         )
 
-        # 更新隐神经元状态（保存末步供下次调用）
+        # 更新隐神经元状态（保存末步 V_post 供下次调用）
         self.hidden_neuron.v = V_post_hidden[-1].detach()
 
-        # ====== Phase 4: 输出投影（V_post → W_out: 连续梯度直通 β）======
-        # 用 V_post（膜电压）代替 spike 作为 W_out 输入，消除 surrogate 梯度瓶颈：
-        #   spike 路径: ∂spike/∂β = surrogate'(V-v_th) · V_prev ≈ 0（大部分时刻）
-        #   V_post 路径: ∂V_post/∂β = V_prev（无 surrogate 阻断，每步都有梯度）
-        v_flat = V_post_hidden.reshape(TK * batch, DN)
-        I_out_all = F.linear(v_flat, self.W_out.weight).reshape(TK, batch, D)
+        # ====== Phase 4: 输出投影（超阈电流 → W_out: ReLU 精确梯度 + sparse GEMM 潜力）======
+        # output_hidden = max(V_pre - v_th, 0) 是 bio-inspired 超阈电流输出:
+        #   - 发放时 output = V_pre - V_th > 0, 不发放时 output == 0 (严格稀疏)
+        #   - 生物上对应"离子流过突触"的量, W_out 只对"真正发放"的神经元做 GEMM
+        #   - 梯度 ∂output/∂V_pre = s (exact ReLU, 不需 surrogate)
+        out_flat = output_hidden.reshape(TK * batch, DN)
+        I_out_all = F.linear(out_flat, self.W_out.weight).reshape(TK, batch, D)
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
         # 子层级 output_neuron 已移除，改由层级 K 帧聚合处理（模型级 output_neuron 仍保留于 model.py）
@@ -2051,13 +1968,12 @@ class SNNDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        spike, V_post = plif_rowparam_forward(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
-            surrogate_function=input_neuron.surrogate_function,
         )
 
         input_neuron.v = V_post[-1].detach()
-        return ((1.0 - beta) * V_post).to(input_dtype)  # 膜电位泄漏量
+        return output.to(input_dtype)  # 超阈电流 (sparse, bio-ReLU)
 
     def _ponder_aggregate_v3(
         self,
@@ -2340,15 +2256,14 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        spike, V_post = plif_rowparam_forward(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
-            surrogate_function=input_neuron.surrogate_function,
         )
         input_neuron.v = V_post[-1].detach()
-        return ((1.0 - beta) * V_post).to(input_dtype)
+        return output.to(input_dtype)
 
     def _gate_neuron_parallel(self, h_normed):
-        """PLIFNode gate 的 parallel scan, 返回标量门控。"""
+        """PLIFNode gate 的 parallel scan, 返回标量门控 (bio-ReLU 超阈电流)。"""
         seq_len, batch, D = h_normed.shape
         input_dtype = h_normed.dtype
         beta_g = self.gate_neuron.beta.to(input_dtype)
@@ -2361,13 +2276,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta_g.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.gate_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        _, V_post_g = plif_rowparam_forward(
+        gate_out, V_post_g = plif_rowparam_forward(
             beta_row, u_g, v_th_row, v_init_g,
-            surrogate_function=self.gate_neuron.surrogate_function,
         )
         self.gate_neuron.v = V_post_g[-1].detach()
-        gate_activation = (1.0 - beta_g) * V_post_g
-        return gate_activation.mean(dim=-1, keepdim=True).to(input_dtype)
+        # gate_out 已经是超阈电流 (sparse, ReLU), 直接做 mean pool 作为标量门控
+        return gate_out.mean(dim=-1, keepdim=True).to(input_dtype)
 
     def _ponder_aggregate_v3(
         self,
@@ -2666,13 +2580,13 @@ class SNNLanguageModel(nn.Module):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        spike, V_post = plif_rowparam_forward(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
-            surrogate_function=self.output_neuron.surrogate_function,
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        return ((1.0 - beta) * V_post).to(input_dtype)
+        # 输出神经元: 传超阈电流 (sparse, bio-ReLU)
+        return output.to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。

@@ -1000,9 +1000,13 @@ class PLIFNode(MemoryModule):
         #    tau=2.0 时 w=0, β ∈ ~[0.38, 0.62]
         init_w = -math.log(init_tau - 1.0)
         self.w = nn.Parameter(torch.empty(dim).normal_(init_w, 0.5))
-        # v_th: 发放阈值，U[0.5x, 1.5x] 均匀分布产生维度间多样性
+        # v_th: 发放阈值. bio-ReLU 下 output = max(V_pre - V_th, 0),
+        # V_pre 在 init 时近似 N(0, σ²) 对称分布, 最大理论发放率 50% (V_th→0),
+        # 为让初始发放率贴近 40-50% 的健康区 (不是 dead-ReLU 区), v_th 初始范围
+        # 从旧 [0.5x, 1.5x] 缩小到 [0.05x, 0.3x]×v_threshold (均值约 0.18×).
+        # 每维保持多样性 (不同神经元有不同时间尺度 + 不同阈值).
         self.v_th = nn.Parameter(torch.empty(dim).uniform_(
-            v_threshold * 0.5, v_threshold * 1.5,
+            v_threshold * 0.05, v_threshold * 0.3,
         ))
         self.surrogate_function = surrogate_function
         # 膜电位状态（functional.reset_net 时重置为 0.）
@@ -1408,6 +1412,9 @@ class SNNFFN(MemoryModule):
         up_out = output_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
+        with torch.no_grad():
+            self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
+            self.up_neuron._last_firing_rate = (up_out > 0).float().mean().item()
 
         # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
         gated = gate_out * up_out  # (TK, batch, D_ff), sparser than gate_out alone
@@ -1629,6 +1636,8 @@ class SNNBlock(MemoryModule):
 
         # 更新隐神经元状态（保存末步 V_post 供下次调用）
         self.hidden_neuron.v = V_post_hidden[-1].detach()
+        with torch.no_grad():
+            self.hidden_neuron._last_firing_rate = (output_hidden > 0).float().mean().item()
 
         # ====== Phase 4: 输出投影（超阈电流 → W_out: ReLU 精确梯度 + sparse GEMM 潜力）======
         # output_hidden = max(V_pre - v_th, 0) 是 bio-inspired 超阈电流输出:
@@ -1973,6 +1982,9 @@ class SNNDecoderLayer(MemoryModule):
         )
 
         input_neuron.v = V_post[-1].detach()
+        # Diagnostic: 发放率 (bio-ReLU: output > 0 ≡ fired)
+        with torch.no_grad():
+            input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)  # 超阈电流 (sparse, bio-ReLU)
 
     def _ponder_aggregate_v3(
@@ -2260,6 +2272,8 @@ class SNNAttentionDecoderLayer(MemoryModule):
             beta_row, u, v_th_row, v_init,
         )
         input_neuron.v = V_post[-1].detach()
+        with torch.no_grad():
+            input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)
 
     def _gate_neuron_parallel(self, h_normed):
@@ -2279,6 +2293,8 @@ class SNNAttentionDecoderLayer(MemoryModule):
         gate_out, V_post_g = plif_rowparam_forward(
             beta_row, u_g, v_th_row, v_init_g,
         )
+        with torch.no_grad():
+            self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
         self.gate_neuron.v = V_post_g[-1].detach()
         # gate_out 已经是超阈电流 (sparse, ReLU), 直接做 mean pool 作为标量门控
         return gate_out.mean(dim=-1, keepdim=True).to(input_dtype)
@@ -2585,6 +2601,8 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
+        with torch.no_grad():
+            self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
         # 输出神经元: 传超阈电流 (sparse, bio-ReLU)
         return output.to(input_dtype)
 

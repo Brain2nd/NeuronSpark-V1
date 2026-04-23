@@ -92,6 +92,7 @@ class SNNDashboard:
         self._log_associative_memory(step, snn)
         self._log_ponder_collapse(step, snn)       # v3: K collapse statistics
         self._log_ponder_gradients(step, snn)      # v3: k_predictor grad health
+        self._log_firing_rates(step, snn)          # v3: real-time bio-ReLU firing rates
         self._log_health(step, snn)
 
     def log_save_point(self, step, model):
@@ -484,6 +485,146 @@ class SNNDashboard:
         if total_count > 0:
             w.add_scalar("ponder_grads/global/broken_net_fraction",
                          broken_count / total_count, step)
+
+    # ====== 7c. v3 Bio-ReLU firing rates + dead/seizure health ======
+
+    _DEAD_THRESHOLD = 0.05        # firing rate < 5% = dead
+    _SEIZURE_THRESHOLD = 0.80     # firing rate > 80% = seizure (over-activation)
+    _HEALTHY_LOW = 0.30           # 30-60% is healthy zone
+    _HEALTHY_HIGH = 0.60
+
+    def _log_firing_rates(self, step, snn):
+        """Real-time per-neuron-group firing rate + dead/seizure indices.
+
+        Reads `_last_firing_rate` (0-1 scalar) populated in each neuron's
+        forward_parallel path. These are BATCH-AVERAGED across (TK, batch, D),
+        so a per-group scalar rate is meaningful.
+
+        Multi-GPU: each rank writes its own firing rate (rank 0 only logs).
+        For a TRULY global view we'd all_reduce; local is fine for health
+        monitoring as rank-to-rank variation is small when data is i.i.d.
+
+        Per (layer, neuron_name):
+          - firing/rate      : fraction of positions with output > 0
+          - firing/is_dead   : 1 if rate < 5%
+          - firing/is_seizure: 1 if rate > 80%
+
+        Global summary:
+          - firing/global/mean_rate
+          - firing/global/dead_neurons_frac (neuron groups with rate < 5%)
+          - firing/global/seizure_neurons_frac (rate > 80%)
+          - firing/global/health_score (0=all dead/seizure, 1=all in 30-60%)
+        """
+        w = self._writer
+        all_rates: list[float] = []
+        dead_count = seizure_count = total_count = 0
+        healthy_count = 0
+
+        # Candidate neurons per layer (some only exist on specific layer types)
+        neuron_names_per_layer_type = {
+            "snn": ["input_neuron1", "input_neuron2", "output_neuron_snn_block_hidden"],
+            "mem": ["input_neuron2", "gate_neuron"],
+        }
+        # Global: output_neuron lives on SNNLanguageModel
+        out_rate = getattr(snn.output_neuron, "_last_firing_rate", None)
+        if out_rate is not None:
+            w.add_scalar("firing/global/output_neuron_rate", out_rate, step)
+            all_rates.append(out_rate)
+            total_count += 1
+            if out_rate < self._DEAD_THRESHOLD:
+                dead_count += 1
+            elif out_rate > self._SEIZURE_THRESHOLD:
+                seizure_count += 1
+            elif self._HEALTHY_LOW <= out_rate <= self._HEALTHY_HIGH:
+                healthy_count += 1
+
+        for i, layer in enumerate(snn.layers):
+            layer_tag = f"firing/layer_{i:02d}"
+
+            # Neurons that exist on SNNDecoderLayer
+            if hasattr(layer, "snn_block"):
+                # input_neuron1, input_neuron2 (PLIFNode row-param)
+                for nname in ("input_neuron1", "input_neuron2"):
+                    neuron = getattr(layer, nname, None)
+                    if neuron is None: continue
+                    rate = getattr(neuron, "_last_firing_rate", None)
+                    if rate is None: continue
+                    w.add_scalar(f"{layer_tag}/{nname}/rate", rate, step)
+                    all_rates.append(rate); total_count += 1
+                    is_dead = rate < self._DEAD_THRESHOLD
+                    is_seizure = rate > self._SEIZURE_THRESHOLD
+                    w.add_scalar(f"{layer_tag}/{nname}/is_dead", float(is_dead), step)
+                    w.add_scalar(f"{layer_tag}/{nname}/is_seizure", float(is_seizure), step)
+                    if is_dead: dead_count += 1
+                    elif is_seizure: seizure_count += 1
+                    elif self._HEALTHY_LOW <= rate <= self._HEALTHY_HIGH:
+                        healthy_count += 1
+
+                # SelectivePLIFNode (inside snn_block.hidden_neuron)
+                hid = layer.snn_block.hidden_neuron
+                hid_rate = getattr(hid, "_last_firing_rate", None)
+                if hid_rate is not None:
+                    w.add_scalar(f"{layer_tag}/block_hidden/rate", hid_rate, step)
+                    all_rates.append(hid_rate); total_count += 1
+                    if hid_rate < self._DEAD_THRESHOLD: dead_count += 1
+                    elif hid_rate > self._SEIZURE_THRESHOLD: seizure_count += 1
+                    elif self._HEALTHY_LOW <= hid_rate <= self._HEALTHY_HIGH:
+                        healthy_count += 1
+
+                # SNNFFN gate/up neurons
+                ffn = layer.snn_ffn
+                for nname in ("gate_neuron", "up_neuron"):
+                    neuron = getattr(ffn, nname, None)
+                    if neuron is None: continue
+                    rate = getattr(neuron, "_last_firing_rate", None)
+                    if rate is None: continue
+                    w.add_scalar(f"{layer_tag}/ffn_{nname}/rate", rate, step)
+                    all_rates.append(rate); total_count += 1
+                    if rate < self._DEAD_THRESHOLD: dead_count += 1
+                    elif rate > self._SEIZURE_THRESHOLD: seizure_count += 1
+                    elif self._HEALTHY_LOW <= rate <= self._HEALTHY_HIGH:
+                        healthy_count += 1
+
+            else:
+                # SNNAttentionDecoderLayer: gate_neuron + input_neuron2 + snn_ffn
+                for nname in ("gate_neuron", "input_neuron2"):
+                    neuron = getattr(layer, nname, None)
+                    if neuron is None: continue
+                    rate = getattr(neuron, "_last_firing_rate", None)
+                    if rate is None: continue
+                    w.add_scalar(f"{layer_tag}/{nname}/rate", rate, step)
+                    all_rates.append(rate); total_count += 1
+                    if rate < self._DEAD_THRESHOLD: dead_count += 1
+                    elif rate > self._SEIZURE_THRESHOLD: seizure_count += 1
+                    elif self._HEALTHY_LOW <= rate <= self._HEALTHY_HIGH:
+                        healthy_count += 1
+
+                # SNNFFN gate/up
+                if hasattr(layer, "snn_ffn"):
+                    ffn = layer.snn_ffn
+                    for nname in ("gate_neuron", "up_neuron"):
+                        neuron = getattr(ffn, nname, None)
+                        if neuron is None: continue
+                        rate = getattr(neuron, "_last_firing_rate", None)
+                        if rate is None: continue
+                        w.add_scalar(f"{layer_tag}/ffn_{nname}/rate", rate, step)
+                        all_rates.append(rate); total_count += 1
+                        if rate < self._DEAD_THRESHOLD: dead_count += 1
+                        elif rate > self._SEIZURE_THRESHOLD: seizure_count += 1
+                        elif self._HEALTHY_LOW <= rate <= self._HEALTHY_HIGH:
+                            healthy_count += 1
+
+        # Global summary
+        if total_count > 0:
+            w.add_scalar("firing/global/mean_rate",
+                         sum(all_rates) / total_count, step)
+            w.add_scalar("firing/global/dead_fraction",
+                         dead_count / total_count, step)
+            w.add_scalar("firing/global/seizure_fraction",
+                         seizure_count / total_count, step)
+            # Health score: 1.0 if all in 30-60% zone, 0 if all dead/seizure
+            health = healthy_count / total_count
+            w.add_scalar("firing/global/health_score", health, step)
 
     # ====== 7. health ======
 

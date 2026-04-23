@@ -12,7 +12,7 @@ class NeuronSparkConfig(PretrainedConfig):
         K=12,
         num_layers=24,
         D_ff=3072,
-        v_th_min=0.1,
+        v_th_min=0.02,  # bio-ReLU: 下调阈值下限提升初始发放率至健康区 30-50%
         memory_layer_interval=4,
         D_key=128,
         D_value=128,

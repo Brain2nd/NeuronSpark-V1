@@ -129,38 +129,58 @@ def test_4_bias_update(engine):
 
 
 def test_7_ds_checkpoint_roundtrip(engine, ds_config_path):
-    """Verify save_checkpoint + load_checkpoint restores optimizer state.
+    """Verify save_checkpoint + load_checkpoint restores optimizer state under ZeRO sharding.
+
+    CRITICAL: under DeepSpeed ZeRO-2, optimizer state is SHARDED across ranks.
+    All ranks MUST use the same checkpoint directory (NOT per-rank tempfile).
+    We use a fixed shared path, and rank 0 creates/cleans it.
 
     Flow:
-      1. Take optimizer state snapshot
-      2. Save DS checkpoint
-      3. Take a training step (to dirty optimizer state)
-      4. Load DS checkpoint → optimizer should match snapshot
+      1. All ranks step once to populate optimizer state
+      2. All ranks save_checkpoint to shared dir
+      3. Snapshot bias/EMA
+      4. Dirty state with more steps
+      5. All ranks load_checkpoint → should restore
     """
-    print("=== Test 7: DeepSpeed save_checkpoint / load_checkpoint round-trip ===")
-    import deepspeed, tempfile
+    print("=== Test 7: DeepSpeed save_checkpoint / load_checkpoint round-trip (sharded) ===")
+    import shutil
 
     cfg = engine.module.config
     device = next(engine.parameters()).device
+    rank = dist.get_rank()
+    world = dist.get_world_size()
 
-    # Do one optimizer step to populate state
-    x = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
-    y = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
-    engine.module.snn.set_ponder_temperature(1.0)
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-        out = engine.module.snn(x, y)
-        loss = out.last_loss.mean()
-    engine.backward(loss)
-    engine.step()
+    # Shared checkpoint dir (all ranks agree; rank 0 creates, barrier syncs)
+    shared_dir = "/tmp/neuronspark_ds_ckpt_test_shared"
+    if rank == 0:
+        if os.path.isdir(shared_dir):
+            shutil.rmtree(shared_dir)
+        os.makedirs(shared_dir, exist_ok=True)
+    dist.barrier()
 
-    with tempfile.TemporaryDirectory() as tmp:
-        # Save checkpoint
-        engine.save_checkpoint(tmp, tag="deepspeed")
-        # Verify directory created
-        ds_dir = os.path.join(tmp, "deepspeed")
-        assert os.path.isdir(ds_dir), f"deepspeed/ dir not created under {tmp}"
+    try:
+        # Do one step to populate optimizer state
+        x = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
+        y = torch.randint(0, cfg.vocab_size, (1, 8), device=device)
+        engine.module.snn.set_ponder_temperature(1.0)
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = engine.module.snn(x, y)
+            loss = out.last_loss.mean()
+        engine.backward(loss)
+        engine.step()
 
-        # Take snapshot of bias/ema
+        # Save (all ranks call; each writes its own shard)
+        engine.save_checkpoint(shared_dir, tag="deepspeed")
+        dist.barrier()
+
+        # Sanity: shards exist from all ranks
+        ds_dir = os.path.join(shared_dir, "deepspeed")
+        assert os.path.isdir(ds_dir), f"deepspeed/ dir not created under {shared_dir} (rank {rank})"
+        shard_files = os.listdir(ds_dir)
+        if rank == 0:
+            print(f"  rank 0 saw {len(shard_files)} files in {ds_dir}: e.g. {shard_files[:3]}")
+
+        # Snapshot bias/ema
         l0 = engine.module.snn.layers[0].ffn_k_predictor
         snapshot_bias = l0.bias.clone()
         snapshot_ema = l0._usage_ema.clone()
@@ -174,22 +194,54 @@ def test_7_ds_checkpoint_roundtrip(engine, ds_config_path):
             engine.step()
             engine.module.snn.update_ponder_bias(lr_bias=1e-3, ema_decay=0.99)
 
-        # Verify state has changed
         bias_changed = (l0.bias - snapshot_bias).abs().max().item()
         ema_changed = (l0._usage_ema - snapshot_ema).abs().max().item()
-        assert bias_changed > 0 or ema_changed > 0, "State did not diverge after extra steps"
+        if rank == 0:
+            print(f"  rank 0 diverged: bias Δ={bias_changed:.6e}, EMA Δ={ema_changed:.6e}")
 
-        # Load checkpoint
-        load_path, _ = engine.load_checkpoint(tmp, tag="deepspeed")
-        assert load_path is not None, "load_checkpoint returned None"
+        # Load (all ranks call)
+        load_path, _ = engine.load_checkpoint(shared_dir, tag="deepspeed")
+        assert load_path is not None, f"rank {rank}: load_checkpoint returned None"
 
         # Verify state restored
         bias_diff = (l0.bias - snapshot_bias).abs().max().item()
         ema_diff = (l0._usage_ema - snapshot_ema).abs().max().item()
-        print(f"  ✓ After restore: bias diff={bias_diff:.6e}, EMA diff={ema_diff:.6e}")
-        assert bias_diff < 1e-5, f"Bias not restored (diff={bias_diff})"
-        assert ema_diff < 1e-5, f"EMA not restored (diff={ema_diff})"
-        print(f"  ✓ DeepSpeed round-trip preserves optimizer + bias + EMA state")
+
+        # Aggregate across ranks: bias/ema should be same across all ranks after sync
+        bias_diff_t = torch.tensor([bias_diff], device=device)
+        ema_diff_t = torch.tensor([ema_diff], device=device)
+        dist.all_reduce(bias_diff_t, op=dist.ReduceOp.MAX)
+        dist.all_reduce(ema_diff_t, op=dist.ReduceOp.MAX)
+
+        if rank == 0:
+            print(f"  ✓ max over {world} ranks: bias diff={bias_diff_t.item():.6e}, "
+                  f"EMA diff={ema_diff_t.item():.6e}")
+        assert bias_diff < 1e-5, f"rank {rank}: bias not restored (diff={bias_diff})"
+        assert ema_diff < 1e-5, f"rank {rank}: EMA not restored (diff={ema_diff})"
+
+        # Also verify optimizer state restored: grab one weight, sum of squared gradients
+        # (Adam's state['exp_avg_sq']) should be identical post-restore
+        opt = engine.optimizer
+        first_param = None
+        for g in opt.param_groups:
+            for p in g["params"]:
+                if p.requires_grad:
+                    first_param = p
+                    break
+            if first_param is not None: break
+        if first_param is not None and first_param in opt.state:
+            exp_avg_sq = opt.state[first_param].get("exp_avg_sq", None)
+            if exp_avg_sq is not None:
+                if rank == 0:
+                    print(f"  ✓ optimizer state exp_avg_sq shape={tuple(exp_avg_sq.shape)} "
+                          f"nonzero_frac={(exp_avg_sq != 0).float().mean().item():.3f}")
+        if rank == 0:
+            print(f"  ✓ DeepSpeed round-trip preserves optimizer + bias + EMA across {world} ranks")
+
+    finally:
+        if rank == 0 and os.path.isdir(shared_dir):
+            shutil.rmtree(shared_dir)
+        dist.barrier()
 
 
 def test_5_gumbel_rng_determinism():

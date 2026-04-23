@@ -30,10 +30,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--deepspeed_config", required=True)
     ap.add_argument("--local_rank", type=int, default=-1)
+    ap.add_argument("--muon_variant", choices=["keller", "moonshot"], default="moonshot",
+                    help="keller = upstream KellerJordan; moonshot = our Moonshot-scaled variant.")
     args, _ = ap.parse_known_args()
 
     import deepspeed
-    from muon import MuonWithAuxAdam
+    if args.muon_variant == "keller":
+        from muon import MuonWithAuxAdam
+    else:
+        from utils.muon_moonshot import MoonshotMuonWithAuxAdam as MuonWithAuxAdam
 
     cfg = NeuronSparkConfig(
         D=128, N=2, K=6, num_layers=4, D_ff=256,
@@ -61,7 +66,7 @@ def main():
     rank = dist.get_rank()
     world = dist.get_world_size()
     if rank == 0:
-        print(f"=== Muon + DS ZeRO-0 on {world} GPUs ===")
+        print(f"=== Muon({args.muon_variant}) + DS ZeRO-0 on {world} GPUs ===")
 
     device = next(engine.parameters()).device
     x = torch.randint(0, cfg.vocab_size, (1, 16), device=device)

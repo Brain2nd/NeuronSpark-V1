@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--local_rank", type=int, default=-1)
     ap.add_argument("--muon_variant", choices=["keller", "moonshot"], default="moonshot",
                     help="keller = upstream KellerJordan; moonshot = our Moonshot-scaled variant.")
-    ap.add_argument("--zero_stage", type=int, default=0, choices=[0, 1, 2],
+    ap.add_argument("--zero_stage", type=int, default=0, choices=[0, 1, 2, 3],
                     help="DeepSpeed ZeRO stage to force for this test (default 0).")
     ap.add_argument("--optimizer", choices=["muon", "adam"], default="muon",
                     help="muon = MuonWithAuxAdam, adam = plain AdamW (for ZeRO-2 compat test).")

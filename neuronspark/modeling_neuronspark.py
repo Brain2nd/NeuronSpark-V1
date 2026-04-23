@@ -1695,10 +1695,12 @@ def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_m
     return beta, u, v_th
 
 
-# Module-level flag for A/B testing. When True, wraps _fused_modulation with
-# activation checkpointing (drops internal intermediates, rerun during bwd).
-# Set from scripts/bench_plif_v2_integrated.py --no_mod_ckpt for comparison.
-_FUSED_MODULATION_CHECKPOINT = True
+# Module-level flag: whether to activation-checkpoint _fused_modulation.
+# EMPIRICALLY DEFAULT FALSE: bench shows checkpoint + torch.compile combo
+# INCREASES peak memory (2.96 → 4.67 GB on small config), likely due to
+# re-tracing overhead + nested checkpointing with outer layer ckpt.
+# Kept as a flag for future experiments (e.g., if layer ckpt is removed).
+_FUSED_MODULATION_CHECKPOINT = False
 
 class SNNBlock(MemoryModule):
     """

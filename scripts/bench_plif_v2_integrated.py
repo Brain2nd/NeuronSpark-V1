@@ -72,7 +72,8 @@ def _install_v1_shims():
     mns.plif_rowparam_forward_v2 = _v1_rowparam
 
 
-def run_model(batch: int, seq: int, cfg_kwargs: dict, n_steps: int = 2):
+def run_model(batch: int, seq: int, cfg_kwargs: dict, n_steps: int = 2, warmup: int = 2):
+    import time
     torch.manual_seed(0)
     cfg = NeuronSparkConfig(**cfg_kwargs)
     m = NeuronSparkForCausalLM(cfg).cuda().to(torch.bfloat16)
@@ -80,10 +81,8 @@ def run_model(batch: int, seq: int, cfg_kwargs: dict, n_steps: int = 2):
 
     opt = torch.optim.AdamW(m.parameters(), lr=1e-4)
 
-    torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
-    for step in range(n_steps):
+    # Warmup (compile caches, first-call overhead)
+    for _ in range(warmup):
         x = torch.randint(0, cfg.vocab_size, (batch, seq), device='cuda')
         y = torch.randint(0, cfg.vocab_size, (batch, seq), device='cuda')
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -93,13 +92,29 @@ def run_model(batch: int, seq: int, cfg_kwargs: dict, n_steps: int = 2):
         loss.backward()
         opt.step()
 
+    # Timed run
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    for step in range(n_steps):
+        x = torch.randint(0, cfg.vocab_size, (batch, seq), device='cuda')
+        y = torch.randint(0, cfg.vocab_size, (batch, seq), device='cuda')
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = m.snn(x, y)
+            loss = out.last_loss.mean()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    torch.cuda.synchronize()
+    elapsed = time.time() - t0
+
     peak = torch.cuda.max_memory_allocated() / 1e9
     n_params = sum(p.numel() for p in m.parameters()) / 1e9
 
     del m, opt, out, loss, x, y
     gc.collect()
     torch.cuda.empty_cache()
-    return peak, n_params
+    return peak, n_params, elapsed / n_steps
 
 
 if __name__ == "__main__":
@@ -138,12 +153,6 @@ if __name__ == "__main__":
         _disable_register_residency()
         print("[patch] β/v_th register residency DISABLED (use per-step kernel)")
 
-    # Timed run for speed comparison
-    import time
-    torch.cuda.synchronize()
-    t0 = time.time()
-    peak, nparams = run_model(args.batch, args.seq, cfg, n_steps=2)
-    torch.cuda.synchronize()
-    elapsed = time.time() - t0
+    peak, nparams, per_step_s = run_model(args.batch, args.seq, cfg, n_steps=5, warmup=3)
     print(f"Peak GPU memory: {peak:.3f} GB (params: {nparams:.3f} B)")
-    print(f"Wall time (2 steps incl. first-call compile): {elapsed:.2f} s")
+    print(f"Per-step time (avg of 5, warmup=3): {per_step_s*1000:.1f} ms")

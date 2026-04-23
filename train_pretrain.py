@@ -267,6 +267,9 @@ def main():
     ap.add_argument("--muon_lr", type=float, default=0.02,
                     help="Muon LR for matrix params (only used when --optimizer muon).")
     ap.add_argument("--muon_momentum", type=float, default=0.95)
+    ap.add_argument("--muon_variant", choices=["keller", "moonshot"], default="moonshot",
+                    help="keller = KellerJordan original (max(1,m/n)^0.5 rectangular scaling). "
+                         "moonshot = Moonshot RMS-match 0.2*max(m,n)^0.5 (paper 2025-02, scalable).")
     ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
     ap.add_argument("--warmup_iters", type=int, default=500)
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -318,7 +321,10 @@ def main():
 
     # Optimizer: Muon (default) or Adam
     if args.optimizer == "muon":
-        from muon import MuonWithAuxAdam
+        if args.muon_variant == "keller":
+            from muon import MuonWithAuxAdam as _MuonWithAuxAdam
+        else:  # moonshot
+            from utils.muon_moonshot import MoonshotMuonWithAuxAdam as _MuonWithAuxAdam
         param_groups = build_muon_param_groups(
             model,
             muon_lr=args.muon_lr,
@@ -327,7 +333,7 @@ def main():
             adam_embed_lr=args.learning_rate,
             neuron_lr_mult=args.neuron_lr_mult,
         )
-        optimizer = MuonWithAuxAdam(param_groups)
+        optimizer = _MuonWithAuxAdam(param_groups)
         # Muon asserts strict group keys on init; inject lr_mult AFTER init
         # so cosine_lr scheduler can scale per-group LR properly.
         for g in optimizer.param_groups:
@@ -337,7 +343,8 @@ def main():
                 # Detect neuron group by larger initial LR
                 ratio = g["lr"] / args.learning_rate if args.learning_rate > 0 else 1.0
                 g["lr_mult"] = round(ratio, 4)  # 1.0 for embed/norm, neuron_lr_mult for neuron group
-        log(f"Optimizer: MuonWithAuxAdam (matrix→Muon lr={args.muon_lr} | "
+        log(f"Optimizer: MuonWithAuxAdam ({args.muon_variant}) "
+            f"(matrix→Muon lr={args.muon_lr} | "
             f"embed/norm→Adam lr={args.learning_rate} | "
             f"neuron→Adam lr={args.learning_rate * args.neuron_lr_mult})")
     elif args.optimizer == "adam":

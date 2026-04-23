@@ -1694,6 +1694,12 @@ def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_m
     u = alpha * I_all
     return beta, u, v_th
 
+
+# Module-level flag for A/B testing. When True, wraps _fused_modulation with
+# activation checkpointing (drops internal intermediates, rerun during bwd).
+# Set from scripts/bench_plif_v2_integrated.py --no_mod_ckpt for comparison.
+_FUSED_MODULATION_CHECKPOINT = True
+
 class SNNBlock(MemoryModule):
     """
     单个 SNN Block（并行化）。
@@ -1848,12 +1854,25 @@ class SNNBlock(MemoryModule):
         # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
         # 神经元参数可能是 fp32 (master weights)，计算时转为输入 dtype
         compute_dtype = h_seq.dtype
-        beta_all, u_hidden, v_th_all = _fused_modulation(
-            raw_beta, self.b_beta.to(compute_dtype),
-            raw_alpha, self.b_alpha.to(compute_dtype),
-            raw_th, self.b_th.to(compute_dtype),
-            self.v_th_min, I_all,
-        )
+        # checkpoint: don't save internal intermediates (alpha, etc.). Re-run
+        # modulation forward during backward. Saves ~3-5 GB/layer @ N=16.
+        # use_reentrant=False enables graph re-tracing under torch.compile.
+        if _FUSED_MODULATION_CHECKPOINT and self.training and I_all.requires_grad:
+            beta_all, u_hidden, v_th_all = checkpoint(
+                _fused_modulation,
+                raw_beta, self.b_beta.to(compute_dtype),
+                raw_alpha, self.b_alpha.to(compute_dtype),
+                raw_th, self.b_th.to(compute_dtype),
+                self.v_th_min, I_all,
+                use_reentrant=False,
+            )
+        else:
+            beta_all, u_hidden, v_th_all = _fused_modulation(
+                raw_beta, self.b_beta.to(compute_dtype),
+                raw_alpha, self.b_alpha.to(compute_dtype),
+                raw_th, self.b_th.to(compute_dtype),
+                self.v_th_min, I_all,
+            )
 
         # 获取隐神经元初始状态
         v_init_hidden = self.hidden_neuron.v

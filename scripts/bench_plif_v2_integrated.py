@@ -26,6 +26,12 @@ from neuronspark import modeling_neuronspark as mns
 from utils.param_groups import promote_neuron_params_fp32
 
 
+def _disable_modulation_checkpoint():
+    """Disable the _fused_modulation checkpoint optimization for A/B comparison."""
+    import neuronspark.modeling_neuronspark as mns
+    mns._FUSED_MODULATION_CHECKPOINT = False
+
+
 def _install_v1_shims():
     """Monkey-patch plif_*_forward_v2 to use V1 kernels, for A/B comparison.
 
@@ -91,6 +97,8 @@ if __name__ == "__main__":
     ap.add_argument("--vocab_size", type=int, default=1024)
     ap.add_argument("--use_v1", action="store_true",
                     help="Monkey-patch plif_*_forward_v2 to use V1 (V_post view) for A/B comparison.")
+    ap.add_argument("--no_mod_ckpt", action="store_true",
+                    help="Disable _fused_modulation activation checkpointing (for A/B).")
     args = ap.parse_args()
 
     cfg = dict(
@@ -104,6 +112,9 @@ if __name__ == "__main__":
 
     if args.use_v1:
         _install_v1_shims()
+    if args.no_mod_ckpt:
+        _disable_modulation_checkpoint()
+        print("[patch] _fused_modulation checkpoint DISABLED")
 
     peak, nparams = run_model(args.batch, args.seq, cfg, n_steps=2)
     print(f"Peak GPU memory: {peak:.3f} GB (params: {nparams:.3f} B)")

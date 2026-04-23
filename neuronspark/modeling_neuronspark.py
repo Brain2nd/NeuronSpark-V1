@@ -1367,17 +1367,18 @@ class SNNFFN(MemoryModule):
             v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
-        # Row-param bio-PLIF scan (V2): returns (output, v_last) not full V_post.
-        # v_last is a fresh tensor — full V_post is freed after forward.
-        output_merged, v_last_merged = plif_rowparam_forward_v2(
+        # Row-param bio-PLIF scan (V1): ablation showed V2 rowparam has bad ROI
+        # (+13% time for only -10% memory). V1 is faster here, V2 kept only for
+        # SNN block hidden (where V_post is biggest).
+        output_merged, V_post_merged = plif_rowparam_forward(
             beta_row, u_merged, v_th_row, v_init_merged,
         )
 
         # 超阈电流输出 (sparse): 非发放位置严格 == 0, 发放位置 = V_pre - V_th > 0
         gate_out = output_merged[:, :, :D_ff]
         up_out = output_merged[:, :, D_ff:]
-        self.gate_neuron.v = v_last_merged[:, :D_ff].detach()
-        self.up_neuron.v = v_last_merged[:, D_ff:].detach()
+        self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
+        self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
         with torch.no_grad():
             self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
             self.up_neuron._last_firing_rate = (up_out > 0).float().mean().item()
@@ -1944,11 +1945,11 @@ class SNNDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, v_last = plif_rowparam_forward_v2(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
         )
 
-        input_neuron.v = v_last.detach()
+        input_neuron.v = V_post[-1].detach()
         # Diagnostic: 发放率 (bio-ReLU: output > 0 ≡ fired)
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
@@ -2235,10 +2236,10 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, v_last = plif_rowparam_forward_v2(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
         )
-        input_neuron.v = v_last.detach()
+        input_neuron.v = V_post[-1].detach()
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)
@@ -2257,12 +2258,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta_g.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.gate_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        gate_out, v_last_g = plif_rowparam_forward_v2(
+        gate_out, V_post_g = plif_rowparam_forward(
             beta_row, u_g, v_th_row, v_init_g,
         )
         with torch.no_grad():
             self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
-        self.gate_neuron.v = v_last_g.detach()
+        self.gate_neuron.v = V_post_g[-1].detach()
         # gate_out 已经是超阈电流 (sparse, ReLU), 直接做 mean pool 作为标量门控
         return gate_out.mean(dim=-1, keepdim=True).to(input_dtype)
 
@@ -2563,11 +2564,11 @@ class SNNLanguageModel(nn.Module):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, v_last = plif_rowparam_forward_v2(
+        output, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
         )
 
-        self.output_neuron.v = v_last.detach()
+        self.output_neuron.v = V_post[-1].detach()
         with torch.no_grad():
             self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
         # 输出神经元: 传超阈电流 (sparse, bio-ReLU)

@@ -60,9 +60,9 @@ def main():
             D=128, N=2, K=6, num_layers=4, D_ff=256,
             vocab_size=256, memory_layer_interval=2,
         )
-    # Keep params fp32; DS bf16.enabled=true manages mixed precision properly
-    # (bf16 compute + fp32 master copy + fp32 optimizer state).
-    m = NeuronSparkForCausalLM(cfg).cuda()
+    # Params must be bf16 for Triton PLIF kernel alignment (see train_pretrain.py).
+    # DS bf16.enabled=true on top gives fp32 master copy + fp32 Adam state.
+    m = NeuronSparkForCausalLM(cfg).cuda().to(torch.bfloat16)
     promote_neuron_params_fp32(m)
 
     if args.optimizer == "muon":

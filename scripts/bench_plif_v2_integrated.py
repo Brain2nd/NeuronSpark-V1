@@ -32,6 +32,23 @@ def _disable_modulation_checkpoint():
     mns._FUSED_MODULATION_CHECKPOINT = False
 
 
+def _disable_register_residency():
+    """Degrade plif_rowparam_forward_v2 to use the per-step kernel instead of the
+    row-param kernel. Effect: β/v_th loaded from HBM every step (no register
+    residency), plus (K, ...) shape allocation overhead. Used to measure the
+    value of the row-param optimization.
+    """
+    _orig_parallel_v2 = mns.plif_parallel_forward_v2
+
+    def _expanded(beta_row, u, v_th_row, v_init):
+        K = u.shape[0]
+        beta = beta_row.unsqueeze(0).expand(K, *beta_row.shape).contiguous()
+        vth = v_th_row.unsqueeze(0).expand(K, *v_th_row.shape).contiguous()
+        return _orig_parallel_v2(beta, u, vth, v_init)
+
+    mns.plif_rowparam_forward_v2 = _expanded
+
+
 def _install_v1_shims():
     """Monkey-patch plif_*_forward_v2 to use V1 kernels, for A/B comparison.
 
@@ -99,6 +116,8 @@ if __name__ == "__main__":
                     help="Monkey-patch plif_*_forward_v2 to use V1 (V_post view) for A/B comparison.")
     ap.add_argument("--no_mod_ckpt", action="store_true",
                     help="Disable _fused_modulation activation checkpointing (for A/B).")
+    ap.add_argument("--no_register", action="store_true",
+                    help="Degrade row-param PLIFs to use per-step kernel (no β/v_th register residency).")
     args = ap.parse_args()
 
     cfg = dict(
@@ -115,6 +134,16 @@ if __name__ == "__main__":
     if args.no_mod_ckpt:
         _disable_modulation_checkpoint()
         print("[patch] _fused_modulation checkpoint DISABLED")
+    if args.no_register:
+        _disable_register_residency()
+        print("[patch] β/v_th register residency DISABLED (use per-step kernel)")
 
+    # Timed run for speed comparison
+    import time
+    torch.cuda.synchronize()
+    t0 = time.time()
     peak, nparams = run_model(args.batch, args.seq, cfg, n_steps=2)
+    torch.cuda.synchronize()
+    elapsed = time.time() - t0
     print(f"Peak GPU memory: {peak:.3f} GB (params: {nparams:.3f} B)")
+    print(f"Wall time (2 steps incl. first-call compile): {elapsed:.2f} s")

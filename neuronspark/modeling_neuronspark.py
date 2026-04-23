@@ -1686,13 +1686,18 @@ class SNNFFN(MemoryModule):
 # 7-8 separate element-wise kernels → 1 fused kernel, ~4x speedup on DN-sized tensors.
 # First call triggers JIT compilation (~seconds); cached for subsequent calls.
 
-@torch.compile(backend='inductor', fullgraph=True)
-def _fused_modulation(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_min, I_all):
+def _fused_modulation_eager(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_min, I_all):
+    """Plain-Python modulation: sigmoid + softplus + abs + multiply.
+    Used directly for A/B test against compiled version."""
     beta = torch.sigmoid(raw_beta + b_beta)
     alpha = F.softplus(raw_alpha + b_alpha)
     v_th = v_th_min + torch.abs(raw_th + b_th)
     u = alpha * I_all
     return beta, u, v_th
+
+
+# Default: use compiled version (module-level so bench can swap to eager for A/B)
+_fused_modulation = torch.compile(_fused_modulation_eager, backend='inductor', fullgraph=True)
 
 
 # Module-level flag: whether to activation-checkpoint _fused_modulation.
@@ -1949,8 +1954,7 @@ class SNNBlock(MemoryModule):
 # sigmoid + clamp + log1p + cumsum + exp + normalize
 # 首次调用触发 JIT 编译（~秒级），后续调用走缓存
 
-@torch.compile(backend='inductor', fullgraph=True)
-def _fused_geometric_halt(halt_logits):
+def _fused_geometric_halt_eager(halt_logits):
     """融合计算 PonderNet 几何分布停止权重。
 
     输入: halt_logits (seq_len, K, batch) — halt_proj 的原始输出
@@ -1968,6 +1972,9 @@ def _fused_geometric_halt(halt_logits):
     halt_weights = p_halt * survive                     # λ_k = p_k · S_k
     halt_weights = halt_weights / (halt_weights.sum(dim=1, keepdim=True) + 1e-8)
     return halt_weights
+
+
+_fused_geometric_halt = torch.compile(_fused_geometric_halt_eager, backend='inductor', fullgraph=True)
 
 
 # ============================================================

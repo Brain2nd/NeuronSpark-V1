@@ -32,6 +32,16 @@ def _disable_modulation_checkpoint():
     mns._FUSED_MODULATION_CHECKPOINT = False
 
 
+def _disable_compile_modulation():
+    """Replace compiled _fused_modulation with eager Python implementation."""
+    mns._fused_modulation = mns._fused_modulation_eager
+
+
+def _disable_compile_halt():
+    """Replace compiled _fused_geometric_halt with eager implementation."""
+    mns._fused_geometric_halt = mns._fused_geometric_halt_eager
+
+
 def _disable_register_residency():
     """Degrade plif_rowparam_forward_v2 to use the per-step kernel instead of the
     row-param kernel. Effect: β/v_th loaded from HBM every step (no register
@@ -133,6 +143,10 @@ if __name__ == "__main__":
                     help="Disable _fused_modulation activation checkpointing (for A/B).")
     ap.add_argument("--no_register", action="store_true",
                     help="Degrade row-param PLIFs to use per-step kernel (no β/v_th register residency).")
+    ap.add_argument("--no_compile_mod", action="store_true",
+                    help="Use eager _fused_modulation (disable torch.compile) — test compile value.")
+    ap.add_argument("--no_compile_halt", action="store_true",
+                    help="Use eager _fused_geometric_halt (disable torch.compile).")
     args = ap.parse_args()
 
     cfg = dict(
@@ -152,6 +166,12 @@ if __name__ == "__main__":
     if args.no_register:
         _disable_register_residency()
         print("[patch] β/v_th register residency DISABLED (use per-step kernel)")
+    if args.no_compile_mod:
+        _disable_compile_modulation()
+        print("[patch] _fused_modulation torch.compile DISABLED (eager)")
+    if args.no_compile_halt:
+        _disable_compile_halt()
+        print("[patch] _fused_geometric_halt torch.compile DISABLED (eager)")
 
     peak, nparams, per_step_s = run_model(args.batch, args.seq, cfg, n_steps=5, warmup=3)
     print(f"Peak GPU memory: {peak:.3f} GB (params: {nparams:.3f} B)")

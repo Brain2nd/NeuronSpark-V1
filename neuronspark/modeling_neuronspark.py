@@ -1052,6 +1052,46 @@ def plif_parallel_forward(
     return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0), None
 
 
+def plif_parallel_forward_v2(
+    beta: torch.Tensor, u: torch.Tensor, v_th: torch.Tensor, v_init: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """V2: returns (output, v_last) instead of (output, V_post, None).
+
+    v_last is a fresh (not-view) tensor of shape v_init. V_post is freed after
+    forward — downstream `neuron.v = v_last.detach()` no longer holds the full
+    (K, *) V_post storage across steps.
+    """
+    if _HAS_TRITON and beta.is_cuda:
+        return _TritonPLIFForward_V2.apply(beta, u, v_th, v_init)
+    # CPU fallback: reuse old path and clone last step
+    K = u.shape[0]
+    v = v_init if isinstance(v_init, torch.Tensor) else torch.zeros_like(u[0])
+    outputs = []
+    for k in range(K):
+        v_pre = beta[k] * v + u[k]
+        output = F.relu(v_pre - v_th[k])
+        v = v_pre - output
+        outputs.append(output)
+    return torch.stack(outputs, dim=0), v.clone()
+
+
+def plif_rowparam_forward_v2(
+    beta_row: torch.Tensor, u: torch.Tensor, v_th_row: torch.Tensor, v_init: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """V2 rowparam: returns (output, v_last) instead of (output, V_post). See V2 docstring."""
+    if _HAS_TRITON and u.is_cuda:
+        return _TritonPLIFRowParamForward_V2.apply(beta_row, u, v_th_row, v_init)
+    K = u.shape[0]
+    v = v_init if isinstance(v_init, torch.Tensor) else torch.zeros_like(u[0])
+    outputs = []
+    for k in range(K):
+        v_pre = beta_row * v + u[k]
+        output = F.relu(v_pre - v_th_row)
+        v = v_pre - output
+        outputs.append(output)
+    return torch.stack(outputs, dim=0), v.clone()
+
+
 def plif_rowparam_forward(
     beta_row: torch.Tensor,
     u: torch.Tensor,
@@ -1591,16 +1631,17 @@ class SNNFFN(MemoryModule):
             v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
-        # Row-param bio-PLIF scan: output = max(V_pre - v_th, 0) (super-threshold current, sparse)
-        output_merged, V_post_merged = plif_rowparam_forward(
+        # Row-param bio-PLIF scan (V2): returns (output, v_last) not full V_post.
+        # v_last is a fresh tensor — full V_post is freed after forward.
+        output_merged, v_last_merged = plif_rowparam_forward_v2(
             beta_row, u_merged, v_th_row, v_init_merged,
         )
 
         # 超阈电流输出 (sparse): 非发放位置严格 == 0, 发放位置 = V_pre - V_th > 0
         gate_out = output_merged[:, :, :D_ff]
         up_out = output_merged[:, :, D_ff:]
-        self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
-        self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
+        self.gate_neuron.v = v_last_merged[:, :D_ff].detach()
+        self.up_neuron.v = v_last_merged[:, D_ff:].detach()
         with torch.no_grad():
             self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
             self.up_neuron._last_firing_rate = (up_out > 0).float().mean().item()
@@ -1819,12 +1860,13 @@ class SNNBlock(MemoryModule):
         if isinstance(v_init_hidden, float):
             v_init_hidden = torch.zeros(batch, DN, device=flat.device, dtype=flat.dtype)
 
-        output_hidden, V_post_hidden, _ = plif_parallel_forward(
+        # V2: returns (output, v_last) — V_post not held across steps by .v view
+        output_hidden, v_last_hidden = plif_parallel_forward_v2(
             beta_all, u_hidden, v_th_all, v_init_hidden,
         )
 
         # 更新隐神经元状态（保存末步 V_post 供下次调用）
-        self.hidden_neuron.v = V_post_hidden[-1].detach()
+        self.hidden_neuron.v = v_last_hidden.detach()
         with torch.no_grad():
             self.hidden_neuron._last_firing_rate = (output_hidden > 0).float().mean().item()
 
@@ -2166,11 +2208,11 @@ class SNNDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, V_post = plif_rowparam_forward(
+        output, v_last = plif_rowparam_forward_v2(
             beta_row, u, v_th_row, v_init,
         )
 
-        input_neuron.v = V_post[-1].detach()
+        input_neuron.v = v_last.detach()
         # Diagnostic: 发放率 (bio-ReLU: output > 0 ≡ fired)
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
@@ -2457,10 +2499,10 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, V_post = plif_rowparam_forward(
+        output, v_last = plif_rowparam_forward_v2(
             beta_row, u, v_th_row, v_init,
         )
-        input_neuron.v = V_post[-1].detach()
+        input_neuron.v = v_last.detach()
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)
@@ -2479,12 +2521,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
         beta_row = beta_g.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.gate_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        gate_out, V_post_g = plif_rowparam_forward(
+        gate_out, v_last_g = plif_rowparam_forward_v2(
             beta_row, u_g, v_th_row, v_init_g,
         )
         with torch.no_grad():
             self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
-        self.gate_neuron.v = V_post_g[-1].detach()
+        self.gate_neuron.v = v_last_g.detach()
         # gate_out 已经是超阈电流 (sparse, ReLU), 直接做 mean pool 作为标量门控
         return gate_out.mean(dim=-1, keepdim=True).to(input_dtype)
 
@@ -2785,11 +2827,11 @@ class SNNLanguageModel(nn.Module):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
 
-        output, V_post = plif_rowparam_forward(
+        output, v_last = plif_rowparam_forward_v2(
             beta_row, u, v_th_row, v_init,
         )
 
-        self.output_neuron.v = V_post[-1].detach()
+        self.output_neuron.v = v_last.detach()
         with torch.no_grad():
             self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
         # 输出神经元: 传超阈电流 (sparse, bio-ReLU)

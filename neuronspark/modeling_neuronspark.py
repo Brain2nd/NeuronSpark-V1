@@ -741,6 +741,195 @@ if _HAS_TRITON:
 
             return grad_beta, grad_u, grad_v_th, grad_v_init
 
+
+    # ============================================================
+    # V2: V_post-less PLIF variants (reconstruct V_post in backward)
+    #
+    # Motivation: V_post is (K, seq*batch, DN) — at N=16 K=12 seq=2048 bs=1 that's
+    # ~800 MB. In the current impl V_post stays live across the whole training
+    # step because `self.hidden_neuron.v = V_post[-1].detach()` holds a view into
+    # its storage. V2 returns v_last as a fresh allocation (clone), so V_post can
+    # be freed after forward, then reconstructed as scratch in backward via the
+    # existing forward kernel. Trade: +1 extra forward pass of PLIF in backward.
+    #
+    # Saved tensor swap: [beta, v_th, v_init, V_post(big), output(big)]
+    #                 → [beta, v_th, v_init, u(big),     output(big)]
+    # If u is already saved upstream (e.g. by fused_modulation's autograd), this
+    # is a net win. If not, net zero. Run scripts/test_plif_kernel_v2.py to
+    # measure empirically.
+    # ============================================================
+
+    class _TritonPLIFRowParamForward_V2(torch.autograd.Function):
+        """V2: only returns v_last (single step), not full V_post. Recomputes in bwd."""
+
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta_row, u, v_th_row, v_init):
+            beta_row_c = beta_row.contiguous()
+            u_c = u.contiguous()
+            v_th_row_c = v_th_row.contiguous()
+            v_init_c = v_init.contiguous()
+
+            K = u_c.shape[0]
+            num_cols = u_c[0].numel()
+
+            output = torch.empty_like(u_c)
+            V_post_tmp = torch.empty_like(u_c)   # transient, freed after this function
+
+            BLOCK = _TritonPLIFRowParamForward_V2._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_plif_fwd_rowparam_kernel[grid](
+                beta_row_c, u_c, v_th_row_c, v_init_c,
+                output, V_post_tmp,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            # Clone last step into its own allocation; V_post_tmp can then be freed.
+            v_last = V_post_tmp[-1].clone()
+            # Let V_post_tmp fall out of scope after save_for_backward decision.
+
+            if any(ctx.needs_input_grad[:4]):
+                # Save u (needed to recompute V_post in backward). V_post NOT saved.
+                ctx.save_for_backward(beta_row_c, v_th_row_c, v_init_c, u_c, output)
+            ctx.K = K
+            ctx.num_cols = num_cols
+
+            return output, v_last
+
+        @staticmethod
+        def backward(ctx, grad_output, grad_v_last):
+            beta_row, v_th_row, v_init, u, output = ctx.saved_tensors
+            K = ctx.K
+            num_cols = ctx.num_cols
+
+            if grad_output is None:
+                grad_output = torch.zeros_like(output)
+
+            # Step 1: recompute V_post as scratch by re-running forward kernel.
+            V_post = torch.empty_like(u)
+            output_scratch = torch.empty_like(u)  # discarded; output already saved
+
+            BLOCK = _TritonPLIFRowParamForward_V2._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_plif_fwd_rowparam_kernel[grid](
+                beta_row, u, v_th_row, v_init,
+                output_scratch, V_post,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+            del output_scratch
+
+            # Step 2: propagate grad_v_last into grad_V_post[-1] and run bwd.
+            grad_V_post = torch.zeros_like(V_post)
+            if grad_v_last is not None:
+                grad_V_post[-1] = grad_v_last
+
+            grad_output_c = grad_output.contiguous()
+            grad_V_post_c = grad_V_post.contiguous()
+
+            grad_beta_row = torch.empty_like(beta_row)
+            grad_u = torch.empty_like(u)
+            grad_v_th_row = torch.empty_like(v_th_row)
+            grad_v_init = torch.empty_like(v_init)
+
+            _fused_plif_bwd_rowparam_kernel[grid](
+                beta_row, v_th_row, v_init, V_post, output,
+                grad_output_c, grad_V_post_c,
+                grad_beta_row, grad_u, grad_v_th_row, grad_v_init,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            return grad_beta_row, grad_u, grad_v_th_row, grad_v_init
+
+
+    class _TritonPLIFForward_V2(torch.autograd.Function):
+        """V2 perstep: only returns v_last. See _TritonPLIFRowParamForward_V2 docs."""
+
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta, u, v_th, v_init):
+            beta_c = beta.contiguous()
+            u_c = u.contiguous()
+            v_th_c = v_th.contiguous()
+            v_init_c = v_init.contiguous()
+
+            K = beta_c.shape[0]
+            num_cols = beta_c[0].numel()
+
+            output = torch.empty_like(u_c)
+            V_post_tmp = torch.empty_like(u_c)
+
+            BLOCK = _TritonPLIFForward_V2._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_plif_fwd_kernel[grid](
+                beta_c, u_c, v_th_c, v_init_c,
+                output, V_post_tmp,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            v_last = V_post_tmp[-1].clone()
+
+            if any(ctx.needs_input_grad[:4]):
+                ctx.save_for_backward(beta_c, u_c, v_th_c, v_init_c, output)
+            ctx.K = K
+            ctx.num_cols = num_cols
+
+            return output, v_last
+
+        @staticmethod
+        def backward(ctx, grad_output, grad_v_last):
+            beta, u, v_th, v_init, output = ctx.saved_tensors
+            K = ctx.K
+            num_cols = ctx.num_cols
+
+            if grad_output is None:
+                grad_output = torch.zeros_like(output)
+
+            V_post = torch.empty_like(u)
+            output_scratch = torch.empty_like(u)
+
+            BLOCK = _TritonPLIFForward_V2._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_plif_fwd_kernel[grid](
+                beta, u, v_th, v_init,
+                output_scratch, V_post,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+            del output_scratch
+
+            grad_V_post = torch.zeros_like(V_post)
+            if grad_v_last is not None:
+                grad_V_post[-1] = grad_v_last
+
+            grad_output_c = grad_output.contiguous()
+            grad_V_post_c = grad_V_post.contiguous()
+
+            grad_beta = torch.empty_like(beta)
+            grad_u = torch.empty_like(beta)
+            grad_v_th = torch.empty_like(v_th)
+            grad_v_init = torch.empty_like(v_init)
+
+            _fused_plif_bwd_kernel[grid](
+                beta, v_th, v_init, V_post, output,
+                grad_output_c, grad_V_post_c,
+                grad_beta, grad_u, grad_v_th, grad_v_init,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            return grad_beta, grad_u, grad_v_th, grad_v_init
+
+
 # ============================================================
 # Hillis-Steele parallel prefix scan (CPU fallback)
 # ============================================================

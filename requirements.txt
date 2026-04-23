@@ -1,0 +1,40 @@
+# NeuronSpark-V1 v3 pinned requirements (tested on H100 80GB SXM + 4090D)
+# For H200 SXM 141GB: driver should support CUDA 12.8+, use same torch cu128 build.
+#
+# Install order matters: torch FIRST from PyTorch index, then rest from pypi,
+# then muon-optimizer from git. See scripts/setup_h200.sh for the full sequence.
+
+# ---- Core PyTorch stack (cu128 build for CUDA 12.8+ drivers) ----
+# NOTE: Install these with:
+#   pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.11.0 torchvision torchaudio
+# Do NOT list torch here or pip will fetch the default (no-CUDA) build.
+
+# ---- Triton (bundled with torch 2.11) ----
+# triton==3.6.0  # installed automatically with torch 2.11+cu128
+
+# ---- Training framework ----
+transformers==5.6.2
+deepspeed==0.18.9
+accelerate==1.13.0
+datasets==4.8.4
+huggingface_hub==1.11.0
+
+# ---- Tokenizers / data ----
+tokenizers==0.22.2
+pyarrow==24.0.0
+safetensors==0.7.0
+
+# ---- Logging / monitoring ----
+tensorboard==2.20.0
+wandb==0.26.1
+
+# ---- Utilities ----
+numpy>=1.26
+pandas==2.3.3
+einops==0.8.2
+tqdm==4.67.3
+pydantic==2.13.3
+protobuf==7.34.1
+
+# ---- Muon optimizer (install via git, see setup_h200.sh) ----
+# pip install git+https://github.com/KellerJordan/Muon

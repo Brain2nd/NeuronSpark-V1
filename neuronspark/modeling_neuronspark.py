@@ -1132,74 +1132,6 @@ def plif_rowparam_forward(
         V_posts.append(v)
     return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0)
 
-def plif_fixed_param_forward(
-    beta,
-    u: torch.Tensor,
-    v_th,
-    v_init: torch.Tensor,
-    max_iter: int = 3,
-    surrogate_function=None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    固定参数 PLIF 神经元的并行前向（如输出神经元、FFN 神经元）。
-
-    ParametricLIFNode 方程: V[k] = beta * V[k-1] + (1-beta) * x[k]
-    其中 beta = 1/(1+exp(w)), 可为 scalar tensor（保持梯度流向 w）。
-
-    scalar/0-dim beta 和 v_th 使用 row-param 内核（无需 expand 到 (K, *shape)）。
-
-    Args:
-        beta: 衰减率 — scalar float、0-dim tensor 或 (K, *shape) tensor
-        u: (K, *shape) — 输入（已乘以 (1-beta)）
-        v_th: 阈值 — scalar float、0-dim tensor 或 (K, *shape) tensor
-        v_init: (*shape) — 初始膜电位
-        max_iter: spike 迭代次数
-        surrogate_function: surrogate gradient 函数
-
-    Returns:
-        spike: (K, *shape) — spike 模式
-        V_post: (K, *shape) — 发放后膜电位
-    """
-    K = u.shape[0]
-    shape = u.shape[1:]
-
-    # Row-param fast path: beta 和 v_th 都是 scalar/0-dim → 扩展为 (*shape) 行向量
-    beta_is_scalar = isinstance(beta, torch.Tensor) and beta.dim() == 0
-    beta_is_float = not isinstance(beta, torch.Tensor)
-    vth_is_scalar = isinstance(v_th, torch.Tensor) and v_th.dim() == 0
-    vth_is_float = not isinstance(v_th, torch.Tensor)
-
-    if (beta_is_scalar or beta_is_float) and (vth_is_scalar or vth_is_float):
-        # Build row vectors (*shape)
-        if beta_is_scalar:
-            beta_row = beta.expand(*shape).contiguous()
-        else:
-            beta_row = torch.full(shape, beta, device=u.device, dtype=u.dtype)
-        if vth_is_scalar:
-            v_th_row = v_th.expand(*shape).contiguous()
-        else:
-            v_th_row = torch.full(shape, v_th, device=u.device, dtype=u.dtype)
-        return plif_rowparam_forward(beta_row, u, v_th_row, v_init, surrogate_function)
-
-    # Full-tensor path: expand to (K, *shape) if needed
-    if isinstance(beta, torch.Tensor):
-        if beta.dim() == 0:
-            beta = beta.expand(K, *shape).contiguous()
-    else:
-        beta = torch.full_like(u, beta)
-
-    if isinstance(v_th, torch.Tensor):
-        if v_th.dim() == 0:
-            v_th = v_th.expand(K, *shape).contiguous()
-    else:
-        v_th = torch.full_like(u, v_th)
-
-    spike, V_post, _ = plif_parallel_forward(
-        beta, u, v_th, v_init, max_iter, surrogate_function,
-    )
-    return spike, V_post
-
-
 # ============================================================
 # Section: plif_node
 # ============================================================
@@ -1948,34 +1880,6 @@ class SNNBlock(MemoryModule):
 # ============================================================
 # Section: snn_decoder_layer
 # ============================================================
-
-# ====== Fused halt weight computation (torch.compile) ======
-# 7-8 个独立 element-wise kernel → 单 fused kernel
-# sigmoid + clamp + log1p + cumsum + exp + normalize
-# 首次调用触发 JIT 编译（~秒级），后续调用走缓存
-
-def _fused_geometric_halt_eager(halt_logits):
-    """融合计算 PonderNet 几何分布停止权重。
-
-    输入: halt_logits (seq_len, K, batch) — halt_proj 的原始输出
-    输出: halt_weights (seq_len, K, batch) — 归一化几何分布权重，sum=1
-
-    数学: p_k = σ(logit_k), S_k = ∏_{j<k}(1-p_j), λ_k = p_k·S_k, λ̂_k = λ_k/Σλ
-    """
-    p_halt = torch.sigmoid(halt_logits).clamp(min=1e-7, max=1.0 - 1e-7)
-    log_1_minus_p = torch.log1p(-p_halt)               # (seq_len, K, batch)
-    # Exclusive cumsum: log_survive[:, k, :] = Σ_{j<k} log(1-p_j)
-    # 避免 torch.cat: 用 cumsum([:, :-1]) 填充 [:, 1:]
-    log_survive = torch.zeros_like(log_1_minus_p)
-    log_survive[:, 1:, :] = torch.cumsum(log_1_minus_p[:, :-1, :], dim=1)
-    survive = torch.exp(log_survive)                    # (seq_len, K, batch)
-    halt_weights = p_halt * survive                     # λ_k = p_k · S_k
-    halt_weights = halt_weights / (halt_weights.sum(dim=1, keepdim=True) + 1e-8)
-    return halt_weights
-
-
-_fused_geometric_halt = torch.compile(_fused_geometric_halt_eager, backend='inductor', fullgraph=True)
-
 
 # ============================================================
 # Section: v3 PonderNet (input-conditioned per-token k_t)

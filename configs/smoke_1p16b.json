@@ -1,0 +1,14 @@
+{
+    "D": 1024,
+    "N": 8,
+    "K": 12,
+    "num_layers": 24,
+    "D_ff": 3072,
+    "vocab_size": 128387,
+    "memory_layer_interval": 4,
+    "v_th_min": 0.02,
+    "k_predictor_hidden": 256,
+    "ponder_T_init": 2.0,
+    "ponder_T_final": 0.3,
+    "eps_explore": 0.05
+}

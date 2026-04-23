@@ -20,6 +20,11 @@ import sys
 
 import torch
 import torch.distributed as dist
+# H100 torch 2.4.1 has a FakeTensor / dynamo bug on @torch.compile'd helpers in
+# modeling_neuronspark.py. Fall back to eager so the smoke test can run.
+# TODO: upgrade torch on H100 to 2.9+ once the env dance is safe.
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM

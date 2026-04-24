@@ -16,6 +16,12 @@ Usage:
 """
 from __future__ import annotations
 
+import os
+# expandable_segments reduces allocator fragmentation on large models. Without
+# this, bs=4 seq=2048 @ 1.24B OOM'd at 134/140 GB (predicted 129 GB) — the 5 GB
+# delta was purely fragmentation. Must be set BEFORE torch.cuda is initialized.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import math

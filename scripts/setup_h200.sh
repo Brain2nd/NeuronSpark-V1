@@ -37,6 +37,10 @@ export TRITON_CACHE_DIR=$WORKSPACE/triton_cache
 export HF_HOME=$WORKSPACE/hf_cache
 export HUGGINGFACE_HUB_CACHE=$WORKSPACE/hf_cache/hub
 export PIP_CACHE_DIR=$WORKSPACE/pip_cache
+
+# Allocator: expandable_segments eliminates fragmentation — required for bs=4
+# seq=2048 on H200 (without this, OOM at 134/140 GB due to 5 GB fragmentation).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 EOF
 # shellcheck disable=SC1090
 source ~/.bashrc

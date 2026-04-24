@@ -18,6 +18,10 @@ import os
 import shutil
 import sys
 
+# expandable_segments reduces allocator fragmentation — must be set BEFORE
+# torch.cuda init. Enables bs=4 seq=2048 on H200 without OOM from fragmentation.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import torch.distributed as dist
 # H100 torch 2.4.1 has a FakeTensor / dynamo bug on @torch.compile'd helpers in

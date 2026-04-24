@@ -93,24 +93,40 @@ def main():
     x = torch.randint(0, cfg.vocab_size, (args.batch, args.seq), device=device)
     y = torch.randint(0, cfg.vocab_size, (args.batch, args.seq), device=device)
 
-    # ==== Training steps ====
+    # ==== Training steps: first 2 warmup (JIT compile), next 3 timed ====
+    import time
     torch.cuda.reset_peak_memory_stats(device)
     losses = []
-    for step in range(3):
+    step_times = []
+    for step in range(5):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
         with torch.amp.autocast("cuda", dtype=torch.bfloat16):
             out = engine.module.snn(x, y)
             loss = out.last_loss.mean()
         engine.backward(loss)
         engine.step()
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t0
         assert not torch.isnan(loss).item(), f"rank {rank}: NaN at step {step}"
         losses.append(loss.item())
+        step_times.append(dt)
     peak_mem = torch.cuda.max_memory_allocated(device) / 1e9
     if rank == 0:
         print(f"  peak memory (rank 0): {peak_mem:.2f} GB")
-    if rank == 0:
         print(f"  step losses (rank 0): {[f'{l:.4f}' for l in losses]}")
+        print(f"  step times (s): {[f'{t:.2f}' for t in step_times]}")
+        # Steps 2..4 after compile; report mean of those
+        steady = step_times[2:]
+        if steady:
+            print(f"  steady-state (last 3 steps): mean {sum(steady)/len(steady)*1000:.0f} ms, "
+                  f"min {min(steady)*1000:.0f} ms")
         assert losses[-1] < losses[0] or losses[-1] < 5.8, f"Loss not decreasing: {losses}"
-        print("  ✓ 3 training steps, loss decreasing, no NaN")
+        print("  ✓ 5 training steps, loss decreasing, no NaN")
+
+    # Skip save/load section for adam (no Muon params). Only meaningful for muon.
+    if args.optimizer != "muon":
+        return
 
     # ==== DS save/load round-trip ====
     # Use /workspace (data disk) not /tmp (20G system disk) to avoid filling up

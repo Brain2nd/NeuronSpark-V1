@@ -71,10 +71,24 @@ class PretrainDataset(Dataset):
                 self._index.append((si, di))
 
     def _init_hf(self, path: str):
-        from datasets import load_from_disk, DatasetDict
-        ds = load_from_disk(path)
-        if isinstance(ds, DatasetDict):
-            ds = ds[list(ds.keys())[0]]
+        from datasets import load_dataset, load_from_disk, DatasetDict
+        # Try save_to_disk format first (dataset_info.json present), else
+        # fall back to a dir-of-parquet/jsonl layout (HF Hub raw download).
+        if os.path.isfile(os.path.join(path, "dataset_info.json")):
+            ds = load_from_disk(path)
+            if isinstance(ds, DatasetDict):
+                ds = ds[list(ds.keys())[0]]
+        else:
+            parquets = sorted(glob(os.path.join(path, "*.parquet")))
+            if parquets:
+                ds = load_dataset("parquet", data_files=parquets, split="train")
+            else:
+                jsonls = sorted(glob(os.path.join(path, "*.jsonl")))
+                if not jsonls:
+                    raise RuntimeError(
+                        f"{path} has no dataset_info.json / *.parquet / *.jsonl"
+                    )
+                ds = load_dataset("json", data_files=jsonls, split="train")
         self._hf_dataset = ds
 
     def _init_jsonl(self, path: str):

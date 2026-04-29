@@ -52,32 +52,32 @@ class SNNDashboard:
     # ====== public ======
 
     def cache_grad_norms(self, model):
-        """Before optimizer.step(), capture per-param grad norm.
+        """DISABLED under multi-GPU (ZeRO-2): caused NCCL collective desync.
 
-        Multi-GPU note (ZeRO-2):
-          Parameters are replicated across ranks but gradients are reduce-scatter
-          SHARDED — each rank holds only 1/world_size of the full gradient.
-          We all-reduce the squared norm across ranks to get the GLOBAL grad
-          norm (mathematically correct: ||g||² = Σ_rank ||g_rank||²).
-          This gives correct scalar norms but NOT full gradient tensors —
-          histograms / per-element distributions are NOT reconstructible here
-          without expensive all-gather (see `_log_histograms`, disabled under ZeRO).
+        Old logic iterated `named_parameters()` and called dist.all_reduce only
+        when `p.grad is not None`. Under ZeRO-2 each rank holds 1/W shards, so
+        different ranks skipped different parameters, drifting the per-rank
+        collective_seq_id and eventually deadlocking on a later ALLREDUCE.
+
+        Multi-GPU: noop. _log_param_norms falls back to local p.grad.norm()
+        (rank-0-only, partial under ZeRO-2 but safe — no collective involved).
+        Single-GPU: original full-grad norm path retained.
         """
         use_dist = dist.is_initialized() and dist.get_world_size() > 1
+        self._is_distributed_sharded = use_dist
+        if use_dist:
+            self._grad_cache = {}
+            return
         cache: dict[str, float] = {}
         for name, p in _inner_snn(model).named_parameters():
             if not p.requires_grad or p.grad is None:
                 continue
             local_sq = p.grad.data.norm().square()
-            if use_dist:
-                dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
             clean = name.replace("._fsdp_wrapped_module", "")
             if clean.startswith("module."):
                 clean = clean[len("module."):]
             cache[clean] = local_sq.sqrt().item()
         self._grad_cache = cache
-        # Mark distributed mode for histogram gating
-        self._is_distributed_sharded = use_dist
 
     def log_step(self, step, metrics_dict, model, log_params: bool = True):
         if not self._enabled:

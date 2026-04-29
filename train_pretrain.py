@@ -132,6 +132,7 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
     device = f"cuda:{local_rank}"
     sampler.set_epoch(epoch)
     t_start = time.time()
+    tokens_seen_at_start = tokens_seen
 
     for step, (X, Y, loss_mask) in enumerate(loader):
         if step < start_step:
@@ -204,7 +205,7 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
                 "loss": ce_loss.item(),
                 "ppl": math.exp(min(ce_loss.item(), 20.0)),
                 "lr": lr,
-                "tps": tokens_seen / max(elapsed, 1),
+                "tps": (tokens_seen - tokens_seen_at_start) / max(elapsed, 1),
                 "tokens_seen": tokens_seen,
                 "ponder_cost": float(out.ponder_cost) if out.ponder_cost is not None else 0.0,
                 "memory_current_gb": torch.cuda.memory_allocated() / 1e9,
@@ -213,7 +214,7 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
 
         if step % args.log_interval == 0 and is_main():
             elapsed = time.time() - t_start
-            tps = tokens_seen / max(elapsed, 1)
+            tps = (tokens_seen - tokens_seen_at_start) / max(elapsed, 1)
             eta_min = elapsed / (step - start_step + 1) * (iters_per_epoch - step - 1) / 60
             print(
                 f"ep[{epoch+1}/{args.epochs}] step {step}/{iters_per_epoch} "

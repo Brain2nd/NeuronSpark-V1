@@ -1762,14 +1762,30 @@ class KPredictor(nn.Module):
             lr_bias: bias learning rate (typical 1e-3)
             ema_decay: EMA smoothing factor for usage statistics
         """
-        if y_hard.numel() == 0:
-            return
-        # Aggregate y_hard over all leading dims except K (cast to fp32 for stable mean)
-        usage = y_hard.float().reshape(-1, self.K).mean(dim=0)  # (K,)
-        # All-reduce usage across ranks so bias stays in sync
+        # NCCL-safe: all ranks must participate in collectives equally.
+        # Previously `if y_hard.numel() == 0: return` made empty ranks skip
+        # the all_reduce while non-empty ranks entered it, drifting per-rank
+        # collective_seq_id and eventually deadlocking on a later large
+        # ALLREDUCE (manifested as save_checkpoint -> 600s timeout every
+        # ~1000 steps). Now: empty rank submits zeros + 0-count; we SUM both
+        # and divide to get the correct global mean of only active ranks.
         import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(usage, op=dist.ReduceOp.AVG)
+        use_dist = dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        local_count = 1.0 if (y_hard is not None and y_hard.numel() > 0) else 0.0
+        if local_count > 0:
+            usage = y_hard.float().reshape(-1, self.K).mean(dim=0)  # (K,)
+        else:
+            usage = torch.zeros(self.K, device=self.bias.device, dtype=torch.float32)
+        if use_dist:
+            counts = torch.tensor([local_count], device=self.bias.device, dtype=torch.float32)
+            dist.all_reduce(usage, op=dist.ReduceOp.SUM)
+            dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+            n_active = counts.item()
+            if n_active == 0:
+                return  # all ranks empty (rare); nothing to update
+            usage = usage / n_active
+        elif local_count == 0:
+            return  # single-GPU + empty: nothing to update
         # EMA-smooth (fp32 arithmetic via _usage_ema being promoted to fp32)
         self._usage_ema.mul_(ema_decay).add_(usage.to(self._usage_ema.dtype), alpha=1.0 - ema_decay)
         # Deviation from uniform
@@ -2077,14 +2093,16 @@ class SNNDecoderLayer(MemoryModule):
 
         Call once per training step AFTER optimizer.step().
         """
-        if self._last_y_hard_block is not None:
-            self.block_k_predictor.update_bias(
-                self._last_y_hard_block, lr_bias=lr_bias, ema_decay=ema_decay,
-            )
-        if self._last_y_hard_ffn is not None:
-            self.ffn_k_predictor.update_bias(
-                self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
-            )
+        # NCCL-safe: always call inner update_bias (handles None / empty).
+        # Previously `if ... is not None:` made ranks where the forward path
+        # didn't populate _last_y_hard_xxx skip the call -> rank-asymmetric
+        # collectives -> NCCL desync -> deadlock at next large ALLREDUCE.
+        self.block_k_predictor.update_bias(
+            self._last_y_hard_block, lr_bias=lr_bias, ema_decay=ema_decay,
+        )
+        self.ffn_k_predictor.update_bias(
+            self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
+        )
 
     def single_step_forward(self, h):
         """
@@ -2367,10 +2385,10 @@ class SNNAttentionDecoderLayer(MemoryModule):
 
     def update_bias(self, lr_bias: float = 1e-3, ema_decay: float = 0.99) -> None:
         """Gradient-free bias balancing for the FFN sub-layer k_predictor."""
-        if self._last_y_hard_ffn is not None:
-            self.ffn_k_predictor.update_bias(
-                self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
-            )
+        # NCCL-safe: always call (inner update_bias handles None / empty).
+        self.ffn_k_predictor.update_bias(
+            self._last_y_hard_ffn, lr_bias=lr_bias, ema_decay=ema_decay,
+        )
 
 
 # ============================================================

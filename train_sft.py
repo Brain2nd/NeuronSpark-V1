@@ -119,23 +119,32 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             }, engine.module, log_params=(step % args.log_interval == 0))
 
         if (step + 1) % args.save_interval == 0:
+            save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
+            # rank 0: HF format weights + training_state metadata
             if is_main():
-                save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
+                engine.module.eval()
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
                 torch.save({"step": step + 1, "epoch": epoch, "tokens_seen": tokens_seen},
                            os.path.join(save_dir, "training_state.pth"))
-                log(f"  → saved {save_dir}")
+                log(f"  → saved HF weights to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
+                engine.module.train()
             dist.barrier()
+            # ALL ranks: DeepSpeed checkpoint with optimizer state (resume support)
+            engine.save_checkpoint(save_dir, tag="deepspeed")
+            if is_main():
+                log(f"  → saved DeepSpeed optimizer state to {save_dir}/deepspeed/")
 
     return tokens_seen
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pretrained_ckpt", required=True,
-                    help="HF-format NeuronSpark checkpoint to initialize from")
+    ap.add_argument("--pretrained_ckpt", default=None,
+                    help="HF-format pretrain ckpt to initialize SFT from (mutually exclusive with --resume)")
+    ap.add_argument("--resume", default=None,
+                    help="resume from a previously-saved SFT ckpt dir (含 deepspeed/ + training_state.pth)")
     ap.add_argument("--data_path", required=True, help="HF Arrow directory or JSONL")
     ap.add_argument("--tokenizer_path", default="tokenizer_v3/")
     ap.add_argument("--max_length", type=int, default=2048)
@@ -158,14 +167,19 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # 互斥校验
+    if not args.pretrained_ckpt and not args.resume:
+        raise ValueError("必须指定 --pretrained_ckpt (新 SFT) 或 --resume (续训)")
+
     # Tokenizer (SFT: eos = <|im_end|> for early-stopping at turn boundary)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
     log(f"Tokenizer {args.tokenizer_path}: vocab={len(tokenizer)}, im_end_id={im_end_id}")
 
-    # Load pretrained model
-    log(f"Loading pretrained from {args.pretrained_ckpt}")
-    model = NeuronSparkForCausalLM.from_pretrained(args.pretrained_ckpt, dtype=torch.bfloat16, trust_remote_code=True)
+    # Load model: --resume 优先 (HF 格式 weights), 否则 --pretrained_ckpt
+    src = args.resume if args.resume else args.pretrained_ckpt
+    log(f"Loading model weights from {src}" + (" (RESUMING)" if args.resume else ""))
+    model = NeuronSparkForCausalLM.from_pretrained(src, dtype=torch.bfloat16, trust_remote_code=True)
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device=device, dtype=torch.bfloat16)
@@ -189,6 +203,30 @@ def main():
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_cfg,
     )
+
+    # Resume: 加载 DeepSpeed optimizer state + 解 step/tokens_seen
+    start_step, start_epoch, tokens_seen = 0, 0, 0
+    if args.resume and os.path.isdir(args.resume):
+        ds_tag_dir = os.path.join(args.resume, "deepspeed")
+        if os.path.isdir(ds_tag_dir):
+            log(f"Resuming DeepSpeed checkpoint from {args.resume}/deepspeed/")
+            load_path, _ = engine.load_checkpoint(
+                args.resume, tag="deepspeed",
+                load_module_strict=False, load_optimizer_states=True,
+                load_lr_scheduler_states=False,
+            )
+            if load_path is None:
+                raise RuntimeError(f"DeepSpeed resume failed from {args.resume}/deepspeed/")
+            log(f"  Resumed: {load_path}")
+        else:
+            log(f"WARN: --resume {args.resume} 没有 deepspeed/ 子目录, 仅加载 model weights, 重置 optimizer")
+        ts_path = os.path.join(args.resume, "training_state.pth")
+        if os.path.isfile(ts_path):
+            ts = torch.load(ts_path, map_location="cpu", weights_only=False)
+            start_step = ts.get("step", 0)
+            start_epoch = ts.get("epoch", 0)
+            tokens_seen = ts.get("tokens_seen", 0)
+            log(f"  step={start_step}, epoch={start_epoch}, tokens={tokens_seen:,}")
 
     # Data: auto-detect binned 三件套 vs runtime tokenize
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -217,12 +255,12 @@ def main():
     log(f"{'='*60}\n")
 
     dashboard = SNNDashboard(args.dashboard_dir, engine.module, rank=rank) if args.dashboard_dir else None
-    tokens_seen = 0
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         tokens_seen = train_epoch(
             epoch, engine, loader, sampler, args, iters_per_epoch,
-            tokens_seen, dashboard, start_step=0,
+            tokens_seen, dashboard, start_step=start_step,
         )
+        start_step = 0  # 仅首个 resume epoch 跳到 start_step, 后续 epoch 从头
     if dashboard is not None:
         dashboard.close()
     log("SFT complete.")

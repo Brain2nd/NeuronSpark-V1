@@ -1503,6 +1503,11 @@ class SNNBlock(MemoryModule):
             detach_reset=False,
         )
 
+        # ====== 缓存生成态: conv1d ring buffer (因果卷积左 context) ======
+        # None = 首次/reset 后, conv1d 用 zero-pad 启动
+        # tensor (batch, D, kernel_size-1) = decode 续传, prepend 到当前帧前
+        self.register_memory('conv_state', None)
+
         # ====== 参数初始化 ======
         self._initialize_parameters()
 
@@ -1577,10 +1582,28 @@ class SNNBlock(MemoryModule):
         TK, batch, D = h_seq.shape
         DN = self.D * self.N
 
-        # ====== Phase 0: 因果卷积预混合（局部上下文） ======
+        # ====== Phase 0: 因果卷积预混合（局部上下文 + ring buffer 支持续传） ======
         conv_dtype = self.conv1d.weight.dtype
+        PAD = self.conv_kernel_size - 1  # = 3
         conv_in = h_seq.to(conv_dtype).permute(1, 2, 0)  # (batch, D, TK)
-        conv_out = self.conv1d(conv_in)[:, :, :TK]  # causal: 截断未来
+        if self.conv_state is None:
+            # 首次/reset 后: 左 zero-pad 启动 (与原 self.conv1d 行为等价)
+            conv_in_padded = F.pad(conv_in, (PAD, 0))
+        else:
+            # decode 续传: ring buffer 当左 context, 不补零
+            conv_in_padded = torch.cat([self.conv_state.to(conv_dtype), conv_in], dim=2)
+        # 手动控制 padding -> 用 F.conv1d 不让 nn.Conv1d 再补零
+        conv_out = F.conv1d(
+            conv_in_padded,
+            self.conv1d.weight,
+            self.conv1d.bias,
+            stride=self.conv1d.stride,
+            padding=0,
+            dilation=self.conv1d.dilation,
+            groups=self.conv1d.groups,
+        )  # (batch, D, TK)
+        # 保存最后 PAD 帧供下次调用 (取自 padded 输入末尾，对应"已观察到的"最近 PAD 帧)
+        self.conv_state = conv_in_padded[:, :, -PAD:].detach()
         h_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
 
         # ====== Phase 1: 批量投影（全部 TK 帧同时计算）======
@@ -2210,6 +2233,8 @@ class SNNAttentionDecoderLayer(MemoryModule):
 
         # 持久状态
         self.register_memory('M_state', 0.)
+        # 缓存生成态: RoPE 绝对位置偏移 (decode 时累加, reset 后清零)
+        self.register_memory('pos_offset', 0)
 
         # ====== 子层 2: SNNFFN (完全复用 SNNDecoderLayer 的结构) ======
         self.ffn_norm = RMSNorm(D)
@@ -2328,11 +2353,13 @@ class SNNAttentionDecoderLayer(MemoryModule):
         k = k.reshape(seq_len, batch, self.D_key)
         v = v.reshape(seq_len, batch, self.D_value)
 
-        # RoPE（转成输入 dtype，兼容 bf16 推理）
-        rope_cos = self.rope_cos[:seq_len].unsqueeze(1).to(q.dtype)
-        rope_sin = self.rope_sin[:seq_len].unsqueeze(1).to(q.dtype)
+        # RoPE: 用 pos_offset 支持续传 (prefill: pos=0, decode: pos=已生成 token 数)
+        pos = self.pos_offset
+        rope_cos = self.rope_cos[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
+        rope_sin = self.rope_sin[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
         q = _apply_rope(q, rope_cos, rope_sin)
         k = _apply_rope(k, rope_cos, rope_sin)
+        self.pos_offset = pos + seq_len
 
         # PLIFNode gate
         gate = self._gate_neuron_parallel(h_normed)
@@ -3012,43 +3039,15 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             )
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
-    @torch.no_grad()
-    def generate(self, input_ids=None, max_new_tokens=256, temperature=1.0,
-                 top_k=50, top_p=1.0, repetition_penalty=1.0,
-                 eos_token_id=None, pad_token_id=None,
-                 attention_mask=None, **kwargs):
-        """覆写 generate: 委托给 SNNLanguageModel.generate (stateful SNN 生成).
-
-        HF 默认 generate 每步调 forward() → SNNLanguageModel.forward() 内部
-        functional.reset_net() 清状态 → 每步丢历史 → 乱码.
-        SNNLanguageModel.generate 只在 prompt prefill 前 reset 一次,
-        之后跨 token 保持 PLIF .v 状态.
-
-        temperature 按用户传入透传, 不做 do_sample 自动重映射 (用户要 greedy 请传 temperature<=0).
-        """
-        if input_ids is None:
-            raise ValueError('input_ids required')
-        device_type = 'cuda' if input_ids.is_cuda else 'cpu'
-        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
-            out = self.snn.generate(
-                prompt_ids=input_ids,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k if top_k else 0,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                eos_token_id=eos_token_id,
-            )
-        return out
-
     @classmethod
     def from_pretrained(cls, *args, **kwargs):
-        """覆写 from_pretrained 强制全量 fp32 加载 + 重算 RoPE 非持久 buffer.
+        """覆写 from_pretrained: per-tensor 混合精度加载 + 重算 RoPE 非持久 buffer.
 
-        1) dtype: safetensors 中 neuron 是 fp32 / 矩阵是 bf16. 若直接用 bf16
-           加载会把 neuron 降 bf16 (精度不足); 若混合 cast 又和 model.py
-           native (upcast 一切到 fp32) 不一致, argmax 飘. fp32 加载 + forward
-           内 autocast bf16 compute, 与原生 bit-exact 对齐.
+        1) dtype: 训练混合精度 = 矩阵 bf16 + 神经元 fp32 (utils/param_groups.py
+           promote_neuron_params_fp32). safetensors 按 per-tensor 存. 加载策略:
+           先 fp32 加载 (保住神经元 fp32 精度), 再把矩阵参数降回 bf16 (它们存的就是 bf16,
+           降回去无精度损失). 推理时 autocast bf16 包 forward → 矩阵 matmul 走 bf16,
+           神经元参数通过 modeling 内 .to(input_dtype) 临时降 bf16 算, 但 stored 仍 fp32.
 
         2) RoPE buffer: SNNAttentionDecoderLayer 的 rope_cos/rope_sin 用
            register_buffer(..., persistent=False), 不在 safetensors 里.
@@ -3058,11 +3057,11 @@ class NeuronSparkForCausalLM(PreTrainedModel):
         """
         import torch as _torch
         user_dtype = kwargs.get('dtype', kwargs.get('torch_dtype', None))
-        if user_dtype is None:
+        apply_mixed = (user_dtype is None)
+        if apply_mixed:
             kwargs['dtype'] = _torch.float32
         model = super().from_pretrained(*args, **kwargs)
         # 重填 RoPE non-persistent buffer
-        # _precompute_rope_freqs(dim) 返回 (max_seq_len, dim//2), 所以 dim = shape[-1] * 2
         for layer_mod in model.snn.layers:
             if hasattr(layer_mod, 'rope_cos') and hasattr(layer_mod, 'rope_sin'):
                 dim = layer_mod.rope_cos.shape[-1] * 2
@@ -3071,58 +3070,65 @@ class NeuronSparkForCausalLM(PreTrainedModel):
                 dtype = layer_mod.rope_cos.dtype
                 layer_mod.rope_cos.data = cos.to(device=device, dtype=dtype)
                 layer_mod.rope_sin.data = sin.to(device=device, dtype=dtype)
+        # Per-tensor 恢复混合精度: 矩阵→bf16, 神经元/PonderNet buffer→保持 fp32
+        # 对齐训练 utils/param_groups.promote_neuron_params_fp32:
+        #   params: 仅 .w/.v_th/.b_beta/.b_alpha/.b_th 后缀 → fp32
+        #   buffers: k_predictor 下的 .bias 和 ._usage_ema → fp32
+        if apply_mixed:
+            _NEURON_PARAM_SUFFIXES = ('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')
+            for name, p in model.named_parameters():
+                if name.endswith(_NEURON_PARAM_SUFFIXES):
+                    continue  # 神经元参数保 fp32
+                p.data = p.data.to(_torch.bfloat16)
+            for name, b in model.named_buffers():
+                if 'k_predictor' in name and (name.endswith('.bias') or name.endswith('._usage_ema')):
+                    continue  # PonderNet buffer 保 fp32
+                if 'rope_' in name:
+                    continue  # RoPE buffer 已按 _precompute_rope_freqs 默认 dtype 填好
+                b.data = b.data.to(_torch.bfloat16)
         return model
 
     def prepare_inputs_for_generation(self, input_ids, **kwargs):
+        # SNN 没有 KV cache; 每步用全序列重算 (HF GenerationMixin 默认行为)
         return {"input_ids": input_ids}
 
     def can_generate(self):
         return True
 
-    _SENTINEL = object()
-
     @torch.no_grad()
-    def generate(self, input_ids=None, max_new_tokens=_SENTINEL,
-                 temperature=_SENTINEL, top_k=_SENTINEL, top_p=_SENTINEL,
-                 repetition_penalty=_SENTINEL, eos_token_id=_SENTINEL, **kwargs):
-        defaults = dict(max_new_tokens=256, temperature=1.0, top_k=50,
-                        top_p=1.0, repetition_penalty=1.0, eos_token_id=None)
-        gen_config = kwargs.get('generation_config', None)
-        if gen_config is not None:
-            for key in defaults:
-                v = getattr(gen_config, key, None)
-                if v is not None:
-                    defaults[key] = v
-            if not getattr(gen_config, 'do_sample', True):
-                defaults['temperature'] = 0.0
-        S = self._SENTINEL
-        if max_new_tokens is not S: defaults['max_new_tokens'] = max_new_tokens
-        if temperature is not S: defaults['temperature'] = temperature
-        if top_k is not S: defaults['top_k'] = top_k
-        if top_p is not S: defaults['top_p'] = top_p
-        if repetition_penalty is not S: defaults['repetition_penalty'] = repetition_penalty
-        if eos_token_id is not S: defaults['eos_token_id'] = eos_token_id
-        if not kwargs.get('do_sample', True):
-            defaults['temperature'] = 0.0
-        if 'max_length' in kwargs and input_ids is not None:
-            derived = kwargs['max_length'] - input_ids.shape[1]
-            if derived <= 0:
-                return input_ids
-            defaults['max_new_tokens'] = derived
-        if kwargs.get('num_beams', 1) != 1:
-            raise NotImplementedError("NeuronSpark SNN does not support beam search")
-        if kwargs.get('num_return_sequences', 1) != 1:
-            raise NotImplementedError("NeuronSpark SNN does not support multiple return sequences")
-        if 'attention_mask' in kwargs:
-            mask = kwargs['attention_mask']
-            if mask is not None and mask.min() == 0:
-                raise ValueError("NeuronSpark SNN generate does not support padding in attention_mask")
-        if defaults['eos_token_id'] is None:
-            defaults['eos_token_id'] = self.config.eos_token_id
-        return self.snn.generate(
-                input_ids, max_new_tokens=defaults['max_new_tokens'],
-                temperature=defaults['temperature'], top_k=defaults['top_k'],
-                top_p=defaults['top_p'], repetition_penalty=defaults['repetition_penalty'],
-                eos_token_id=defaults['eos_token_id'],
+    def generate_cached(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 256,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
+        eos_token_id=None,
+    ) -> torch.Tensor:
+        """带缓存的 stateful 生成: prefill 整 prompt, 然后逐 token decode 仅推 K 帧.
+
+        正确性依赖三个状态自动 carry:
+          - PLIF .v (已通过 register_memory)
+          - SNNAttentionDecoderLayer.M_state (已通过 register_memory)
+          - SNNBlock.conv_state + SNNAttentionDecoderLayer.pos_offset (新加)
+
+        与 HF 默认 model.generate() 等价但每步 O(K) 而非 O(T*K), T 越长加速越明显.
+        autocast bf16 包 forward 与 self.forward() 一致.
+
+        eos_token_id 默认从 config 取.
+        """
+        if eos_token_id is None:
+            eos_token_id = self.config.eos_token_id
+        device_type = 'cuda' if input_ids.is_cuda else 'cpu'
+        with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+            return self.snn.generate(
+                prompt_ids=input_ids,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k if top_k else 0,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                eos_token_id=eos_token_id,
             )
 

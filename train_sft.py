@@ -29,7 +29,7 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import AutoTokenizer
 
 from neuronspark import NeuronSparkForCausalLM
-from nsdata.sft_dataset import SFTDataset
+from nsdata.sft_dataset import SFTDataset, BinnedSFTDataset, is_binned_sft_dir
 from utils.dashboard import SNNDashboard
 from utils.param_groups import build_param_groups, promote_neuron_params_fp32
 
@@ -190,9 +190,14 @@ def main():
         model=model, optimizer=optimizer, config=ds_cfg,
     )
 
-    # Data
+    # Data: auto-detect binned 三件套 vs runtime tokenize
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
-    ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_length, pad_token_id=pad_id)
+    if is_binned_sft_dir(args.data_path):
+        ds = BinnedSFTDataset(args.data_path, max_length=args.max_length)
+        log(f"SFTDataset: BINNED mode, {len(ds)} samples from {args.data_path}")
+    else:
+        ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_length, pad_token_id=pad_id)
+        log(f"SFTDataset: runtime tokenize mode, {len(ds)} samples from {args.data_path}")
     rank = dist.get_rank()
     world = dist.get_world_size()
     sampler = DistributedSampler(ds, num_replicas=world, rank=rank, shuffle=True)

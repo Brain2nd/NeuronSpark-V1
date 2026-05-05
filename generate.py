@@ -29,7 +29,7 @@ def load(ckpt_path: str, tokenizer_path: str | None = None, device: str = "cuda"
     tok_src = tokenizer_path or ckpt_path
     tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        ckpt_path, dtype=torch.float32, trust_remote_code=True,
+        ckpt_path, trust_remote_code=True,
     )
     model = model.to(device).eval()
     return model, tokenizer

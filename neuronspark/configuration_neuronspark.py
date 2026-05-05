@@ -32,6 +32,10 @@ class NeuronSparkConfig(PretrainedConfig):
         self.N = N
         self.K = K
         self.num_layers = num_layers
+        # HF GenerationMixin / DynamicCache 期望 num_hidden_layers 字段
+        self.num_hidden_layers = num_layers
+        # SNN 没有 KV cache, 关掉避免 HF 试图建 DynamicCache
+        self.use_cache = False
         self.D_ff = D_ff
         self.v_th_min = v_th_min
         self.memory_layer_interval = memory_layer_interval

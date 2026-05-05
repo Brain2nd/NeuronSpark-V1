@@ -10,14 +10,24 @@ checkpoints/
 checkpoints_sft/
 checkpoints_distill/
 checkpoints_hf/
+checkpoints_hf_*/
+checkpoints_sft_*/
 *.pt
+*.bak
+*.bak_*
 train_log*.txt
 train_v75.log
 train*.log
 runs/
+hf_logs/
+logs/
+exp/
 
 # Data (too large for git)
 data/
+
+# Claude session state
+.claude/
 
 # IDE
 .vscode/

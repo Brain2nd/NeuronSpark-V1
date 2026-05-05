@@ -11,27 +11,23 @@ PROMPTS = [
 ]
 
 CONFIGS = [
-    # (label, T, top_p, top_k, rep_pen)
-    ("greedy",          0.0, 1.00,  0, 1.0),
-    ("T0.3 p0.9",       0.3, 0.90, 50, 1.1),
-    ("T0.3 p0.95",      0.3, 0.95, 50, 1.1),
-    ("T0.5 p0.9",       0.5, 0.90, 50, 1.1),
-    ("T0.5 p0.95",      0.5, 0.95, 50, 1.1),
+    # (label, T, top_p, top_k, rep_pen)  -- 精选, 上次 sweep 表现较好的
     ("T0.7 p0.9",       0.7, 0.90, 50, 1.1),
-    ("T0.7 p0.95",      0.7, 0.95, 50, 1.1),
-    ("T0.7 p1.0 k0",    0.7, 1.00,  0, 1.1),
-    ("T1.0 p0.95",      1.0, 0.95, 50, 1.1),
-    ("T0.6 p0.95 rp1.0", 0.6, 0.95, 50, 1.0),
     ("T0.6 p0.95 rp1.2", 0.6, 0.95, 50, 1.2),
+    ("T0.5 p0.95",      0.5, 0.95, 50, 1.1),
+    ("T0.8 p0.95",      0.8, 0.95, 50, 1.1),
 ]
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", default="checkpoints_hf_v3_step108000")
-    ap.add_argument("--max_new_tokens", type=int, default=200)
+    ap.add_argument("--max_new_tokens", type=int, default=2048,
+                    help="give think enough room to complete + answer")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--enable_thinking", default="True", choices=["True", "False"])
+    ap.add_argument("--use_cache", action="store_true",
+                    help="走 generate_cached (fast)")
     args = ap.parse_args()
 
     print(f"loading {args.checkpoint}", flush=True)
@@ -50,16 +46,26 @@ def main():
         ids = tok(text, return_tensors="pt").input_ids.cuda()
         for clabel, T, top_p, top_k, rep_pen in CONFIGS:
             torch.manual_seed(args.seed)
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model.generate(
+            if args.use_cache:
+                out = model.generate_cached(
                     input_ids=ids,
                     max_new_tokens=args.max_new_tokens,
-                    temperature=T if T > 0 else 1.0,
-                    top_k=top_k if top_k > 0 else None,
+                    temperature=T if T > 0 else 0,
+                    top_k=top_k if top_k > 0 else 0,
                     top_p=top_p,
                     repetition_penalty=rep_pen,
-                    do_sample=(T > 0),
                 )
+            else:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    out = model.generate(
+                        input_ids=ids,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=T if T > 0 else 1.0,
+                        top_k=top_k if top_k > 0 else None,
+                        top_p=top_p,
+                        repetition_penalty=rep_pen,
+                        do_sample=(T > 0),
+                    )
             new = tok.decode(out[0, ids.shape[1]:], skip_special_tokens=False)
             # 抽 final answer (after </think>)
             if "</think>" in new:

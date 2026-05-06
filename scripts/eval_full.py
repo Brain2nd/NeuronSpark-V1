@@ -61,45 +61,19 @@ class NeuronSparkLM(LM):
         return tpl or ''
 
     def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
-        kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
-        if self._enable_thinking:
-            kwargs['enable_thinking'] = True
+        # enable_thinking=True: 留空 (<|im_start|>assistant\n), 让模型自己生成 <think>...</think>
+        #                       — 仅生成式评测有意义, log-lik 下 cont 概率必然偏低
+        # enable_thinking=False: tokenizer 自动注入 <think>\n\n</think>\n\n, 表达 "skip thinking"
+        #                        — log-lik 下落在 SFT 训练分布里, 是正确的"非 think 模式"评测
+        kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt,
+                      enable_thinking=self._enable_thinking)
         return self.tokenizer.apply_chat_template(chat_history, **kwargs)
 
-    def _generate_think_section(self, ctx_ids, max_think_tokens=512):
-        """从 ctx 末尾起 generate, 直到模型自己吐出 </think> 或达到上限.
-        返回 generated token ids (含 </think> 闭合 token, 不含 prompt).
-        """
-        close_id = self.tokenizer.encode('</think>', add_special_tokens=False)[0]
-        input_ids = torch.tensor([ctx_ids], dtype=torch.long, device=self._device)
-        gen_ids = []
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=self._dtype):
-            for _ in range(max_think_tokens):
-                out = self.model(input_ids=input_ids)
-                next_id = int(out.logits[0, -1, :].argmax().item())
-                gen_ids.append(next_id)
-                input_ids = torch.cat(
-                    [input_ids, torch.tensor([[next_id]], device=self._device)], dim=1)
-                if next_id == close_id:
-                    break
-                if input_ids.shape[1] >= self.max_length - 64:
-                    break
-        return gen_ids
-
     def loglikelihood(self, requests):
-        # 缓存: 同 ctx (eg 一道 MC 题的 4 个 cont 选项) 共享同一份 think section
-        think_cache = {}
         results = []
         for req in requests:
             ctx, cont = req.args[0], req.args[1]
             ctx_ids = self.tokenizer.encode(ctx, add_special_tokens=False)
-            # think 模式: ctx 以 chat_template 末尾结束 (<|im_start|>assistant\n),
-            # 让模型自己 generate <think>...</think> 闭合, 然后在闭合后做 cont loglik
-            if self._enable_thinking:
-                key = tuple(ctx_ids)
-                if key not in think_cache:
-                    think_cache[key] = self._generate_think_section(ctx_ids)
-                ctx_ids = ctx_ids + think_cache[key]
             cont_ids = self.tokenizer.encode(cont, add_special_tokens=False)
             all_ids = ctx_ids + cont_ids
             if len(all_ids) > self.max_length:

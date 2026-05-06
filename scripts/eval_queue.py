@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--out_dir", default="exp/v3_step84000")
     ap.add_argument("--skip_done", action="store_true",
                     help="已存在结果文件就跳过")
+    ap.add_argument("--apply_chat_template", action="store_true")
+    ap.add_argument("--enable_thinking", action="store_true",
+                    help="chat_template 时启用 think 模式")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -59,7 +62,9 @@ def main():
         t0 = time.time()
         try:
             res = run_eval(args.checkpoint, args.device, [task], out,
-                           apply_chat_template=False, system_instruction=None)
+                           apply_chat_template=args.apply_chat_template,
+                           system_instruction=None,
+                           enable_thinking=args.enable_thinking)
             dt = time.time() - t0
             summary["timings"][task] = dt
             summary["results"].update(res.get("results", {}))

@@ -14,11 +14,13 @@ from lm_eval.api.registry import register_model
 class NeuronSparkLM(LM):
     def __init__(self, checkpoint='checkpoints/ckpt_step441000',
                  tokenizer_path='./tokenizer_v3/', device='cuda:0',
-                 batch_size=1, dtype='bfloat16', **kw):
+                 batch_size=1, dtype='bfloat16', enable_thinking=False, **kw):
         super().__init__()
         self._device = torch.device(device)
         self._batch_size = int(batch_size)
         self._dtype = getattr(torch, dtype)
+        self._enable_thinking = bool(enable_thinking) if not isinstance(enable_thinking, str) \
+            else enable_thinking.lower() in ('1', 'true', 'yes')
         self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
@@ -59,9 +61,10 @@ class NeuronSparkLM(LM):
         return tpl or ''
 
     def apply_chat_template(self, chat_history, add_generation_prompt: bool = True) -> str:
-        return self.tokenizer.apply_chat_template(
-            chat_history, tokenize=False, add_generation_prompt=add_generation_prompt,
-        )
+        kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
+        if self._enable_thinking:
+            kwargs['enable_thinking'] = True
+        return self.tokenizer.apply_chat_template(chat_history, **kwargs)
 
     def loglikelihood(self, requests):
         results = []
@@ -161,17 +164,20 @@ class NeuronSparkLM(LM):
 
 
 def run_eval(checkpoint, device, tasks, output_path, apply_chat_template=False,
-             system_instruction=None):
+             system_instruction=None, enable_thinking=False):
     """单 GPU 测评指定任务子集。"""
     # 在多进程下, 每个子进程继承 parent 的 current_device=cuda:0. 必须显式 set_device
     # 否则 Triton kernel 或其它中间 tensor 会落在 cuda:0 造成跨设备/CPU 假象.
     if device.startswith('cuda'):
         torch.cuda.set_device(torch.device(device))
     print(f'[{device}] Running {len(tasks)} tasks on {checkpoint} '
-          f'(chat_template={apply_chat_template})...')
+          f'(chat_template={apply_chat_template}, think={enable_thinking})...')
+    model_args = f'checkpoint={checkpoint},device={device}'
+    if enable_thinking:
+        model_args += ',enable_thinking=True'
     results = lm_eval.simple_evaluate(
         model='neuronspark',
-        model_args=f'checkpoint={checkpoint},device={device}',
+        model_args=model_args,
         tasks=tasks,
         batch_size=1,
         apply_chat_template=apply_chat_template,
@@ -230,6 +236,8 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--apply_chat_template', action='store_true',
                         help='按 SFT ChatML 格式包装 prompt (要求 LM 实现 apply_chat_template)')
+    parser.add_argument('--enable_thinking', action='store_true',
+                        help='chat_template 时启用 think 模式 (插入 <think> prompt prefix)')
     parser.add_argument('--system_instruction', type=str, default=None,
                         help='apply_chat_template 时的 system prompt. 默认 None — 对齐 SFT '
                              '训练数据 (benchmark_sft_mix 90000 条样本均无 system message). '
@@ -261,7 +269,8 @@ if __name__ == '__main__':
     if args.num_gpus <= 1:
         run_eval(args.checkpoint, 'cuda:0', all_tasks, output_path,
                  apply_chat_template=args.apply_chat_template,
-                 system_instruction=args.system_instruction)
+                 system_instruction=args.system_instruction,
+                 enable_thinking=args.enable_thinking)
     else:
         # 按请求量均衡分配, 1 GPU 1 重任务原则: mmlu / hellaswag / mnli 各独占一卡.
         # 支持 4 / 8 GPU 两种布局 (H100 8 卡 / 4090 4 卡).
@@ -297,7 +306,8 @@ if __name__ == '__main__':
             p = multiprocessing.Process(
                 target=run_eval,
                 args=(args.checkpoint, device, tasks, pf,
-                      args.apply_chat_template, args.system_instruction),
+                      args.apply_chat_template, args.system_instruction,
+                      args.enable_thinking),
             )
             p.start()
             procs.append(p)

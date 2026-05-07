@@ -59,6 +59,13 @@ aggregation (PonderNet-style early-exit over short internal processing steps per
 `neuronsparkcheckpoint/` is a self-contained HuggingFace artifact. Loading requires
 `trust_remote_code=True` because the architecture is custom.
 
+> **OpenReview zip note**: the OpenReview supplementary zip ships every file in this
+> repository **except the two weight shards** (`model-0000{1,2}-of-00002.safetensors`,
+> ~2.2 GB total), which exceed the 100 MB upload limit. Download them from the anonymous
+> repository at `https://anonymous.4open.science/r/NeuronSpark` and drop them into
+> `neuronsparkcheckpoint/`. See `neuronsparkcheckpoint/DOWNLOAD_WEIGHTS.md` for direct
+> commands. Cloning the anonymous repo directly already yields a fully working tree.
+
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch

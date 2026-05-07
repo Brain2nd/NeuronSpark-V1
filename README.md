@@ -2,19 +2,21 @@
 
 > **Anonymous submission to NeurIPS 2026.** All identifying information has been removed for double-blind review.
 
-This repository contains the source code, tokenizer, and a fine-tuned (SFT) checkpoint
-for **NeuronSpark-1.1B**, a 24-layer, 1.16B-parameter self-attention-free language model
-built from input-dependent spiking membrane dynamics (SelectivePLIF), gated associative
-memory, and adaptive temporal aggregation (PonderNet-style early-exit over short internal
-processing steps per token). The reported pretrain run uses 2.1B tokens.
+This repository accompanies our paper. It contains the source code, the tokenizer, and the
+released **NeuronSpark-1.1B** checkpoint (the model reported in the paper) — a 24-layer,
+1.16B-parameter, self-attention-free language model built from input-dependent spiking
+membrane dynamics (SelectivePLIF), gated associative memory, and adaptive temporal
+aggregation (PonderNet-style early-exit over short internal processing steps per token).
 
 ## Repository layout
 
 ```
 .
-├── neuronsparkcheckpoint/        # Pretrained + SFT checkpoint, ready for HuggingFace AutoModel.
-│                                 # 2.32 GB safetensors (Git LFS), tokenizer (vocab 64002),
-│                                 # ChatML chat_template, modeling code with trust_remote_code.
+├── neuronsparkcheckpoint/        # Released NeuronSpark-1.1B checkpoint (the model reported in the paper).
+│                                 # 2.32 GB safetensors split into two shards (Git LFS),
+│                                 # tokenizer, ChatML chat_template, and modeling code with
+│                                 # trust_remote_code support — directly loadable via
+│                                 # transformers.AutoModelForCausalLM.
 ├── neuronspark/                  # HuggingFace-compatible model classes
 │   ├── configuration_neuronspark.py
 │   └── modeling_neuronspark.py
@@ -24,28 +26,29 @@ processing steps per token). The reported pretrain run uses 2.1B tokens.
 │   ├── snn_block.py              #   SNNBlock (selective spiking state-space layer)
 │   ├── snn_attention_decoder_layer.py  # Decoder layer with PonderNet adaptive K
 │   ├── snn_decoder_layer.py
-│   ├── plif_node.py / parallel_scan.py / rms_norm.py / lateral_inhibition.py / snn_base.py / snn_ffn.py
+│   └── plif_node.py / parallel_scan.py / rms_norm.py / lateral_inhibition.py / snn_base.py / snn_ffn.py
 ├── tokenizer/                    # Tokenizer (vocab 64002) used by the released checkpoint
 ├── model.py                      # Native (non-HF) model definition + native checkpoint loader
 ├── checkpoint_utils.py           # Native checkpoint utilities (used by training scripts)
-├── dataset.py / nsdata/          # Pretraining + SFT data loading (parquet / jsonl / arrow)
-├── train_ddp.py                  # PyTorch DDP pretraining (4090 / single-node)
-├── train_fsdp.py                 # PyTorch FSDP pretraining (multi-node H100)
-├── train_ds.py / train_ds_neuron.py  # DeepSpeed ZeRO-{1,2,3} pretraining
-├── sft_ddp.py / sft_ds.py / sft_ds_neuron.py  # SFT entry points (DDP / DeepSpeed)
-├── rl_train.py                   # RLVR (GRPO) training entry
-├── generate_sample.py            # Inference / sampling demo for the released checkpoint
+├── dataset.py / nsdata/          # Data loading (parquet / jsonl / arrow shards)
+├── train_ddp.py                  # PyTorch DDP training (single-node)
+├── train_fsdp.py                 # PyTorch FSDP training (multi-node)
+├── train_ds.py / train_ds_neuron.py  # DeepSpeed ZeRO-{1,2,3} training
+├── sft_ddp.py / sft_ds.py / sft_ds_neuron.py  # Instruction-tuning entry points
+├── rl_train.py                   # RLVR (GRPO) entry point
+├── generate_sample.py            # Inference / sampling demo
 ├── eval_classification.py        # Classification probe evaluation
 ├── scripts/
-│   ├── eval_full.py              # lm-evaluation-harness driver (with NeuronSpark LM adapter)
+│   ├── eval_full.py              # lm-evaluation-harness driver (NeuronSpark adapter
+│   │                             #   registered as model='neuronspark')
 │   ├── bench_baselines.py / bench_baselines_extended.py / bench_baselines_phaseA.py
-│   ├── build_pretrain_mix.py     # Reproduce the 2.1B-token pretraining mixture
-│   ├── build_sft_mix.py          # Reproduce the benchmark-derived SFT mixture
-│   ├── build_sft_v2.py           # Reproduce the SFT v2 mixture used by the released ckpt
-│   ├── build_benchmark_sft_mix.py / build_knowledge_sft.py / build_rl_domain_data.py
+│   ├── build_pretrain_mix.py     # Build the pretraining data mixture
+│   ├── build_sft_mix.py / build_sft_v2.py / build_benchmark_sft_mix.py
+│   │                             # Build the instruction-tuning data mixtures
+│   ├── build_knowledge_sft.py / build_rl_domain_data.py
 │   ├── prepare_data.py / filter_sft_v2.py / resize_embedding.py
 │   ├── convert_to_hf.py          # Native → HuggingFace format converter
-│   ├── train_tokenizer.py        # Reproduce the BPE tokenizer
+│   ├── train_tokenizer.py        # Train the BPE tokenizer
 │   └── ...                       # (smoke / dryrun / equivalence tests)
 ├── ds_config.json                # DeepSpeed ZeRO-2 config used in the reported run
 ├── docs/                         # Architecture notes referenced by the paper
@@ -54,8 +57,8 @@ processing steps per token). The reported pretrain run uses 2.1B tokens.
 
 ## Quick start: load the released checkpoint
 
-The `neuronsparkcheckpoint/` directory is a self-contained HuggingFace artifact. Loading
-requires `trust_remote_code=True` because the architecture is custom.
+`neuronsparkcheckpoint/` is a self-contained HuggingFace artifact. Loading requires
+`trust_remote_code=True` because the architecture is custom.
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -67,7 +70,6 @@ model = AutoModelForCausalLM.from_pretrained(
     ckpt, trust_remote_code=True, dtype=torch.bfloat16,
 ).cuda().eval()
 
-# Chat-style inference (the released ckpt is SFT-tuned)
 messages = [{"role": "user", "content": "What is the capital of France?"}]
 text = tokenizer.apply_chat_template(
     messages, tokenize=False, add_generation_prompt=True,
@@ -85,22 +87,23 @@ with torch.no_grad():
 print(tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True))
 ```
 
-A reference inference script with multiple sampling configurations and both raw / chat
-modes is provided in `generate_sample.py`.
+A reference inference script with multiple sampling configurations is provided in
+`generate_sample.py`.
 
 ### Files inside `neuronsparkcheckpoint/`
 
 | File | Purpose |
 |------|---------|
-| `model.safetensors`            | bf16 weights (2.32 GB; tracked via Git LFS) |
+| `model-00001-of-00002.safetensors` / `model-00002-of-00002.safetensors` | bf16 weights, 2.32 GB total, sharded for Git LFS (each <2 GB) |
+| `model.safetensors.index.json` | Shard index — HuggingFace auto-loads both shards |
 | `config.json`                  | Model hyperparameters (D=1024, 24 layers, K_max=12, vocab=64002, ~1.16B params) |
 | `generation_config.json`       | Default generation parameters |
 | `configuration_neuronspark.py` | HuggingFace `PretrainedConfig` subclass |
 | `modeling_neuronspark.py`      | HuggingFace `PreTrainedModel` + `GenerationMixin` implementation, including the inference cache (per-token `conv_state` ring buffer + RoPE `pos_offset`) used in our system measurements |
-| `tokenizer.json` / `tokenizer_config.json` | Tokenizer (vocab=64002) |
+| `tokenizer.json` / `tokenizer_config.json` | Tokenizer (vocab 64002) |
 | `chat_template.jinja`          | ChatML-compatible chat template |
 
-## Reproducing the pretraining and SFT runs
+## Reproducing the experiments
 
 ### Environment
 
@@ -111,16 +114,15 @@ modes is provided in `generate_sample.py`.
 
 ### Data
 
-The full pretraining and SFT pipelines (curation, deduplication, packing into
-fixed-length shards, length-uniform bucket selection, ChatML masking) are reproducible
-end-to-end from public sources via `scripts/build_pretrain_mix.py`,
-`scripts/build_sft_mix.py`, and `scripts/build_sft_v2.py`. See each script's docstring
-for the upstream HuggingFace dataset IDs and curation parameters.
+The training data pipelines (curation, deduplication, packing into fixed-length shards,
+length-uniform bucket selection, ChatML masking) are reproducible end-to-end from public
+sources via the `scripts/build_*` scripts. See each script's docstring for the upstream
+HuggingFace dataset IDs and curation parameters.
 
-### Pretraining
+### Training
 
 ```bash
-# DeepSpeed ZeRO-2, 8 GPUs (matches the reported run)
+# DeepSpeed ZeRO-2, 8 GPUs (matches the configuration of the reported run)
 deepspeed --num_gpus=8 train_ds.py \
   --deepspeed_config ds_config.json \
   --data data/pretrain_mix \
@@ -133,32 +135,17 @@ points using the same model code. Architectural ablations referenced in the pape
 (removing selective modulation / continuous health control / E[K] floor / etc.) are
 controlled by command-line flags documented in those scripts.
 
-### SFT
-
-```bash
-deepspeed --num_gpus=8 sft_ds.py \
-  --deepspeed_config ds_config.json \
-  --data data/sft_v2_mix \
-  --tokenizer_path tokenizer/ \
-  --pretrained_ckpt runs/pretrain/ckpts/ckpt_stepN \
-  --out_dir runs/sft
-```
-
-The released `neuronsparkcheckpoint/` corresponds to the SFT v2 run, which fine-tunes
-the pretrained 2.1B-token checkpoint on the mixture produced by `build_sft_v2.py`.
-
 ### Evaluation
 
 ```bash
-# lm-evaluation-harness with the NeuronSpark adapter (registered as model='neuronspark')
 python scripts/eval_full.py \
   --checkpoint ./neuronsparkcheckpoint \
   --num_gpus 1
 ```
 
 The eight zero-shot tasks reported in the paper (ARC-E, ARC-C, WinoGrande, BoolQ, PIQA,
-OpenBookQA, MMLU, C-Eval) are the default suite in `scripts/eval_full.py`. Per-task
-JSONs and an aggregate summary are written to `exp/`.
+OpenBookQA, MMLU, C-Eval) are the default suite in `scripts/eval_full.py`. Per-task JSON
+results and an aggregate summary are written to `exp/`.
 
 ## License
 

@@ -15,8 +15,8 @@
 set -e
 
 # ================ 配置 ================
-DATA_REPO='Brain2nd/NeuronSpark-SFT-v2-Mix'
-BASE_REPO='Brain2nd/NeuronSpark-V2.5-SFT'  # 起始 ckpt (hf_step7000)
+DATA_REPO='<ANONYMIZED>/sft-v2-dataset'
+BASE_REPO='<ANONYMIZED>/v2.5-sft'  # 起始 ckpt (hf_step7000)
 DATA_DIR='data/sft_v2_mix'
 BASE_CKPT_DIR='checkpoints_sft/hf_step7000'
 OUT_DIR='checkpoints_sft_v2'

@@ -1,586 +1,166 @@
-# NeuronSpark — SNN Hidden State Space Language Model
+# NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling
 
-[![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
+> **Anonymous submission to NeurIPS 2026.** All identifying information has been removed for double-blind review.
 
-**NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**
+This repository contains the source code, tokenizer, and a fine-tuned (SFT) checkpoint
+for **NeuronSpark-1.1B**, a 24-layer, 1.16B-parameter self-attention-free language model
+built from input-dependent spiking membrane dynamics (SelectivePLIF), gated associative
+memory, and adaptive temporal aggregation (PonderNet-style early-exit over short internal
+processing steps per token). The reported pretrain run uses 2.1B tokens.
 
-一个**完全基于脉冲神经网络 (SNN)** 构建的语言模型。隐层神经元的动态参数 β(t), α(t), V_th(t) 作为输入依赖的调制信号，实现选择性信息过滤。**整个网络是纯 SNN —— 不包含任何标准 ANN 组件**。
+## Repository layout
 
-## 模型下载
+```
+.
+├── neuronsparkcheckpoint/        # Pretrained + SFT checkpoint, ready for HuggingFace AutoModel.
+│                                 # 2.32 GB safetensors (Git LFS), tokenizer (vocab 64002),
+│                                 # ChatML chat_template, modeling code with trust_remote_code.
+├── neuronspark/                  # HuggingFace-compatible model classes
+│   ├── configuration_neuronspark.py
+│   └── modeling_neuronspark.py
+├── atomic_ops/                   # Core architectural building blocks
+│   ├── selective_plif.py         #   SelectivePLIF neuron (input-dependent β/α/V_th)
+│   ├── snn_associative_memory.py #   Gated associative memory (linear-attention style)
+│   ├── snn_block.py              #   SNNBlock (selective spiking state-space layer)
+│   ├── snn_attention_decoder_layer.py  # Decoder layer with PonderNet adaptive K
+│   ├── snn_decoder_layer.py
+│   ├── plif_node.py / parallel_scan.py / rms_norm.py / lateral_inhibition.py / snn_base.py / snn_ffn.py
+├── tokenizer/                    # Tokenizer (vocab 64002) used by the released checkpoint
+├── model.py                      # Native (non-HF) model definition + native checkpoint loader
+├── checkpoint_utils.py           # Native checkpoint utilities (used by training scripts)
+├── dataset.py / nsdata/          # Pretraining + SFT data loading (parquet / jsonl / arrow)
+├── train_ddp.py                  # PyTorch DDP pretraining (4090 / single-node)
+├── train_fsdp.py                 # PyTorch FSDP pretraining (multi-node H100)
+├── train_ds.py / train_ds_neuron.py  # DeepSpeed ZeRO-{1,2,3} pretraining
+├── sft_ddp.py / sft_ds.py / sft_ds_neuron.py  # SFT entry points (DDP / DeepSpeed)
+├── rl_train.py                   # RLVR (GRPO) training entry
+├── generate_sample.py            # Inference / sampling demo for the released checkpoint
+├── eval_classification.py        # Classification probe evaluation
+├── scripts/
+│   ├── eval_full.py              # lm-evaluation-harness driver (with NeuronSpark LM adapter)
+│   ├── bench_baselines.py / bench_baselines_extended.py / bench_baselines_phaseA.py
+│   ├── build_pretrain_mix.py     # Reproduce the 2.1B-token pretraining mixture
+│   ├── build_sft_mix.py          # Reproduce the benchmark-derived SFT mixture
+│   ├── build_sft_v2.py           # Reproduce the SFT v2 mixture used by the released ckpt
+│   ├── build_benchmark_sft_mix.py / build_knowledge_sft.py / build_rl_domain_data.py
+│   ├── prepare_data.py / filter_sft_v2.py / resize_embedding.py
+│   ├── convert_to_hf.py          # Native → HuggingFace format converter
+│   ├── train_tokenizer.py        # Reproduce the BPE tokenizer
+│   └── ...                       # (smoke / dryrun / equivalence tests)
+├── ds_config.json                # DeepSpeed ZeRO-2 config used in the reported run
+├── docs/                         # Architecture notes referenced by the paper
+└── LICENSE
+```
 
-预训练权重托管在 HuggingFace: [LumenscopeAI/NeuronSpark](https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre)
+## Quick start: load the released checkpoint
 
-| Checkpoint | 说明 | 大小 |
-|------------|------|------|
-| `checkpoints/ckpt_step85000.pth` | 预训练 85000 步，loss ~3.6 | 9.8 GB |
-| `checkpoints_sft/ckpt_step6500.pth` | SFT 6500 步，基础对话能力 | 9.8 GB |
+The `neuronsparkcheckpoint/` directory is a self-contained HuggingFace artifact. Loading
+requires `trust_remote_code=True` because the architecture is custom.
 
-### 快速下载
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+ckpt = "./neuronsparkcheckpoint"
+tokenizer = AutoTokenizer.from_pretrained(ckpt)
+model = AutoModelForCausalLM.from_pretrained(
+    ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+).cuda().eval()
+
+# Chat-style inference (the released ckpt is SFT-tuned)
+messages = [{"role": "user", "content": "What is the capital of France?"}]
+text = tokenizer.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True,
+)
+input_ids = tokenizer(text, return_tensors="pt").input_ids.cuda()
+with torch.no_grad():
+    out = model.generate(
+        input_ids,
+        max_new_tokens=200,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+        repetition_penalty=1.1,
+    )
+print(tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True))
+```
+
+A reference inference script with multiple sampling configurations and both raw / chat
+modes is provided in `generate_sample.py`.
+
+### Files inside `neuronsparkcheckpoint/`
+
+| File | Purpose |
+|------|---------|
+| `model.safetensors`            | bf16 weights (2.32 GB; tracked via Git LFS) |
+| `config.json`                  | Model hyperparameters (D=1024, 24 layers, K_max=12, vocab=64002, ~1.16B params) |
+| `generation_config.json`       | Default generation parameters |
+| `configuration_neuronspark.py` | HuggingFace `PretrainedConfig` subclass |
+| `modeling_neuronspark.py`      | HuggingFace `PreTrainedModel` + `GenerationMixin` implementation, including the inference cache (per-token `conv_state` ring buffer + RoPE `pos_offset`) used in our system measurements |
+| `tokenizer.json` / `tokenizer_config.json` | Tokenizer (vocab=64002) |
+| `chat_template.jinja`          | ChatML-compatible chat template |
+
+## Reproducing the pretraining and SFT runs
+
+### Environment
+
+* Python 3.10
+* PyTorch 2.4+ with CUDA
+* `transformers>=4.40`, `datasets>=2.16`, `deepspeed>=0.14`, `huggingface_hub`,
+  `lm-eval==0.4.x`, `safetensors`, `tokenizers`, `numpy`, `tqdm`, `tensorboard`.
+
+### Data
+
+The full pretraining and SFT pipelines (curation, deduplication, packing into
+fixed-length shards, length-uniform bucket selection, ChatML masking) are reproducible
+end-to-end from public sources via `scripts/build_pretrain_mix.py`,
+`scripts/build_sft_mix.py`, and `scripts/build_sft_v2.py`. See each script's docstring
+for the upstream HuggingFace dataset IDs and curation parameters.
+
+### Pretraining
 
 ```bash
-# 方法1: 使用 huggingface_hub (推荐)
-pip install huggingface_hub
-python -c "
-from huggingface_hub import hf_hub_download
-repo_id = 'LumenscopeAI/NeuronSpark'
-
-# 下载预训练 checkpoint
-hf_hub_download(repo_id=repo_id, filename='checkpoints/ckpt_step85000.pth', local_dir='.')
-
-# 下载 SFT checkpoint
-hf_hub_download(repo_id=repo_id, filename='checkpoints_sft/ckpt_step6500.pth', local_dir='.')
-"
-
-# 方法2: 使用 curl 直接下载
-mkdir -p checkpoints checkpoints_sft
-curl -L -C - -o checkpoints/ckpt_step85000.pth \
-    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints/ckpt_step85000.pth"
-curl -L -C - -o checkpoints_sft/ckpt_step6500.pth \
-    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints_sft/ckpt_step6500.pth"
+# DeepSpeed ZeRO-2, 8 GPUs (matches the reported run)
+deepspeed --num_gpus=8 train_ds.py \
+  --deepspeed_config ds_config.json \
+  --data data/pretrain_mix \
+  --tokenizer_path tokenizer/ \
+  --out_dir runs/pretrain
 ```
 
-### 快速推理
+`train_ddp.py` and `train_fsdp.py` provide single-node DDP and multi-node FSDP entry
+points using the same model code. Architectural ablations referenced in the paper
+(removing selective modulation / continuous health control / E[K] floor / etc.) are
+controlled by command-line flags documented in those scripts.
+
+### SFT
 
 ```bash
-# SFT 对话模式 (推荐 temperature=0.1~0.3)
-python generate_sample.py \
-    --checkpoint checkpoints_sft/ckpt_step6500.pth \
-    --mode sft \
-    --prompt "中国的首都是哪里？" \
-    --temperature 0.1 --top_k 10
-
-# 预训练续写模式
-python generate_sample.py \
-    --checkpoint checkpoints/ckpt_step85000.pth \
-    --mode pretrain \
-    --prompt "人工智能的发展"
+deepspeed --num_gpus=8 sft_ds.py \
+  --deepspeed_config ds_config.json \
+  --data data/sft_v2_mix \
+  --tokenizer_path tokenizer/ \
+  --pretrained_ckpt runs/pretrain/ckpts/ckpt_stepN \
+  --out_dir runs/sft
 ```
 
-**示例输出 (SFT, temp=0.1):**
-```
-Q: 中国的首都是哪里？
-A: 中国的首都在北京。
-```
+The released `neuronsparkcheckpoint/` corresponds to the SFT v2 run, which fine-tunes
+the pretrained 2.1B-token checkpoint on the mixture produced by `build_sft_v2.py`.
 
-## 致谢与参考
-
-本项目的训练基础设施（数据处理、Tokenizer 训练、预训练/SFT 流程）**严格参照 [happy-llm](https://github.com/datawhalechina/happy-llm) 教学项目**（Datawhale 开源社区）。happy-llm 是一个从零搭建大模型的教程，我们在其基础上将模型架构替换为 SNN，训练流程保持对齐。
-
-具体借鉴关系见下方 [与 happy-llm 的关系](#与-happy-llm-的关系) 章节。
-
-## 核心架构
-
-```
-token → Embedding(D=1024) → repeat K=12 帧
-  → L=24 × SNNDecoderLayer:
-      RMSNorm(h) → PLIFNode(leak) → SNNBlock → PonderNet动态K聚合 → out_proj → 残差
-      RMSNorm(h) → PLIFNode(leak) → SNNFFN  → PonderNet动态K聚合 → out_proj → 残差
-  → RMSNorm → PLIFNode(leak) → K帧mean → decode_proj → LateralInhibition → Embedding^T (tied) → logits
-```
-
-### 架构要点
-
-- **膜电位泄漏量输出**: 所有神经元输出 (1-β)·V_post（泄漏量），隐式时间尺度加权，支持 V1(V_post)/V2(泄漏量) 模式切换
-- **动态 K (PonderNet)**: 每层每子层学习停止概率，几何分布加权聚合 K 帧，不同 token 有效步数 ∈ [1, K_max]
-- **基础神经元**: PLIF (Parametric LIF)，动态 β(t), α(t), V_th(t) 由调制网络生成
-- **连续残差流**: 层间传递连续值 h，仅 SNN 子层内部使用 spike，解决深层梯度消失
-- **Pre-LN RMSNorm**: 分支归一化控制 PLIFNode 输入 scale + 残差中心化消除 DC 漂移
-- **6 条并行输入投影 + 1 条输出投影**: W_in, W_β, W_α, W_th, W_gate, W_skip (+ W_out)
-- **并行化**: Triton Fused PLIF Kernel，单 kernel 完成扫描 + spike + 软重置 + 替代梯度
-- **Natural Gradient 补偿**: sigmoid/softplus 饱和补偿 + 层间梯度均衡
-- **训练**: Surrogate Gradient + 标准反向传播
-- **框架**: SpikingJelly (conda env `SNN`)
-
-## 与 happy-llm 的关系
-
-本项目模型架构为原创 SNN 设计，但**训练基础设施严格对齐 happy-llm 教程**（[第五章：动手搭建大模型](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md)），确保训练流程经过验证，集中精力在 SNN 架构创新上。
-
-### 直接借鉴的部分（训练基础设施）
-
-| 组件 | happy-llm 源文件 | NeuronSpark 对应文件 | 对齐程度 |
-|------|-----------------|---------------------|---------|
-| **数据下载** | `download_dataset.sh` | `scripts/download_dataset.sh` | 完全对齐：ModelScope + HuggingFace 镜像 |
-| **数据预处理** | `deal_dataset.py` | `scripts/deal_dataset.py` | 完全对齐：预训练 512 字符切块 + SFT ChatML 格式转换 |
-| **Tokenizer 训练** | `train_tokenizer.py` | `scripts/train_tokenizer.py` | 完全对齐：BPE, vocab=64000, NFKC 正则化, ChatML chat_template |
-| **数据集加载** | `dataset.py` | `dataset.py` | 完全对齐：PretrainDataset (byte-offset JSONL), SFTDataset (assistant-only loss_mask) |
-| **预训练循环** | `ddp_pretrain.py` | `train.py` / `train_ddp.py` | 高度对齐：Adam, Warmup+Cosine LR, autocast bf16, 梯度累积/裁剪 |
-| **SFT 训练** | `ddp_sft_full.py` | `sft.py` / `sft_ddp.py` | 高度对齐：加载预训练权重 + SFTDataset + 相同训练循环 |
-| **推理生成** | `model_sample.py` | `generate_sample.py` | 对齐：pretrain 续写 + SFT 对话，temperature/top_k 采样 |
-| **预训练数据** | Seq-Monkey 10B tokens | 同（29M 样本 JSONL） | 完全相同 |
-| **SFT 数据** | BelleGroup 350 万条 | 同 | 完全相同 |
-
-### NeuronSpark 独创部分（SNN 架构）
-
-| 组件 | 说明 |
-|------|------|
-| `model.py` | SNNLanguageModel：三段式 encode/snn_forward/decode，自回归 generate() |
-| `atomic_ops/selective_plif.py` | SelectivePLIFNode：动态参数 PLIF 神经元 |
-| `atomic_ops/plif_node.py` | PLIFNode：D 维固定参数 PLIF 神经元 |
-| `atomic_ops/snn_block.py` | SNNBlock：SNN 状态空间 Mixer（6 条并行输入投影 + 门控 + 跳跃连接） |
-| `atomic_ops/snn_ffn.py` | SNNFFN：SNN 前馈网络（SwiGLU 风格三分支连续膜电位门控） |
-| `atomic_ops/snn_decoder_layer.py` | SNNDecoderLayer：Pre-LN RMSNorm + Block + FFN + 残差中心化 |
-| `atomic_ops/snn_attention_decoder_layer.py` | SNNAttentionDecoderLayer：SNN-Attention + FFN 解码层 |
-| `atomic_ops/snn_base.py` | Vendored spikingjelly 兼容层（MemoryModule / BaseNode / Sigmoid / Linear） |
-| `atomic_ops/parallel_scan.py` | Triton Fused PLIF Kernel，Row-param Kernel |
-| `atomic_ops/lateral_inhibition.py` | Triton 实现的侧抑制归一化 (divisive normalization) |
-| `atomic_ops/rms_norm.py` | Pre-LN 分支归一化 |
-| `docs/SNN_SELECTIVE_STATE_SPACE.md` | 完整架构设计文档 |
-
-### 与 happy-llm 的配置对比
-
-| 参数 | happy-llm (LLaMA2) | NeuronSpark (SNN) |
-|------|-------------------|-------------------|
-| 架构 | Transformer (Attention + MLP) | SNN (SNNBlock + SNNFFN) |
-| 参数量 | 215M | 1.37B |
-| 隐藏维度 | 1024 | 1024 |
-| 层数 | 18 | 24 |
-| 词表 | 64000 | 64000 |
-| 序列长度 | 512 | 2048 |
-| SNN 时间步 K | — | 12 (PonderNet 动态) |
-| 优化器 | Adam | Adam |
-| 学习率 | 2e-4 | 2e-4 |
-| LR 调度 | Warmup + Cosine | Warmup + Cosine |
-| 精度 | bfloat16 | bfloat16 |
-| 预训练数据 | Seq-Monkey | Seq-Monkey |
-| SFT 数据 | BelleGroup 3.5M | BelleGroup 3.5M |
-| 硬件 | 8 × RTX 4090 | 1 × NVIDIA GB10 (DGX Spark, 128GB 统一内存) |
-
-## 快速开始
-
-### 环境准备
+### Evaluation
 
 ```bash
-# 1. 创建 conda 环境
-conda create -n SNN python=3.10
-conda activate SNN
-
-# 2. 安装依赖
-pip install torch torchvision torchaudio
-pip install transformers tokenizers pandas numpy tqdm
-pip install modelscope huggingface_hub  # 数据集下载
-
-# 3. (DGX Spark / Blackwell GPU) Triton ptxas 配置
-export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
+# lm-evaluation-harness with the NeuronSpark adapter (registered as model='neuronspark')
+python scripts/eval_full.py \
+  --checkpoint ./neuronsparkcheckpoint \
+  --num_gpus 1
 ```
 
-### 数据下载
-
-参照 [happy-llm 第五章 5.3.1 节](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md#531-数据下载)。
-
-一键下载预训练数据（Seq-Monkey）和 SFT 数据（BelleGroup 350 万条）：
-
-```bash
-bash scripts/download_dataset.sh
-```
-
-**手动下载**（如脚本不可用）：
-
-```bash
-# 预训练数据：Seq-Monkey（出门问问序列猴子通用语料，~10B tokens）
-mkdir -p data/seq-monkey
-modelscope download --dataset ddzhu123/seq-monkey \
-    mobvoi_seq_monkey_general_open_corpus.jsonl.tar.bz2 \
-    --local_dir data/seq-monkey/
-tar -xvf data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl.tar.bz2 \
-    -C data/seq-monkey/
-
-# SFT 数据：BelleGroup 350 万条中文指令数据
-mkdir -p data/sft
-export HF_ENDPOINT=https://hf-mirror.com  # 国内镜像加速
-huggingface-cli download --repo-type dataset --resume-download \
-    BelleGroup/train_3.5M_CN --local-dir data/sft/BelleGroup/
-```
-
-### 数据预处理
-
-参照 [happy-llm 第五章 5.3.1 节](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md#531-数据下载)。
-
-将原始数据转换为训练所需格式：
-
-```bash
-# 处理全部数据（预训练 + SFT）
-python scripts/deal_dataset.py
-
-# 仅处理预训练数据
-python scripts/deal_dataset.py --pretrain_only
-
-# 仅处理 SFT 数据
-python scripts/deal_dataset.py --sft_only
-```
-
-**预训练数据处理**：将 Seq-Monkey 长文本按 512 字符切分成块，输出 JSONL 格式。
-
-```
-输入: data/seq-monkey/mobvoi_seq_monkey_general_open_corpus.jsonl
-      {"text": "一段很长的中文文本...（可能数千字）"}
-
-输出: data/seq-monkey/seq_monkey_datawhale.jsonl（约 29M 样本）
-      {"text": "切分后的512字符文本块1"}
-      {"text": "切分后的512字符文本块2"}
-      ...
-```
-
-**SFT 数据处理**：将 BelleGroup 原始对话格式转换为 ChatML 标准格式。
-
-```
-输入: data/sft/BelleGroup/train_3.5M_CN.json
-      {"conversations": [{"from": "human", "value": "..."}, {"from": "assistant", "value": "..."}]}
-
-输出: data/sft/sft_data.jsonl（约 350 万条对话）
-      [{"role": "system", "content": "你是一个AI助手"}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-```
-
-### 训练 Tokenizer
-
-参照 [happy-llm 第五章 5.3.2 节](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md#532-训练-tokenizer)：
-
-```bash
-python scripts/train_tokenizer.py \
-    --data_path data/seq-monkey/seq_monkey_datawhale.jsonl \
-    --save_dir tokenizer_snn \
-    --vocab_size 64000
-```
-
-输出 `tokenizer_snn/` 目录，包含：
-- `tokenizer.json` — BPE 模型（64000 词表，NFKC 正则化，ByteLevel 编码）
-- `tokenizer_config.json` — ChatML chat_template（兼容 Qwen2.5 格式）
-- `special_tokens_map.json` — 特殊 token 映射
-
-> 项目已包含训练好的 tokenizer (`tokenizer_snn/`)，可跳过此步直接使用。
-
-### 预训练
-
-参照 [happy-llm 第五章 5.3.4 节](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md#534-预训练)。
-
-```bash
-# 单卡预训练
-TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas \
-python -u train.py \
-    --D 1024 --D_ff 3072 --num_layers 20 \
-    --batch_size 2 --accumulation_steps 32 \
-    --warmup_iters 1000 --log_interval 10 \
-    --save_interval 1000
-
-# 多卡预训练 (DDP)
-TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas \
-torchrun --nproc_per_node=4 train_ddp.py \
-    --D 1024 --D_ff 3072 \
-    --batch_size 2 --accumulation_steps 8
-
-# 后台运行（推荐）
-tmux new-session -d -s train
-tmux send-keys -t train 'PYTHONUNBUFFERED=1 TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas conda run --no-capture-output -n SNN python -u train.py --D 1024 --D_ff 3072 --batch_size 2 --accumulation_steps 32 --warmup_iters 1000 --log_interval 10 2>&1 | tee train.log' Enter
-
-# 断续训练
-python train.py --resume checkpoints/ckpt_step5000.pth
-
-# 查看训练日志
-tail -f train.log
-```
-
-Checkpoint 自动管理：每 `--save_interval` 步保存为 `ckpt_step{N}.pth`，自动清理只保留最新 5 个。
-
-### SFT 微调
-
-参照 [happy-llm 第五章 5.3.5 节](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/第五章%20动手搭建大模型.md#535-sft-训练)。
-
-加载预训练权重，用 SFTDataset 进行监督微调。Loss 仅在 assistant 回复 token 上计算。
-
-```bash
-# 单卡 SFT
-python sft.py \
-    --pretrained_ckpt checkpoints/ckpt_step10000.pth \
-    --sft_data_path data/sft/sft_data.jsonl \
-    --D 1024 --D_ff 3072 \
-    --batch_size 4 --accumulation_steps 16 \
-    --learning_rate 5e-5 --epochs 3 --warmup_iters 100
-
-# 多卡 SFT (DDP)
-torchrun --nproc_per_node=4 sft_ddp.py \
-    --pretrained_ckpt checkpoints/ckpt_step10000.pth \
-    --sft_data_path data/sft/sft_data.jsonl \
-    --D 1024 --D_ff 3072 \
-    --batch_size 2 --accumulation_steps 8 \
-    --learning_rate 5e-5 --epochs 3
-
-# 断续训练
-python sft.py --resume checkpoints_sft/ckpt_step500.pth
-```
-
-**SFT 与预训练的关键区别：**
-
-| | 预训练 | SFT |
-|---|---|---|
-| 数据 | PretrainDataset (纯文本) | SFTDataset (ChatML 对话) |
-| Loss 范围 | 全部非 padding token | 仅 assistant 回复 token |
-| 初始权重 | 随机初始化 | 加载预训练 checkpoint |
-| 学习率 | 2e-4 | 5e-5 (更低) |
-| Epochs | 1 | 3 |
-| 输出目录 | `checkpoints/` | `checkpoints_sft/` |
-
-### 推理生成
-
-参照 [happy-llm model_sample.py](https://github.com/datawhalechina/happy-llm/blob/main/docs/chapter5/code/model_sample.py)。
-
-SNN 生成机制：Prefill 阶段用 `forward_parallel` 并行处理 prompt 建立神经元状态，自回归阶段逐 token 用 `forward_parallel` 处理 K 帧（复用 Triton parallel scan），神经元膜电位 V 跨 token 连续传递。
-
-```bash
-# 文本续写（预训练模型）
-python generate_sample.py \
-    --checkpoint checkpoints/ckpt_step10000.pth \
-    --mode pretrain \
-    --prompt "人工智能的发展" \
-    --max_new_tokens 256 --temperature 0.8 --top_k 50
-
-# 对话生成（SFT 模型）
-python generate_sample.py \
-    --checkpoint checkpoints_sft/ckpt_step3000.pth \
-    --mode sft \
-    --prompt "什么是脉冲神经网络？"
-
-# 交互模式
-python generate_sample.py \
-    --checkpoint checkpoints/ckpt_step10000.pth \
-    --interactive
-
-# 交互模式中可切换模式：
-#   [pretrain] > 今天天气
-#   [pretrain] > mode sft
-#   [sft] > 请介绍一下深度学习
-#   [sft] > quit
-```
-
-**生成参数说明：**
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--checkpoint` | (必填) | 模型 checkpoint 路径 |
-| `--mode` | `pretrain` | 生成模式：`pretrain` (续写) / `sft` (对话) |
-| `--prompt` | — | 输入文本（非交互模式） |
-| `--max_new_tokens` | 256 | 最大生成 token 数 |
-| `--temperature` | 0.8 | 采样温度（0 = greedy，越高越随机） |
-| `--top_k` | 50 | Top-k 采样（限制候选 token 数） |
-| `--interactive` | — | 交互式生成模式 |
-
-## 训练参数参考
-
-### 模型参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--D` | 1024 | 隐藏维度 |
-| `--N` | 8 | 神经元分组数（状态扩展因子） |
-| `--K` | 12 | 每 token 最大 SNN 时间步（PonderNet 动态决定有效步数） |
-| `--num_layers` | 24 | SNN 解码层数 |
-| `--D_ff` | 3072 | FFN 中间维度 (通常 3×D) |
-| `--vocab_size` | 64000 | 词表大小 |
-
-### 训练参数
-
-| 参数 | 预训练默认 | SFT 默认 | 说明 |
-|------|-----------|---------|------|
-| `--batch_size` | 8 | 4 | 每 GPU micro-batch 大小 |
-| `--accumulation_steps` | 8 | 8 | 梯度累积步数 |
-| `--learning_rate` | 2e-4 | 5e-5 | 峰值学习率 |
-| `--warmup_iters` | 1000 | 100 | Warmup 步数 |
-| `--epochs` | 1 | 3 | 训练轮数 |
-| `--grad_clip` | 1.0 | 1.0 | 梯度裁剪阈值 |
-| `--neuron_lr_mult` | 10.0 | 10.0 | 神经元参数学习率倍率 |
-| `--log_interval` | 10 | 100 | 日志打印间隔 |
-| `--save_interval` | 1000 | 1000 | Checkpoint 保存间隔 |
-
-### 显存与 batch_size 参考
-
-| batch_size | 约显存占用 | 适用硬件 |
-|:----------:|:---------:|:--------:|
-| 2 | ~29 GB | RTX 3090/4090 (24GB) + 梯度检查点 |
-| 4 | ~55 GB | A100 40GB / A6000 48GB |
-| 8 | ~103 GB | DGX Spark (128GB 统一内存) / A100 80GB |
-
-## 训练流程总览
-
-参照 happy-llm 教程的完整训练流程：
-
-```
-Step 1: 数据下载
-  bash scripts/download_dataset.sh
-  → Seq-Monkey 预训练数据 + BelleGroup SFT 数据
-
-Step 2: 数据预处理
-  python scripts/deal_dataset.py
-  → 预训练: 29M 样本 JSONL (512 字符切块)
-  → SFT: 350 万条 ChatML 格式对话 JSONL
-
-Step 3: Tokenizer 训练 (首次)
-  python scripts/train_tokenizer.py
-  → tokenizer_snn/ (64000 词表 BPE + ChatML chat_template)
-
-Step 4: 预训练
-  python train.py (单卡) / torchrun train_ddp.py (多卡)
-  → next token prediction on Seq-Monkey
-  → 目标: loss 收敛到 3~4
-
-Step 5: SFT 微调
-  python sft.py --pretrained_ckpt checkpoints/ckpt_step{N}.pth
-  → 加载预训练权重 + BelleGroup 指令数据
-  → 目标: 模型能进行基本对话
-
-Step 6: 推理生成
-  python generate_sample.py --checkpoint checkpoints_sft/ckpt_step{N}.pth
-  → 文本续写 / 对话生成
-```
-
-## 项目结构
-
-```
-NeuronSpark/
-├── model.py                        # SNNLanguageModel (三段式 encode/snn_forward/decode + generate)
-├── train.py                        # 预训练脚本-单卡 (对齐 happy-llm ddp_pretrain.py)
-├── train_ddp.py                    # 预训练脚本-多卡 DDP (torchrun, bf16, no_sync)
-├── train_fsdp.py                   # 预训练脚本-多卡 FSDP (全分片数据并行)
-├── sft.py                          # SFT 微调脚本-单卡 (对齐 happy-llm ddp_sft_full.py)
-├── sft_ddp.py                      # SFT 微调脚本-多卡 DDP
-├── generate_sample.py              # 推理生成脚本 (对齐 happy-llm model_sample.py)
-├── dataset.py                      # 数据集加载 (对齐 happy-llm dataset.py)
-├── checkpoint_utils.py             # Checkpoint 工具 (HF safetensors 格式保存/加载)
-├── dashboard.py                    # TensorBoard 训练看板 (参数/梯度/神经元动力学监控)
-├── convert_to_leakage.py           # V1→V2 权重适配工具 (V_post → 泄漏量激活)
-├── atomic_ops/                     # SNN 核心算子（独创）
-│   ├── __init__.py
-│   ├── selective_plif.py           # SelectivePLIFNode: 动态参数 PLIF 神经元
-│   ├── plif_node.py                # PLIFNode: D 维固定参数 PLIF 神经元
-│   ├── snn_block.py                # SNNBlock: SNN 状态空间 Mixer (6 路并行投影 + 门控)
-│   ├── snn_ffn.py                  # SNNFFN: SNN 前馈网络 (SwiGLU 风格三分支)
-│   ├── snn_decoder_layer.py        # SNNDecoderLayer: Pre-LN + Block + FFN + PonderNet + 残差
-│   ├── snn_attention_decoder_layer.py # SNNAttentionDecoderLayer: SNN-Attention + FFN 解码层
-│   ├── snn_base.py                 # Vendored spikingjelly 兼容层 (MemoryModule/BaseNode/Sigmoid)
-│   ├── parallel_scan.py            # Triton Fused PLIF Kernel + Row-param Kernel
-│   ├── lateral_inhibition.py       # Triton 侧抑制归一化 (输出层使用)
-│   ├── rms_norm.py                 # Pre-LN 分支归一化
-├── scripts/                        # 数据处理脚本 (对齐 happy-llm)
-│   ├── download_dataset.sh         # 一键下载预训练 + SFT 数据集
-│   ├── deal_dataset.py             # 数据预处理 (预训练切块 + SFT ChatML 转换)
-│   ├── train_tokenizer.py          # BPE Tokenizer 训练 (64000 词表)
-│   └── prepare_data.py             # SkyPile-150B 数据集处理 (备选)
-├── docs/                           # 设计文档
-│   ├── SNN_SELECTIVE_STATE_SPACE.md  # 主设计文档
-│   ├── PARALLEL_SCAN_OPTIMIZATION.md # Triton Kernel 优化文档
-│   ├── OPEN_ISSUES.md              # 已解决的设计问题记录
-│   ├── Q5.md                       # 技术验证方法论
-│   └── SNN_DIFFUSION_PLAN.md       # 未来方向: SNN 扩散模型
-├── exp/                            # 实验脚本 (验证 + 基准测试)
-│   ├── verify_*.py                 # 正确性验证 (梯度、融合算子、端到端)
-│   ├── bench_*.py                  # 性能基准测试 (Triton kernel, 编译, 层级)
-│   └── diagnose_*.py              # 训练诊断工具
-├── notebooks/                      # 实验 Notebook
-│   ├── linear_layer_analysis.ipynb # SpikingJelly 线性层分析
-│   └── neuron_comparison.ipynb     # 7 种神经元模型对比 → PLIF 最优
-├── tokenizer_snn/                  # 已训练的 BPE tokenizer (64000 词表)
-├── data/                           # 训练数据 (不纳入 git)
-│   ├── seq-monkey/                 # Seq-Monkey 预训练数据 (29M 样本 JSONL)
-│   └── sft/                        # BelleGroup SFT 数据 (350 万条对话)
-├── checkpoints/                    # 预训练 checkpoint (不纳入 git)
-├── checkpoints_sft/                # SFT checkpoint (不纳入 git)
-└── archive/                        # 历史版本归档
-    ├── logs/                       # 历史训练日志
-    └── checkpoints/                # 历史 checkpoint
-```
-
-## 当前训练配置
-
-| 参数 | 值 |
-|------|-----|
-| 参数量 | 1.37B |
-| D (隐藏维度) | 1024 |
-| N (神经元分组) | 8 |
-| K (最大 SNN 步数) | 12 (PonderNet 动态决定有效步数) |
-| Layers | 24 |
-| D_ff (FFN 维度) | 3072 |
-| Vocab | 64000 |
-| 序列长度 | 2048 |
-| 激活模式 | V2 ((1-β)·V_post 泄漏量) |
-| Batch size | 1/gpu × 4 gpus × accum 32 = 128 effective |
-| 学习率 | 2e-4 (warmup 500 → cosine → 2e-5) |
-| 精度 | bfloat16 |
-| 数据集 | Seq-Monkey (29M 样本) |
-| 硬件 | 4 × NVIDIA RTX 4090D (48GB) DDP |
-
-## 环境
-
-```bash
-conda activate SNN
-# 核心依赖: PyTorch, SpikingJelly, Triton, transformers, tokenizers, pandas, numpy, tqdm
-# 数据下载: modelscope, huggingface_hub
-# 硬件: NVIDIA GPU (推荐 Blackwell/Ampere 架构, 24GB+ 显存)
-# DGX Spark 需配置: export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
-```
-
-## V2 Pretraining Plan
-
-### Dataset
-
-Bilingual pretraining dataset uploaded to HuggingFace: [Brain2nd/NeuronSpark-V1](https://huggingface.co/datasets/Brain2nd/NeuronSpark-V1)
-
-| Source | Documents | Ratio | Est. Tokens | Lang |
-|--------|-----------|-------|-------------|------|
-| FineWeb-Edu | 6,810,451 | 39.7% | ~7B | EN general |
-| SkyPile-150B | 7,173,310 | 41.8% | ~4.5B | ZH general |
-| Cosmopedia | 2,313,934 | 13.5% | ~1.5B | EN synthetic textbooks |
-| OpenWebMath | 792,380 | 4.6% | ~1.5B | EN math |
-| Belle school_math | 84,659 | 0.5% | ~17M | ZH math |
-| **Total** | **17,174,734** | | **~14.5B** | Bilingual |
-
-### 候选正式数据集（NVIDIA Nemotron Pre-Training）
-
-来源：[nvidia/nemotron-pre-training-datasets](https://huggingface.co/collections/nvidia/nemotron-pre-training-datasets)
-
-选用新版（提纯后），跳过旧版：
-
-| 数据集 | 下载大小 | 条数 | Tokens | 语种 | 说明 |
-|--------|---------|------|--------|------|------|
-| [Nemotron-CC-v2.1](https://huggingface.co/datasets/nvidia/Nemotron-CC-v2.1) | 4,591 GB | 3.8B | 2.5T | EN | CC 网页过滤 + 合成改写 + 多语种翻译为英文 |
-| [Nemotron-Pretraining-Code-v2](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Code-v2) | 907 GB | 836M | ~1.09T | Code | GitHub 代码 + 合成代码 |
-| [Nemotron-CC-Code-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Code-v1) | 563 GB | 216M | 427.9B | Code | CC 提取代码（Lynx+LLM 管线） |
-| [Nemotron-CC-Math-v1](https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1) | 260 GB | 190M | 133.3B | EN | CC 数学内容（保留 LaTeX） |
-| [Nemotron-Pretraining-Specialized-v1.1](https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-Specialized-v1.1) | 35 GB | 19.8M | ~336B | EN | 合成 STEM（推理/逻辑/经济学） |
-| **总计** | **6.36 TB** | | **~4.5T** | | |
-
-> 注：全部为英文/代码，中文需另行补充。当前服务器可用空间 ~420GB，需按优先级分批下载。
-> 优先级建议：Math-v1 (260GB) > Specialized-v1.1 (35GB) > CC-Code-v1 (563GB)
-
-### Tokenizer
-
-Current tokenizer: 64K vocab BPE (bilingual).
-
-```bash
-python scripts/train_tokenizer.py \
-  --data_dir data/pretrain_mix \
-  --save_dir tokenizer \
-  --vocab_size 64000 \
-  --sample_docs 500000
-```
-
-Adjust `--sample_docs` by available RAM (200K ~8GB, 500K ~16GB, 2M ~64GB).
-
-### TODO
-
-1. [ ] Train 64K vocab bilingual BPE tokenizer
-2. [ ] Update `dataset.py` to support parquet input
-3. [ ] Update model config (vocab_size=64000, rest unchanged)
-4. [ ] Launch pretraining on remote server (4x RTX 4090D)
-5. [ ] SFT after pretraining
-
-## Citation
-
-```bibtex
-@article{tang2025neuronspark,
-  title={NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics},
-  author={Tang, Zhengzheng},
-  journal={arXiv preprint arXiv:2603.16148},
-  year={2025}
-}
-```
+The eight zero-shot tasks reported in the paper (ARC-E, ARC-C, WinoGrande, BoolQ, PIQA,
+OpenBookQA, MMLU, C-Eval) are the default suite in `scripts/eval_full.py`. Per-task
+JSONs and an aggregate summary are written to `exp/`.
 
 ## License
 
-Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)
+Released under the license in `LICENSE`. Author and affiliation information has been
+withheld for double-blind review and will be added upon acceptance.

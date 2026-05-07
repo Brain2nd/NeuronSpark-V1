@@ -13,8 +13,8 @@ import random
 import re
 from datasets import load_from_disk, Dataset
 
-BASE = '/home/dgxspark/Desktop/NeuronSpark-V1/data/benchmark'
-OUT_DIR = '/home/dgxspark/Desktop/NeuronSpark-V1/data/benchmark_sft_mix'
+BASE = './data/benchmark'
+OUT_DIR = './data/benchmark_sft_mix'
 TARGET_PER_TASK = 10000
 random.seed(0)
 

@@ -9,10 +9,10 @@ from datasets import load_from_disk, Dataset
 from transformers import AutoTokenizer
 from tqdm import tqdm
 
-SRC = '/home/dgxspark/Desktop/NeuronSpark-V1/data/sft_v2_mix'
-DST = '/home/dgxspark/Desktop/NeuronSpark-V1/data/sft_v2_mix_filtered'
+SRC = './data/sft_v2_mix'
+DST = './data/sft_v2_mix_filtered'
 MAX_LEN = 2048
-TOK_PATH = '/home/dgxspark/Desktop/NeuronSpark-V1/tokenizer/'
+TOK_PATH = './tokenizer/'
 
 tok = AutoTokenizer.from_pretrained(TOK_PATH)
 ds = load_from_disk(SRC)

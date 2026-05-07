@@ -22,9 +22,9 @@ import pyarrow.parquet as pq
 from datasets import load_from_disk, Dataset
 from transformers import AutoTokenizer
 
-DATA_ROOT = '/home/dgxspark/Desktop/NeuronSpark-V1/data'
+DATA_ROOT = './data'
 OUT_DIR = f'{DATA_ROOT}/sft_v2_mix'
-TOK_PATH = '/home/dgxspark/Desktop/NeuronSpark-V1/tokenizer/'
+TOK_PATH = './tokenizer/'
 random.seed(42)
 
 tokenizer = AutoTokenizer.from_pretrained(TOK_PATH)
@@ -283,7 +283,7 @@ def fmt_benchmark_boost():
     # 直接 import build_benchmark_sft_mix 的格式化函数
     import importlib.util
     spec = importlib.util.spec_from_file_location(
-        'bbm', '/home/dgxspark/Desktop/NeuronSpark-V1/scripts/build_benchmark_sft_mix.py')
+        'bbm', './scripts/build_benchmark_sft_mix.py')
     bbm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bbm)
 

@@ -51,7 +51,6 @@ aggregation (PonderNet-style early-exit over short internal processing steps per
 │   ├── train_tokenizer.py        # Train the BPE tokenizer
 │   └── ...                       # (smoke / dryrun / equivalence tests)
 ├── ds_config.json                # DeepSpeed ZeRO-2 config used in the reported run
-├── docs/                         # Architecture notes referenced by the paper
 └── LICENSE
 ```
 

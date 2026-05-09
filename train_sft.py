@@ -128,29 +128,31 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
 
         if (step + 1) % args.save_interval == 0:
             save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
-            # rank 0: HF format weights + training_state metadata
+            # Reordered save block to fix post-save NCCL allreduce timeout.
+            # Diagnosis: dump showed Rank 0 enqueue=N, others=N+1 i.e. rank 0 was
+            # 1 NCCL op behind every save. Hypothesis: with rank-0 IO (save_pretrained
+            # writing 2.4GB safetensors) executing BETWEEN dist.barrier() and the
+            # collective engine.save_checkpoint, rank 0's NCCL stream picks up
+            # internal save_checkpoint sub-collectives mid-IO while ranks 1-3
+            # already enqueued them, leaving rank 0 in a permanent 1-op deficit.
+            # Fix: do the collective save FIRST (all ranks together, no rank-0
+            # interleaved IO), then the rank-0-only HF save afterward, with
+            # explicit barriers fencing both sections.
+            os.makedirs(save_dir, exist_ok=True)
+            dist.barrier()
+            # 1) ALL ranks: DeepSpeed checkpoint with optimizer state (collective).
+            engine.save_checkpoint(save_dir, tag="deepspeed")
+            torch.cuda.synchronize()
+            dist.barrier()
+            # 2) Rank 0 only: HF format weights + training_state metadata + dashboard.
             if is_main():
-                engine.module.eval()
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
                 torch.save({"step": step + 1, "epoch": epoch, "tokens_seen": tokens_seen},
                            os.path.join(save_dir, "training_state.pth"))
-                log(f"  → saved HF weights to {save_dir}")
+                log(f"  → saved HF weights + DeepSpeed optimizer state to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
-                engine.module.train()
             dist.barrier()
-            # ALL ranks: DeepSpeed checkpoint with optimizer state (resume support)
-            engine.save_checkpoint(save_dir, tag="deepspeed")
-            # Hard fence: device-side sync + collective barrier. engine.save_checkpoint
-            # may leave per-rank async cuda streams (state_dict gather, file IO bridges)
-            # outstanding. Without sync, the next training iteration's first allreduce
-            # races against half-finished save streams and triggers ~600s NCCL timeout
-            # exactly at the post-save bucket reduce-scatter, which is the bug we hit
-            # repeatably both on H200 and 4090. Force completion before resuming.
-            torch.cuda.synchronize()
-            dist.barrier()
-            if is_main():
-                log(f"  → saved DeepSpeed optimizer state to {save_dir}/deepspeed/")
 
     return tokens_seen
 

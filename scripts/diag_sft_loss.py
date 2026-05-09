@@ -28,8 +28,16 @@ def main():
     print(f"loading {args.ckpt}", flush=True)
     tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.ckpt, trust_remote_code=True, dtype=torch.bfloat16,
+        args.ckpt, trust_remote_code=True,
     ).cuda().eval()
+    # mixed precision: neuron params fp32, others bf16 (matches eval_full.py)
+    for name, p in model.named_parameters():
+        if name.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')):
+            p.data = p.data.float()
+        else:
+            p.data = p.data.to(torch.bfloat16)
+    for _, b in model.named_buffers():
+        b.data = b.data.to(torch.bfloat16)
 
     print(f"loading dataset {args.data}", flush=True)
     ds = BinnedSFTDataset(args.data, max_length=args.max_length)
@@ -46,7 +54,7 @@ def main():
         Y = Y.unsqueeze(0).cuda()
         mask = mask.cuda()
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
             out = model.snn(X, Y)
 
         per_token = out.last_loss          # (seq_len,) per-token CE

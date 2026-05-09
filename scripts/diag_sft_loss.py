@@ -20,12 +20,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--data", required=True)
+    ap.add_argument("--tokenizer", default="tokenizer_v3")
     ap.add_argument("--max_length", type=int, default=512)
     ap.add_argument("--n_samples", type=int, default=5)
     args = ap.parse_args()
 
     print(f"loading {args.ckpt}", flush=True)
-    tok = AutoTokenizer.from_pretrained(args.ckpt, trust_remote_code=True)
+    tok = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.ckpt, trust_remote_code=True, dtype=torch.bfloat16,
     ).cuda().eval()

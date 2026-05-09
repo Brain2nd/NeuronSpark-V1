@@ -141,6 +141,14 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             dist.barrier()
             # ALL ranks: DeepSpeed checkpoint with optimizer state (resume support)
             engine.save_checkpoint(save_dir, tag="deepspeed")
+            # Hard fence: device-side sync + collective barrier. engine.save_checkpoint
+            # may leave per-rank async cuda streams (state_dict gather, file IO bridges)
+            # outstanding. Without sync, the next training iteration's first allreduce
+            # races against half-finished save streams and triggers ~600s NCCL timeout
+            # exactly at the post-save bucket reduce-scatter, which is the bug we hit
+            # repeatably both on H200 and 4090. Force completion before resuming.
+            torch.cuda.synchronize()
+            dist.barrier()
             if is_main():
                 log(f"  → saved DeepSpeed optimizer state to {save_dir}/deepspeed/")
 

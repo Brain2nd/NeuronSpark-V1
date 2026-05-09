@@ -43,7 +43,13 @@ def prep_gsm8k(tokenizer):
 
 
 def prep_math(tokenizer):
-    ds = load_dataset("hendrycks/competition_math", split="train", trust_remote_code=True)
+    # EleutherAI mirror of Hendrycks competition_math (same content, no gated download)
+    # Subjects come as 7 separate splits; concat them.
+    from datasets import concatenate_datasets
+    SUBJECTS = ["algebra", "counting_and_probability", "geometry", "intermediate_algebra",
+                "number_theory", "prealgebra", "precalculus"]
+    parts = [load_dataset("EleutherAI/hendrycks_math", subj, split="train") for subj in SUBJECTS]
+    ds = concatenate_datasets(parts)
     out = []
     for s in ds:
         q = s["problem"]

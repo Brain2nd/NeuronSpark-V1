@@ -120,19 +120,26 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
 
         if (step + 1) % args.save_interval == 0:
             save_dir = os.path.join(args.out_dir, f"ckpt_step{step+1}")
-            # rank 0: HF format weights + training_state metadata
+            # rank 0: HF format weights + training_state metadata. KEEP IN TRAIN MODE
+            # — eval()/train() toggle here was rank-0-only and unnecessary for HF
+            # save_pretrained (which only walks state_dict, no forward), but the
+            # asymmetric self.training flag could let rank-0-divergent paths slip
+            # through MemoryModule resets / surrogate-grad bookkeeping.
             if is_main():
-                engine.module.eval()
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
                 torch.save({"step": step + 1, "epoch": epoch, "tokens_seen": tokens_seen},
                            os.path.join(save_dir, "training_state.pth"))
                 log(f"  → saved HF weights to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
-                engine.module.train()
             dist.barrier()
             # ALL ranks: DeepSpeed checkpoint with optimizer state (resume support)
             engine.save_checkpoint(save_dir, tag="deepspeed")
+            # Explicit barrier after the collective: V2.5 didn't have this DeepSpeed
+            # save and never hit the post-save NCCL allreduce timeout. Forcing sync
+            # here closes any residual rank-skew from save_checkpoint internals
+            # before the next training iteration's grad reduce.
+            dist.barrier()
             if is_main():
                 log(f"  → saved DeepSpeed optimizer state to {save_dir}/deepspeed/")
 

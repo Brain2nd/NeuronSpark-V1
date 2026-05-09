@@ -94,6 +94,14 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
                 dashboard.cache_grad_norms(engine.module)
         engine.step()
 
+        # === DIAG: per-step barrier to fail-fast on rank divergence ===
+        # If ranks already disagree on collective seq before this point,
+        # barrier here will hang within NCCL timeout → log shows which step
+        # was the FIRST to diverge (vs current 600s-after-the-fact crash).
+        # Pure diagnostic; safe to keep in steady state (negligible overhead).
+        if args.debug_barrier and world > 1:
+            dist.barrier()
+
         valid = loss_mask.sum()
         if world > 1:
             dist.all_reduce(valid, op=dist.ReduceOp.SUM)
@@ -161,6 +169,10 @@ def main():
     ap.add_argument("--log_interval", type=int, default=10)
     ap.add_argument("--save_interval", type=int, default=500)
     ap.add_argument("--dashboard_dir", default=None)
+    ap.add_argument("--debug_barrier", action="store_true",
+                    help="DIAG: insert dist.barrier() after each engine.step() so "
+                         "rank desync surfaces at the actual divergence step rather "
+                         "than 600s later in some downstream allreduce.")
     ap.add_argument("--local_rank", type=int, default=-1)
     ap = deepspeed.add_config_arguments(ap)
     args = ap.parse_args()

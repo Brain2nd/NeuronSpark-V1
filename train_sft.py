@@ -56,7 +56,7 @@ def cosine_lr(step, total, base_lr, warmup):
 
 
 def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
-                tokens_seen, dashboard, start_step):
+                tokens_seen, dashboard, start_step, tokenizer=None):
     rank = dist.get_rank()
     world = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -144,12 +144,16 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             engine.save_checkpoint(save_dir, tag="deepspeed")
             torch.cuda.synchronize()
             dist.barrier()
-            # 2) Rank 0 only: HF format weights + training_state metadata + dashboard.
+            # 2) Rank 0 only: HF format weights + tokenizer + training_state metadata + dashboard.
+            #    Includes tokenizer so the ckpt dir is a fully self-contained HF repo:
+            #    AutoModelForCausalLM + AutoTokenizer can both load from the same path.
             if is_main():
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(save_dir)
                 torch.save({"step": step + 1, "epoch": epoch, "tokens_seen": tokens_seen},
                            os.path.join(save_dir, "training_state.pth"))
-                log(f"  → saved HF weights + DeepSpeed optimizer state to {save_dir}")
+                log(f"  → saved HF weights + tokenizer + DeepSpeed optimizer state to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
             dist.barrier()
@@ -286,7 +290,7 @@ def main():
     for epoch in range(start_epoch, args.epochs):
         tokens_seen = train_epoch(
             epoch, engine, loader, sampler, args, iters_per_epoch,
-            tokens_seen, dashboard, start_step=start_step,
+            tokens_seen, dashboard, start_step=start_step, tokenizer=tokenizer,
         )
         start_step = 0  # 仅首个 resume epoch 跳到 start_step, 后续 epoch 从头
     if dashboard is not None:

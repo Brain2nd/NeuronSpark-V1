@@ -130,7 +130,7 @@ def load_model(args) -> tuple[NeuronSparkForCausalLM, AutoTokenizer, torch.devic
 
 
 def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
-                tokens_seen, dashboard, start_step):
+                tokens_seen, dashboard, start_step, tokenizer=None):
     rank = dist.get_rank()
     world = dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -234,12 +234,14 @@ def train_epoch(epoch, engine, loader, sampler, args, iters_per_epoch,
             if is_main():
                 engine.module.eval()
                 engine.module.save_pretrained(save_dir, safe_serialization=True)
+                if tokenizer is not None:
+                    tokenizer.save_pretrained(save_dir)
                 torch.save({
                     "step": step + 1,
                     "epoch": epoch,
                     "tokens_seen": tokens_seen,
                 }, os.path.join(save_dir, "training_state.pth"))
-                log(f"  → saved HF weights to {save_dir}")
+                log(f"  → saved HF weights + tokenizer to {save_dir}")
                 if dashboard is not None:
                     dashboard.log_save_point(step, engine.module)
                 engine.module.train()
@@ -439,7 +441,8 @@ def main():
     # Train
     for epoch in range(args.epochs):
         tokens_seen = train_epoch(epoch, engine, loader, sampler, args,
-                                   iters_per_epoch, tokens_seen, dashboard, start_step)
+                                   iters_per_epoch, tokens_seen, dashboard, start_step,
+                                   tokenizer=tokenizer)
         start_step = 0
 
     if dashboard is not None:

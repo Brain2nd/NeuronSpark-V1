@@ -343,6 +343,7 @@ def main():
             if step > 0 and step % args.save_interval == 0:
                 save_dir = os.path.join(args.out_dir, f"ckpt_step{step}")
                 policy.save_pretrained(save_dir, safe_serialization=True)
+                tokenizer.save_pretrained(save_dir)
                 torch.save({"step": step}, os.path.join(save_dir, "training_state.pth"))
                 print(f"  → saved {save_dir}")
 
@@ -352,6 +353,7 @@ def main():
 
     final_dir = os.path.join(args.out_dir, "final")
     policy.save_pretrained(final_dir, safe_serialization=True)
+    tokenizer.save_pretrained(final_dir)
     print(f"RL done. Final saved to {final_dir}")
 
 

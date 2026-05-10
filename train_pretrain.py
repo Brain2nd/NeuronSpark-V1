@@ -109,6 +109,11 @@ def load_model(args) -> tuple[NeuronSparkForCausalLM, AutoTokenizer, torch.devic
         log(f"Building fresh model from config: {json.dumps(cfg_kwargs, indent=2)}")
         model = NeuronSparkForCausalLM(config)
 
+    # Register for auto_class so every save_pretrained call writes
+    # configuration_neuronspark.py + modeling_neuronspark.py into the ckpt dir.
+    model.config.register_for_auto_class()
+    model.register_for_auto_class("AutoModelForCausalLM")
+
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     # Params MUST be bf16 at load time (Triton PLIF kernels assume bf16 alignment —

@@ -272,6 +272,10 @@ def main():
 
     print(f"Loading policy from {args.sft_ckpt}")
     policy = NeuronSparkForCausalLM.from_pretrained(args.sft_ckpt, dtype=torch.bfloat16, trust_remote_code=True).to(device)
+    # Register for auto_class so save_pretrained copies modeling/config .py
+    # files into every RL ckpt — same as pretrain/sft pipelines.
+    policy.config.register_for_auto_class()
+    policy.register_for_auto_class("AutoModelForCausalLM")
     print("Cloning as reference (frozen)")
     reference = NeuronSparkForCausalLM.from_pretrained(args.sft_ckpt, dtype=torch.bfloat16, trust_remote_code=True).to(device).eval()
     for p in reference.parameters():

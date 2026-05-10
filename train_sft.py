@@ -202,6 +202,12 @@ def main():
     src = args.resume if args.resume else args.pretrained_ckpt
     log(f"Loading model weights from {src}" + (" (RESUMING)" if args.resume else ""))
     model = NeuronSparkForCausalLM.from_pretrained(src, dtype=torch.bfloat16, trust_remote_code=True)
+    # Register for auto_class so save_pretrained copies configuration_neuronspark.py +
+    # modeling_neuronspark.py into every saved ckpt — required for downstream
+    # AutoModelForCausalLM.from_pretrained(ckpt, trust_remote_code=True) to work
+    # without manual file copying.
+    model.config.register_for_auto_class()
+    model.register_for_auto_class("AutoModelForCausalLM")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device=device, dtype=torch.bfloat16)

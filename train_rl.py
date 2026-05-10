@@ -267,10 +267,14 @@ def main():
     random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # RL operates on SFT-style chat data — align with Qwen2.5-Instruct EOS conv:
+    #   tokenizer.eos_token = "<|im_end|>"
+    #   generation eos_token_id = [im_end, endoftext]
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
-    # RL operates on SFT-style chat data — <|im_end|> is the conversation EOS.
     tokenizer.eos_token = "<|im_end|>"
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
+    endoftext_id = tokenizer.encode("<|endoftext|>", add_special_tokens=False)[0]
+    eos_list = [im_end_id, endoftext_id]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading policy from {args.sft_ckpt}")
@@ -279,7 +283,7 @@ def main():
     # files into every RL ckpt — same as pretrain/sft pipelines.
     policy.config.register_for_auto_class()
     policy.register_for_auto_class("AutoModelForCausalLM")
-    policy.generation_config.eos_token_id = im_end_id
+    policy.generation_config.eos_token_id = eos_list
     policy.generation_config.pad_token_id = tokenizer.pad_token_id
     policy.config.eos_token_id = im_end_id
     print("Cloning as reference (frozen)")

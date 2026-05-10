@@ -197,14 +197,20 @@ def main():
     if not args.pretrained_ckpt and not args.resume:
         raise ValueError("必须指定 --pretrained_ckpt (新 SFT) 或 --resume (续训)")
 
-    # Tokenizer. SFT uses <|im_end|> as the conversation-end token, so override
-    # tokenizer.eos_token (was <|endoftext|> from pretrain config) so the saved
-    # SFT tokenizer reports the chat-correct EOS to downstream callers.
+    # Tokenizer. SFT/chat uses <|im_end|> as the turn-end token (per the v3
+    # chat_template inherited from Qwen2.5). Align with Qwen2.5-Instruct
+    # convention:
+    #   tokenizer.eos_token = "<|im_end|>"   (was <|endoftext|> in pretrain)
+    #   pad_token stays <|endoftext|>        (Qwen2.5-Instruct same)
+    #   generation eos_token_id = [im_end, endoftext]  (accept either as stop)
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
+    endoftext_id = tokenizer.encode("<|endoftext|>", add_special_tokens=False)[0]
     tokenizer.eos_token = "<|im_end|>"
-    log(f"Tokenizer {args.tokenizer_path}: vocab={len(tokenizer)}, im_end_id={im_end_id}, "
-        f"eos_token={tokenizer.eos_token!r} (eos_id={tokenizer.eos_token_id})")
+    eos_list = [im_end_id, endoftext_id]
+    log(f"Tokenizer {args.tokenizer_path}: vocab={len(tokenizer)}, "
+        f"eos_token={tokenizer.eos_token!r} (eos_id={tokenizer.eos_token_id}), "
+        f"generation eos_token_id={eos_list}")
 
     # Load model: --resume 优先 (HF 格式 weights), 否则 --pretrained_ckpt
     src = args.resume if args.resume else args.pretrained_ckpt
@@ -216,11 +222,12 @@ def main():
     # without manual file copying.
     model.config.register_for_auto_class()
     model.register_for_auto_class("AutoModelForCausalLM")
-    # generation_config defaults to eos_token_id=2 (transformers Llama default) which
-    # makes generate() never stop on <|im_end|>. Set to im_end_id so saved ckpts
-    # produce well-formed chat output out of the box.
-    model.generation_config.eos_token_id = im_end_id
+    # generation_config defaults to eos_token_id=2 (transformers Llama default).
+    # Override with list [im_end, endoftext] matching Qwen2.5-Instruct.
+    model.generation_config.eos_token_id = eos_list
     model.generation_config.pad_token_id = tokenizer.pad_token_id
+    # model.config.eos_token_id is a single int by convention (used as default
+    # by some downstream tooling); set to the primary chat EOS.
     model.config.eos_token_id = im_end_id
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")

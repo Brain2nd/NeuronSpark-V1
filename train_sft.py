@@ -197,10 +197,14 @@ def main():
     if not args.pretrained_ckpt and not args.resume:
         raise ValueError("必须指定 --pretrained_ckpt (新 SFT) 或 --resume (续训)")
 
-    # Tokenizer (SFT: eos = <|im_end|> for early-stopping at turn boundary)
+    # Tokenizer. SFT uses <|im_end|> as the conversation-end token, so override
+    # tokenizer.eos_token (was <|endoftext|> from pretrain config) so the saved
+    # SFT tokenizer reports the chat-correct EOS to downstream callers.
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
     im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
-    log(f"Tokenizer {args.tokenizer_path}: vocab={len(tokenizer)}, im_end_id={im_end_id}")
+    tokenizer.eos_token = "<|im_end|>"
+    log(f"Tokenizer {args.tokenizer_path}: vocab={len(tokenizer)}, im_end_id={im_end_id}, "
+        f"eos_token={tokenizer.eos_token!r} (eos_id={tokenizer.eos_token_id})")
 
     # Load model: --resume 优先 (HF 格式 weights), 否则 --pretrained_ckpt
     src = args.resume if args.resume else args.pretrained_ckpt
@@ -212,6 +216,12 @@ def main():
     # without manual file copying.
     model.config.register_for_auto_class()
     model.register_for_auto_class("AutoModelForCausalLM")
+    # generation_config defaults to eos_token_id=2 (transformers Llama default) which
+    # makes generate() never stop on <|im_end|>. Set to im_end_id so saved ckpts
+    # produce well-formed chat output out of the box.
+    model.generation_config.eos_token_id = im_end_id
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = im_end_id
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device=device, dtype=torch.bfloat16)

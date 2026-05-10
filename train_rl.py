@@ -268,6 +268,9 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    # RL operates on SFT-style chat data — <|im_end|> is the conversation EOS.
+    tokenizer.eos_token = "<|im_end|>"
+    im_end_id = tokenizer.encode("<|im_end|>", add_special_tokens=False)[0]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading policy from {args.sft_ckpt}")
@@ -276,6 +279,9 @@ def main():
     # files into every RL ckpt — same as pretrain/sft pipelines.
     policy.config.register_for_auto_class()
     policy.register_for_auto_class("AutoModelForCausalLM")
+    policy.generation_config.eos_token_id = im_end_id
+    policy.generation_config.pad_token_id = tokenizer.pad_token_id
+    policy.config.eos_token_id = im_end_id
     print("Cloning as reference (frozen)")
     reference = NeuronSparkForCausalLM.from_pretrained(args.sft_ckpt, dtype=torch.bfloat16, trust_remote_code=True).to(device).eval()
     for p in reference.parameters():

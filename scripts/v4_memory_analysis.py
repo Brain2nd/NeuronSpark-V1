@@ -262,35 +262,86 @@ def _influence_curve(model, ids, deltas, label):
     return out
 
 
+import types
+import torch.nn.functional as F
+from neuronspark.modeling_neuronspark import _apply_rope, _ponder_v3_pick
+
+
+def _attn_forward_no_xpos(self, h):
+    """SNNAttentionDecoderLayer.forward_parallel 的副本，唯一改动:
+    M_all = kv_gated（不做 cumsum, 每位置只看自己；M_state 也不加）→ 注意力子层变成纯 per-position，
+    切断所有经 SNNAttention 的跨位置信息。其余（RoPE/gate/FFN/PonderNet）原样。"""
+    seq_len, batch, D = h.shape
+    K = self.K
+    steps_vec = torch.arange(1, K + 1, device=h.device, dtype=h.dtype)
+    # 子层 1: SNN-Attention，但跨位置混合关掉
+    h_normed = self.attn_norm(h)
+    flat = h_normed.reshape(seq_len * batch, D)
+    qkv = self.qkv_proj(flat)
+    q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
+    q = q.reshape(seq_len, batch, self.D_key)
+    k = k.reshape(seq_len, batch, self.D_key)
+    v = v.reshape(seq_len, batch, self.D_value)
+    pos = self.pos_offset
+    rope_cos = self.rope_cos[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
+    rope_sin = self.rope_sin[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
+    q = _apply_rope(q, rope_cos, rope_sin)
+    k = _apply_rope(k, rope_cos, rope_sin)
+    self.pos_offset = pos + seq_len
+    gate = self._gate_neuron_parallel(h_normed)
+    k = F.normalize(k, dim=-1)
+    kv_outer = k.unsqueeze(-1) * v.unsqueeze(-2)
+    kv_gated = gate.unsqueeze(-1) * kv_outer
+    M_all = kv_gated  # <<< 改动：不 cumsum，每位置只保留自己的 kv（M_state 也不加 → 切断跨位置）
+    attn_out = torch.einsum('sbk,sbkv->sbv', q, M_all)
+    attn_out = self.attn_out_norm(attn_out)
+    res_attn = self.attn_out_proj(attn_out.reshape(seq_len * batch, self.D_value)).reshape(seq_len, batch, D)
+    res_attn = res_attn - res_attn.mean(dim=-1, keepdim=True)
+    h = h + res_attn
+    # 子层 2: SNNFFN (原样)
+    k_logits_ffn = self.ffn_k_predictor(h)
+    y_st_ffn, y_hard_ffn = _ponder_v3_pick(k_logits_ffn, training=self.training,
+                                           temperature=self.ponder_T, eps_explore=self.eps_explore)
+    k_t_ffn = y_hard_ffn.argmax(dim=-1)
+    Ka_f = K if self.training else (int(k_t_ffn.max().item()) + 1)
+    h_normed_k2 = self.ffn_norm(h).repeat_interleave(Ka_f, dim=0)
+    v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, Ka_f, self.training)
+    cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, Ka_f, self.training)
+    frames_ffn = cont_ffn.view(seq_len, Ka_f, batch, D)
+    combined_ffn = (y_st_ffn[..., :Ka_f].permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)
+    res_ffn = self.ffn_out_proj(combined_ffn)
+    res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
+    h = h + res_ffn
+    ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
+    self._last_y_hard_ffn = y_hard_ffn
+    return h, ek_ffn.mean()
+
+
 @torch.no_grad()
 def e3_perturbation_influence(model, ids):
     print("\n" + "=" * 78)
     print("E3  因果扰动影响 influence(Δ) = ‖Δlogits_T‖ / ‖ε‖  (扰动 emb at pos T-1-Δ → 末位 logits 变化)")
-    print("    component 归因: 比较 (a) full / (b) SNNAttention 关掉跨位置混合 (cumsum→identity, 每位置只看自己)")
-    print("    → 跨位置信息只剩 SNNBlock 的 segmented-PLIF 跨 token carry. influence(Δ) for Δ>~几步 在 (b) 下塌掉 ⇒ 长程是 SNNAttention 扛的。")
+    print("    component 归因: (a) full / (b) SNNAttention 跨位置混合关掉 (M_all=kv_gated, 直接 override forward_parallel)")
+    print("    → (b) 下跨位置信息只剩 SNNBlock segmented-PLIF carry (快通道~1-2 tokens, 慢通道~3% ~100 tokens). influence(Δ) 在长 Δ 塌掉 ⇒ 长程是 SNNAttention 扛的。")
     print("=" * 78)
     T = ids.shape[1]
     deltas = [d for d in [1, 2, 4, 8, 16, 32, 64, 128, 256] if d < T - 1]
-    # (a) full
     inf_full = _influence_curve(model, ids, deltas, "full")
-    # (b) SNNAttention cross-position OFF: monkeypatch torch.cumsum → identity (forward 里唯一的 cumsum 就是线性注意力的 M_all)
-    import neuronspark.modeling_neuronspark as nm
-    orig_cumsum = nm.torch.cumsum
-    def no_cumsum(x, dim=0, *a, **kw):
-        return x  # 每位置只保留自己的 kv，不累加历史
-    nm.torch.cumsum = no_cumsum
+    # (b) override 所有 SNNAttentionDecoderLayer 的 forward_parallel
+    attn_layers = [l for l in model.snn.layers if isinstance(l, SNNAttentionDecoderLayer)]
+    orig_fps = [l.forward_parallel for l in attn_layers]
+    for l in attn_layers:
+        l.forward_parallel = types.MethodType(_attn_forward_no_xpos, l)
     try:
         inf_noattn = _influence_curve(model, ids, deltas, "no-attn-mix")
     finally:
-        nm.torch.cumsum = orig_cumsum
+        for l, fp in zip(attn_layers, orig_fps):
+            l.forward_parallel = fp
     print(f"  {'Δ':>5s} | {'influence(full)':>16s} | {'influence(no-attn-mix)':>22s} | ratio noattn/full")
     for d in deltas:
         f, n = inf_full[d], inf_noattn[d]
-        print(f"  {d:5d} | {f:16.4e} | {n:22.4e} | {n/f if f>0 else float('nan'):.3f}")
+        print(f"  {d:5d} | {f:16.4e} | {n:22.4e} | {n/f if f>0 else float('nan'):.4f}")
     print("  解读: ratio≈1 → 该距离的信息不靠 SNNAttention (近距离, SNNBlock/残差就够); ratio≈0 → 该距离全靠 SNNAttention 扛 (长距离)。")
-    print("  ⚠️ 已知问题: fresh-init 模型上 influence(Δ) 全是噪声幅度且无衰减趋势，no-attn-mix 的 ratio 也接近 1 —— 怀疑")
-    print("     全局 torch.cumsum monkeypatch 在大模型 (有 checkpoint 包裹) 下没有可靠地传到 SNNAttention 层。需在 trained ckpt 上复测,")
-    print("     或换更直接的 component-ablation (直接替换 SNNAttentionDecoderLayer.forward_parallel 跳过 attn 子层)。架构论证见文档 §记忆归因。")
 
 
 def main():

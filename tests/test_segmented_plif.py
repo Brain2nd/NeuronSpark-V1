@@ -10,6 +10,11 @@ from neuronspark.modeling_neuronspark import (
     segmented_plif_rowparam, plif_rowparam_forward,
     segmented_plif_selective, plif_parallel_forward,
 )
+try:
+    from neuronspark.modeling_neuronspark import _segmented_plif_rowparam_fwd_triton
+    _HAS_SEG_KERNEL = True
+except ImportError:
+    _HAS_SEG_KERNEL = False
 
 
 def gather_at_kt(frames_TK, k_t, K):
@@ -151,6 +156,37 @@ def test_selective_gradcheck():
     print("  ==> PASS: selective backward matches numerical grads")
 
 
+# ---------------- P5.5: fused Triton kernel (rowparam forward) ----------------
+
+def test_kernel_rowparam_fwd_matches_reference():
+    if not _HAS_SEG_KERNEL or not torch.cuda.is_available():
+        print("[kernel rowparam fwd] skipped (no triton/cuda)")
+        return
+    torch.manual_seed(0)
+    dev = "cuda"
+    for train in (True, False):
+        for kt_mode in ("random", "degenerate"):
+            T, K, b, H = 6, 5, 3, 16
+            beta = torch.rand(b, H, device=dev, dtype=torch.float32) * 0.5 + 0.4
+            vth = torch.rand(b, H, device=dev, dtype=torch.float32) * 0.3 + 0.1
+            u = torch.randn(T * K, b, H, device=dev, dtype=torch.float32) * 0.5
+            v_init = torch.randn(b, H, device=dev, dtype=torch.float32) * 0.2
+            k_t = (torch.randint(0, K, (T, b), dtype=torch.long, device=dev) if kt_mode == "random"
+                   else torch.full((T, b), K - 1, dtype=torch.long, device=dev))
+            with torch.no_grad():
+                o_ref, vp_ref, vc_ref = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, train)
+                o_k, vp_k, vc_k = _segmented_plif_rowparam_fwd_triton(beta, u, vth, v_init, k_t, K, train)
+            if train:
+                d_o = (o_ref - o_k).abs().max().item(); d_vp = (vp_ref - vp_k).abs().max().item()
+            else:
+                d_o = (gather_at_kt(o_ref, k_t, K) - gather_at_kt(o_k, k_t, K)).abs().max().item()
+                d_vp = (gather_at_kt(vp_ref, k_t, K) - gather_at_kt(vp_k, k_t, K)).abs().max().item()
+            d_vc = (vc_ref - vc_k).abs().max().item()
+            print(f"[kernel rowparam fwd] train={train} kt={kt_mode}: d_out={d_o:.2e} d_Vpost={d_vp:.2e} d_vcarry={d_vc:.2e}")
+            assert d_o < 1e-5 and d_vp < 1e-5 and d_vc < 1e-5
+    print("  ==> PASS: Triton rowparam forward kernel bit-exact vs PyTorch reference")
+
+
 if __name__ == "__main__":
     test_degenerate_matches_continuous()
     test_early_stop_bit_exact()
@@ -158,4 +194,5 @@ if __name__ == "__main__":
     test_selective_degenerate()
     test_selective_early_stop_bit_exact()
     test_selective_gradcheck()
-    print("\nALL P3b-1 + P3b-2 TESTS PASSED")
+    test_kernel_rowparam_fwd_matches_reference()
+    print("\nALL P3b-1 + P3b-2 + P5.5-1 TESTS PASSED")

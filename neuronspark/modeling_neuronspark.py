@@ -409,6 +409,56 @@ if _HAS_TRITON:
             tl.store(VPOST_ptr + off, v, mask=mask)
 
     @triton.jit
+    def _segmented_plif_fwd_rowparam_kernel(
+        BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, INIT_ptr, KT_COLS_ptr,
+        OUTPUT_ptr, VPOST_ptr, VCARRY_ptr,
+        T, K, num_cols,
+        IS_TRAINING: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """V4 segmented PLIF forward (row-param β/v_th).
+
+        Per-token K-frame 递推, token 边界把运行膜电位 patch 成上 token 第 k_{t-1} 帧的 V_post.
+        IS_TRAINING: 跑全 K 帧 (梯度需要); 否则早停只跑到 block 内 max(k_t)+1 帧.
+        见 docs/v4_segmented_plif_kernel_design.md §1 / §6.2.
+
+        U/OUTPUT/VPOST: (TK, num_cols) 行主序; KT_COLS: (T, num_cols) int (= k_t expanded per col).
+        BETA_ROW/VTH_ROW/INIT/VCARRY: (num_cols,).
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        for t in range(T):
+            if t > 0:
+                # token 边界 patch: v <- 上 token 第 k_{t-1} 帧的 V_post (per-lane gather)
+                kt_prev = tl.load(KT_COLS_ptr + (t - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
+                patch_off = ((t - 1) * K + kt_prev) * num_cols + cols
+                v = tl.load(VPOST_ptr + patch_off, mask=mask, other=0.0).to(tl.float32)
+            kt_t = tl.load(KT_COLS_ptr + t * num_cols + cols, mask=mask, other=0).to(tl.int32)
+            if IS_TRAINING:
+                k_run = K
+            else:
+                k_run = tl.max(tl.where(mask, kt_t + 1, 0))
+            for k in range(K):
+                if k < k_run:
+                    off = (t * K + k) * num_cols + cols
+                    u_ik = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                    v_pre = beta * v + u_ik
+                    out_ik = tl.maximum(v_pre - vth, 0.0)
+                    v = v_pre - out_ik
+                    tl.store(OUTPUT_ptr + off, out_ik, mask=mask)
+                    tl.store(VPOST_ptr + off, v, mask=mask)
+        # v_carry = 序列最后 token 第 k_t 帧的 V_post
+        kt_last = tl.load(KT_COLS_ptr + (T - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
+        vc = tl.load(VPOST_ptr + ((T - 1) * K + kt_last) * num_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        tl.store(VCARRY_ptr + cols, vc, mask=mask)
+
+    @triton.jit
     def _fused_plif_bwd_rowparam_kernel(
         BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr, VPOST_ptr, OUTPUT_ptr,
         GRAD_OUTPUT_ptr, GRAD_VPOST_ptr,
@@ -999,6 +1049,40 @@ def segmented_plif_rowparam(
     output = torch.stack(out_tk, dim=0).reshape(TK, b, H)
     V_post = torch.stack(Vp_tk, dim=0).reshape(TK, b, H)
     return output, V_post, v_carry.detach()
+
+
+def _segmented_plif_rowparam_fwd_triton(beta_row, u, vth_row, v_init, k_t, K, training):
+    """Triton fused forward for segmented_plif_rowparam (P5.5). 与 PyTorch reference bit-exact.
+
+    Args / Returns: 与 segmented_plif_rowparam 相同 (beta_row/vth_row/v_init: (b,H); u: (TK,b,H);
+    k_t: (T,b) int). 仅 forward (backward kernel = P5.5-2).
+    """
+    TK, b, H = u.shape
+    T = TK // K
+    num_cols = b * H
+    u_flat = u.reshape(TK, num_cols).contiguous()
+    beta_flat = beta_row.reshape(num_cols).contiguous().to(torch.float32)
+    vth_flat = vth_row.reshape(num_cols).contiguous().to(torch.float32)
+    if not isinstance(v_init, torch.Tensor):
+        v_init_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
+    else:
+        v_init_flat = v_init.reshape(num_cols).contiguous().to(torch.float32)
+    k_t_cols = k_t.repeat_interleave(H, dim=1).contiguous().to(torch.int32)  # (T, num_cols)
+    output = torch.empty(TK, num_cols, device=u.device, dtype=torch.float32)
+    V_post = torch.empty(TK, num_cols, device=u.device, dtype=torch.float32)
+    v_carry = torch.empty(num_cols, device=u.device, dtype=torch.float32)
+    BLOCK = 128
+    grid = ((num_cols + BLOCK - 1) // BLOCK,)
+    _segmented_plif_fwd_rowparam_kernel[grid](
+        beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols,
+        output, V_post, v_carry,
+        T, K, num_cols,
+        IS_TRAINING=bool(training),
+        BLOCK=BLOCK,
+    )
+    return (output.reshape(TK, b, H).to(u.dtype),
+            V_post.reshape(TK, b, H).to(u.dtype),
+            v_carry.reshape(b, H).to(u.dtype).detach())
 
 
 def segmented_plif_selective(

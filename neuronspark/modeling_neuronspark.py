@@ -936,6 +936,71 @@ def plif_rowparam_forward(
         V_posts.append(v)
     return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0)
 
+
+def segmented_plif_rowparam(
+    beta_row: torch.Tensor,
+    u: torch.Tensor,
+    v_th_row: torch.Tensor,
+    v_init,
+    k_t: torch.Tensor,
+    K: int,
+    training: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """V4 segmented PLIF (row-param β/v_th). 见 docs/v4_segmented_plif_kernel_design.md.
+
+    Per-token K-frame 递推, token 边界把运行膜电位 patch 成上 token 第 k_{t-1} 帧的 V_post.
+    纯 PyTorch (autograd 自动反向); Triton 融合 kernel 后续 (P5.5) 再写, 用本函数当 reference.
+
+    Args:
+        beta_row: (b, H) — per-column 衰减率 (所有帧相同)
+        u:        (T*K, b, H) — per-frame 已缩放输入
+        v_th_row: (b, H) — per-column 阈值
+        v_init:   (b, H) Tensor 或 0 (float) — 初始膜电位 (上次 forward call 携带过来)
+        k_t:      (T, b) int ∈ {0..K-1} — 每 (token, batch) 的 halt 帧 index
+        K:        K_max (每 token 最大帧数)
+        training: True=跑全 K 帧; False=早停只跑到 batch 内 max(k_t)+1 (FLOP 节省)
+
+    Returns:
+        output:  (T*K, b, H) — 超阈电流 (sparse). 推理模式下 frame > running token 的 max-k_t 是
+                 未定义填充值, 但下游绝不读它 (gather 是 one-hot at k_t, patch 读 frame k_{t-1}).
+        V_post:  (T*K, b, H) — 发放后膜电位 (同上 caveat)
+        v_carry: (b, H) — 最后一个 token 第 k_{T-1} 帧的 V_post (detached; 给下次 forward call)
+    """
+    TK, b, H = u.shape
+    T = TK // K
+    u_tk = u.view(T, K, b, H)
+    if not isinstance(v_init, torch.Tensor):
+        v_init = torch.zeros(b, H, dtype=u.dtype, device=u.device)
+    v_carry = v_init
+    out_tk: list[torch.Tensor] = []
+    Vp_tk: list[torch.Tensor] = []
+    for t in range(T):
+        v = v_carry  # (b, H) — token t 的起始膜电位 (= 上 token 第 k_{t-1} 帧的 V_post, 或 t==0 时 = v_init)
+        K_run = K if training else (int(k_t[t].max().item()) + 1)
+        token_out: list[torch.Tensor] = []
+        token_vp: list[torch.Tensor] = []
+        for k in range(K_run):
+            v_pre = beta_row * v + u_tk[t, k]
+            out = F.relu(v_pre - v_th_row)
+            v = v_pre - out
+            token_out.append(out)
+            token_vp.append(v)
+        # 早停时补齐到 K 帧 (零填充; 推理无反向, 且这些帧永不被读)
+        while len(token_out) < K:
+            token_out.append(torch.zeros_like(token_out[0]))
+            token_vp.append(token_vp[-1])
+        token_out_s = torch.stack(token_out, dim=0)  # (K, b, H)
+        token_vp_s = torch.stack(token_vp, dim=0)    # (K, b, H)
+        out_tk.append(token_out_s)
+        Vp_tk.append(token_vp_s)
+        # v_carry = token t 第 k_t 帧的 V_post (per batch element)
+        idx = k_t[t].view(1, b, 1).expand(1, b, H)   # (1, b, H)
+        v_carry = token_vp_s.gather(0, idx).squeeze(0)  # (b, H)
+    output = torch.stack(out_tk, dim=0).reshape(TK, b, H)
+    V_post = torch.stack(Vp_tk, dim=0).reshape(TK, b, H)
+    return output, V_post, v_carry.detach()
+
+
 # ============================================================
 # Section: plif_node
 # ============================================================

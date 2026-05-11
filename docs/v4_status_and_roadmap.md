@@ -52,27 +52,35 @@
 
 ---
 
-## 3. 规划实现（按优先级）
+## 3. 规划 / 已排除
 
-### P-A（下一个做）：低秩化 SNN block 投影 —— 不碰 K 步串行动力学
-- **动机**：SNN block 单 token 大头 = 5 个满秩投影各执行 K 次（W_in/W_beta_x/W_alpha_x/W_th_x: D→DN=16384, 各 16M 参数；W_out: DN→D）。
-- **改法**：低秩分解 `W = A·B`（A:(out,r)、B:(r,D 或 r,DN)，r≪min(in,out)）。`W@x` = `A@(B@x)`：每帧 (in·r + r·out) vs 满秩 (in·out)，r=128 时 ~7-15× 便宜。对 W_in/W_out/W_beta_x/W_alpha_x/W_th_x 都做（W_gate/W_skip 是 D→D 较小，可选）。
-- **不动**：K 步递推（串行、逐 k 不同的选择性调制 β_h[k]/α[k]/vth_h[k] 从 v_in[k] 算）、input_neuron+hidden_neuron 两级 PLIF、生物味。只是每次 matmul 低秩。
-- **依据**：Mamba 的 Δ 投影本来就低秩（D→dt_rank→D）；满秩 D→16384 相对 Mamba overkill。Mamba 的 N 维 state 输入是 rank-1，所以 rank-r 宽松。
-- **代价**：低秩瓶颈 → N 个 sub-neuron 输入有 rank-r 相关性 → 可能掉一点容量。
-- **验证**：ablation —— 满秩 baseline vs 低秩 r∈{64,128,256}，同小规模（~100-200M 模型）训 ~2k step 比 perplexity，选不掉质量的最小 r。
-- **收益**：训练 + 推理的 SNN block matmul FLOPs 减约一个量级（matmul 是大头），SNN 本质不变。**这同时也减小「k_t 无关地板」里的 1-帧成本** → 早停相对收益也变大。
-
-### P-B（之后）：CUDA graphs / kernel 融合（降级 —— 用户指示优先级靠后）
-- 砍 ~1000 个 kernel launch 开销/forward（地板大头）。CUDA graphs 把整个 forward 捕成一个 graph → 每步 ~零 launch 开销 → 地板砍约一半 → 早停相对收益再变大。短序列 decode 时这是最大杠杆（FLOP 小、launch 开销主导）。
+### P-B（降级 —— 用户指示优先级靠后）：CUDA graphs / kernel 融合
+- 砍 ~1000 个 kernel launch 开销/forward（「k_t 无关地板」大头）。CUDA graphs 把整个 forward 捕成一个 graph → 每步 ~零 launch 开销 → 地板砍约一半 → 早停相对收益再变大。短序列 decode 时这是最大杠杆（FLOP 小、launch 开销主导）。注：也是 SNN block 单 token wall-clock 的真瓶颈所在（segmented PLIF kernel memory-bound + 一堆小 kernel），不是投影 matmul（见下 P-A 失败结论）。
 
 ### P-C（待定）：full 预训练（V4 从头训）
-- 大资源投入（多卡、大数据、几天）。在 P-A（+ 可选 P-B）落地并 ablation 通过后启动。需定：在哪训、规模、数据、K_max。
+- 大资源投入（多卡、大数据、几天）。需定：在哪训、规模、数据、K_max。V4 必须重训（架构改了）。
 
-### 不做（破坏神经动力学，已排除）
+### 不做（已排除）
+
+**P-A 低秩化 SNN block 投影 —— 试过, 不可取, 已 revert（commit 90087fd + bfb8f95 revert 了 b978ba9 + 2b80dd9）。**
+- 改法曾是：`W = A·B`（r≪min(in,out)）对 W_in/W_beta_x/W_alpha_x/W_th_x/W_out（SNNBlock）+ gate/up/down（SNNFFN）；不动 K 步串行选择性动力学。
+- **ablation 实测**（D=512, N=16, 12 层, seq=512, batch=4, 1500 step, SFT 数据切片, 4 卡并行）：
+  | rank | params | final_loss(last100) | ms/step | vs full |
+  |---|---|---|---|---|
+  | full | 289.6M | 7.290 | 1206 | baseline |
+  | r=256 | 196.4M | 7.408 | 1099 (~9%快) | +0.118 |
+  | r=128 | 139.2M | 7.429 | 1049 (~13%快) | +0.139 |
+  | r=64 | 110.5M | 7.423 | 1038 (~14%快) | +0.133 |
+- **结论 / 为什么不可取**：
+  1. 低秩 **+0.13 loss（≈ ppl 高 ~14%）** vs 满秩 —— 有质量损失, 不是「无损」。
+  2. **r=64≈r=128≈r=256**（差异在噪声内）→ gap 不是低秩瓶颈造成的, 是**参数量差异**（满秩 290M vs 低秩 110-200M）。即低秩只是「换个更小的模型」, 不是「同模型更省」。
+  3. **速度只省 ~10-14%**（远不是预期的「matmul ×10 少」）—— 因为 SNN block 单 token wall-clock 的大头是 **segmented PLIF kernel**（memory-bound, DN=8192 维 × K 步, 跟 proj rank 无关），不是投影 matmul。投影低秩只省了那 ~50-60% 的投影 FLOP, 对总 wall-clock 只 ~10-14%。
+  → 「想 290M 模型快」: 瓶颈是 PLIF kernel（→ CUDA 工程 / 减小 N, 都不是「架构层面、不碰旋钮、不碰动力学」的可取选项）。低秩对此无帮助。
+
+**其它已排除（破坏神经动力学）**：
 - 「投影一次」（K 步递推输入变常数 → 退化成 settling 曲线 → 废 SNN 串行动力学）。
 - 连续 Δ_t（消掉 K 维 → 1 步 → 就不是 SNN 了，跟「唯一创新是 Mamba→BioSSM」冲突）。
-- 调旋钮（N / K_max / attention interval）不算架构改动；K_max=8 那种只省训练、推理早停已覆盖，是重训时的 config 决策不是结构改动。
+- 调旋钮（N / K_max / attention interval）不算架构改动；K_max=8 那种只省训练、推理早停已覆盖。
 
 ---
 

@@ -1444,20 +1444,18 @@ class SNNFFN(MemoryModule):
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
         self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
 
-    def forward_parallel(self, h_seq: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(self, h_seq: torch.Tensor, k_t: torch.Tensor, K: int, training: bool) -> torch.Tensor:
         """
-        并行前向传播：使用 parallel scan 处理全序列。
-
-        优化：
-          - gate_proj + up_proj 合并为单次 matmul（2 launch → 1）
-          - gate + up PLIF scan: row-param kernel（无需 expand+contiguous beta/v_th）
-          - u_merged: 向量缩放替代 cat（1次 broadcast multiply 替代 2次 scale + 1次 cat）
+        并行前向传播：V4 segmented PLIF (per-token K 帧, token 边界携带第 k_t 帧膜电位).
 
         Args:
-            h_seq: (TK, batch, D) — 全部 T×K 帧的连续激活（来自 PLIFNode V_post 泄漏量）
+            h_seq: (TK, batch, D) — input_neuron 的 K 帧输出 (TK = T*K)
+            k_t:   (T, batch) int ∈ {0..K-1} — FFN 子层的 halt 帧 index per (token, batch)
+            K:     K_max
+            training: True=跑全 K 帧; False=早停只跑到 max(k_t)
 
         Returns:
-            continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出
+            continuous_out: (TK, batch, D)
         """
         TK, batch, D = h_seq.shape
         input_dtype = h_seq.dtype
@@ -1469,44 +1467,35 @@ class SNNFFN(MemoryModule):
         I_gate_up = F.linear(flat, W_gate_up).reshape(TK, batch, 2 * D_ff)
         I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
 
-        # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======
+        # ====== Phase 2: Gate+Up 合并 segmented PLIF (row-param) ======
         beta_gate = self.gate_neuron.beta.to(input_dtype)  # (D_ff,)
         beta_up = self.up_neuron.beta.to(input_dtype)      # (D_ff,)
-        surr = self.gate_neuron.surrogate_function
-
-        # u_merged: 向量缩放（D_ff 维 β 直接 cat，无需 expand）
         scale_row = torch.cat([1.0 - beta_gate, 1.0 - beta_up])  # (2*D_ff,)
         u_merged = I_gate_up * scale_row  # (TK, batch, 2*D_ff), broadcast
-
-        # beta_row / v_th_row: (batch, 2*D_ff) — D_ff 维可学习参数
-        beta_row = torch.cat([beta_gate, beta_up])  # (2*D_ff,)
-        beta_row = beta_row.unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
-
+        beta_row = torch.cat([beta_gate, beta_up]).unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
         v_th_row = torch.cat([self.gate_neuron.v_th.to(input_dtype),
-                              self.up_neuron.v_th.to(input_dtype)])  # (2*D_ff,)
-        v_th_row = v_th_row.unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
-
-        # v_init_merged: (batch, 2*D_ff)
+                              self.up_neuron.v_th.to(input_dtype)]).unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
         v_init_gate = self.gate_neuron.v
         if isinstance(v_init_gate, float):
-            v_init_gate = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_gate = torch.zeros(batch, D_ff, device=flat.device, dtype=input_dtype)
+        else:
+            v_init_gate = v_init_gate.to(input_dtype)
         v_init_up = self.up_neuron.v
         if isinstance(v_init_up, float):
-            v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=input_dtype)
+        else:
+            v_init_up = v_init_up.to(input_dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
-        # Row-param bio-PLIF scan (V1): ablation showed V2 rowparam has bad ROI
-        # (+13% time for only -10% memory). V1 is faster here, V2 kept only for
-        # SNN block hidden (where V_post is biggest).
-        output_merged, V_post_merged = plif_rowparam_forward(
-            beta_row, u_merged, v_th_row, v_init_merged,
+        output_merged, _V_post_merged, v_carry_merged = segmented_plif_rowparam(
+            beta_row, u_merged, v_th_row, v_init_merged, k_t, K, training,
         )
 
         # 超阈电流输出 (sparse): 非发放位置严格 == 0, 发放位置 = V_pre - V_th > 0
         gate_out = output_merged[:, :, :D_ff]
         up_out = output_merged[:, :, D_ff:]
-        self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
-        self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
+        self.gate_neuron.v = v_carry_merged[:, :D_ff]   # (batch, D_ff), 已 detach
+        self.up_neuron.v = v_carry_merged[:, D_ff:]
         with torch.no_grad():
             self.gate_neuron._last_firing_rate = (gate_out > 0).float().mean().item()
             self.up_neuron._last_firing_rate = (up_out > 0).float().mean().item()
@@ -1686,15 +1675,18 @@ class SNNBlock(MemoryModule):
         with torch.no_grad():
             self.W_out.weight.mul_(out_scale_DN.unsqueeze(0))
 
-    def forward_parallel(self, h_seq: torch.Tensor) -> torch.Tensor:
+    def forward_parallel(self, h_seq: torch.Tensor, k_t: torch.Tensor, K: int, training: bool) -> torch.Tensor:
         """
-        并行前向传播：使用 parallel scan 处理全序列。
+        并行前向传播：V4 segmented PLIF (per-token K 帧, token 边界携带第 k_t 帧膜电位).
 
         Args:
-            h_seq: (TK, batch, D) — 全部 T×K 帧的连续激活（来自 PLIFNode V_post 泄漏量）
+            h_seq: (TK, batch, D) — input_neuron 的 K 帧输出 (TK = T*K)
+            k_t:   (T, batch) int ∈ {0..K-1} — block 子层的 halt 帧 index per (token, batch)
+            K:     K_max
+            training: True=跑全 K 帧; False=早停只跑到 max(k_t)
 
         Returns:
-            continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出（V_post 经 W_out 投影）
+            continuous_out: (TK, batch, D) — 全部 K 帧的连续输出（推理早停时 frame > k_t 是填充值, 下游不读）
         """
         TK, batch, D = h_seq.shape
         DN = self.D * self.N
@@ -1736,17 +1728,17 @@ class SNNBlock(MemoryModule):
             )
 
         # 获取隐神经元初始状态
-        v_init_hidden = self.hidden_neuron.v
-        if isinstance(v_init_hidden, float):
-            v_init_hidden = torch.zeros(batch, DN, device=flat.device, dtype=flat.dtype)
+        v_init_hidden = self.hidden_neuron.v  # (batch, DN) Tensor 或 0 (float)
+        if isinstance(v_init_hidden, torch.Tensor):
+            v_init_hidden = v_init_hidden.to(compute_dtype)
 
-        # V2: returns (output, v_last) — V_post not held across steps by .v view
-        output_hidden, v_last_hidden = plif_parallel_forward_v2(
-            beta_all, u_hidden, v_th_all, v_init_hidden,
+        # V4 segmented selective PLIF: per-token K 帧, token 边界携带第 k_t 帧膜电位
+        output_hidden, _V_post_hidden, v_carry_hidden = segmented_plif_selective(
+            beta_all, u_hidden, v_th_all, v_init_hidden, k_t, K, training,
         )
 
-        # 更新隐神经元状态（保存末步 V_post 供下次调用）
-        self.hidden_neuron.v = v_last_hidden.detach()
+        # 携带状态 = 序列最后 token 第 k_t 帧的膜电位 (segmented_plif_* 已 detach)
+        self.hidden_neuron.v = v_carry_hidden
         with torch.no_grad():
             self.hidden_neuron._last_firing_rate = (output_hidden > 0).float().mean().item()
 
@@ -2049,44 +2041,37 @@ class SNNDecoderLayer(MemoryModule):
         self._last_y_hard_block = None
         self._last_y_hard_ffn = None
 
-    def _input_neuron_parallel(self, input_neuron, x):
-        """
-        输入 PLIF 神经元的 parallel scan 前向传播。
+    def _input_neuron_parallel(self, input_neuron, x, k_t, K, training):
+        """输入 PLIF 神经元: V4 segmented (per-token K 帧, token 边界携带第 k_t 帧膜电位).
 
-        完整 PLIF 动力学: V[t] = β·V[t-1] + (1-β)·x[t], spike = Θ(V-V_th), 软重置。
-        输出膜电位泄漏量 (1-β)·V_post 作为激活值——即每步因指数衰减将泄漏的量。
-        相比直接传递 V_post，泄漏量自然强调快响应神经元（大 1-β），
-        抑制慢记忆神经元（小 1-β），实现隐式的时间尺度加权。
+        x 是 K 展开后的输入 (TK, batch, D), 每 token 的 K 份相同 (来自 repeat_interleave).
+        完整 PLIF: V[k] = β·V[k-1] + (1-β)·x[k]; out[k] = relu(V-V_th); V[k] = min(V_pre, V_th).
+        返回超阈电流 (1-β)·... 等价的 out (sparse).
 
         Args:
-            input_neuron: PLIFNode 实例（D 维可学习 β 和 V_th）
-            x: (TK, batch, D) — 连续值输入
-
+            input_neuron: PLIFNode (D 维 β / V_th)
+            x: (TK, batch, D); k_t: (T, batch) int; K: K_max; training: bool
         Returns:
-            leak: (TK, batch, D) — 膜电位泄漏量 (1-β)·V_post
+            output: (TK, batch, D) — 超阈电流 (推理早停时 frame > k_t 是填充值, 下游不读)
         """
         TK, batch, D = x.shape
         input_dtype = x.dtype
-
-        beta = input_neuron.beta.to(input_dtype)  # fp32→bf16 for compute
-        u = (1.0 - beta) * x
-
+        beta = input_neuron.beta.to(input_dtype)  # (D,)
+        u = (1.0 - beta) * x  # (TK, batch, D)
         v_init = input_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=x.device, dtype=x.dtype)
-
+            v_init = torch.zeros(batch, D, device=x.device, dtype=input_dtype)
+        else:
+            v_init = v_init.to(input_dtype)
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
-
-        output, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
+        output, _V_post, v_carry = segmented_plif_rowparam(
+            beta_row, u, v_th_row, v_init, k_t, K, training,
         )
-
-        input_neuron.v = V_post[-1].detach()
-        # Diagnostic: 发放率 (bio-ReLU: output > 0 ≡ fired)
+        input_neuron.v = v_carry  # (batch, D), 已 detach
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
-        return output.to(input_dtype)  # 超阈电流 (sparse, bio-ReLU)
+        return output.to(input_dtype)
 
     def _ponder_aggregate_v3(
         self,
@@ -2169,9 +2154,10 @@ class SNNDecoderLayer(MemoryModule):
             k_logits_block, training=self.training,
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )                                                                # y_st: (T, b, K)
+        k_t_block = y_hard_block.argmax(dim=-1)                          # (T, b) int — 与 gather 用的 y_st argmax 一致
         h_normed_k = self.block_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
-        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k)  # (TK, b, D)
-        cont_block = self.snn_block.forward_parallel(v_in)               # (TK, b, D)
+        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k, k_t_block, K, self.training)  # (TK, b, D)
+        cont_block = self.snn_block.forward_parallel(v_in, k_t_block, K, self.training)  # (TK, b, D)
         frames_block = cont_block.view(seq_len, K, batch, D)            # (T, K, b, D)
         # gather 第 k_t 帧 (STE: forward=y_hard, backward=y_soft)
         combined_block = (y_st_block.permute(0, 2, 1).unsqueeze(-1) * frames_block).sum(dim=1)  # (T, b, D)
@@ -2187,9 +2173,10 @@ class SNNDecoderLayer(MemoryModule):
             k_logits_ffn, training=self.training,
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
+        k_t_ffn = y_hard_ffn.argmax(dim=-1)                             # (T, b) int
         h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)  # (TK, b, D)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)                 # (TK, b, D)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, K, self.training)  # (TK, b, D)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, K, self.training)  # (TK, b, D)
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
         combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
         ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
@@ -2366,24 +2353,23 @@ class SNNAttentionDecoderLayer(MemoryModule):
         self.eps_explore = 0.0
         self._last_y_hard_ffn = None
 
-    def _input_neuron_parallel(self, input_neuron, x):
-        """PLIFNode parallel scan, 返回激活值。复用 SNNDecoderLayer 的逻辑。"""
+    def _input_neuron_parallel(self, input_neuron, x, k_t, K, training):
+        """V4 segmented input PLIF (per-token K 帧, token 边界携带第 k_t 帧). 复用 SNNDecoderLayer 逻辑。"""
         TK, batch, D = x.shape
         input_dtype = x.dtype
         beta = input_neuron.beta.to(input_dtype)
         u = (1.0 - beta) * x
-
         v_init = input_neuron.v
         if isinstance(v_init, float):
             v_init = torch.zeros(batch, D, device=x.device, dtype=input_dtype)
-
+        else:
+            v_init = v_init.to(input_dtype)
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
-
-        output, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
+        output, _V_post, v_carry = segmented_plif_rowparam(
+            beta_row, u, v_th_row, v_init, k_t, K, training,
         )
-        input_neuron.v = V_post[-1].detach()
+        input_neuron.v = v_carry
         with torch.no_grad():
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)
@@ -2492,9 +2478,10 @@ class SNNAttentionDecoderLayer(MemoryModule):
             k_logits_ffn, training=self.training,
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
+        k_t_ffn = y_hard_ffn.argmax(dim=-1)                             # (T, b) int
         h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)                 # (TK, b, D)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, K, self.training)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, K, self.training)  # (TK, b, D)
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
         combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
         ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)

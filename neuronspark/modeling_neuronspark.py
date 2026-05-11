@@ -1752,18 +1752,22 @@ class SNNFFN(MemoryModule):
         output_v_threshold: float = 0.3,
         num_layers: int = 1,
         layer_idx: int = 0,
+        proj_rank: int | None = None,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
     ):
         super().__init__()
         self.D = D
         self.D_ff = D_ff
+        self.proj_rank = proj_rank
 
-        # ====== 三条投影路径（对标 SwiGLU: gate_proj, up_proj, down_proj） ======
-        self.gate_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
-        self.up_proj = layer.Linear(D, D_ff, bias=False, step_mode='s')
-        self.down_proj = layer.Linear(D_ff, D, bias=False, step_mode='s')
+        # ====== 三条投影路径（对标 SwiGLU）—— P-A: gate/up/down 可低秩 ======
+        def _mk(i, o):
+            return LowRankLinear(i, o, proj_rank) if proj_rank else layer.Linear(i, o, bias=False, step_mode='s')
+        self.gate_proj = _mk(D, D_ff)
+        self.up_proj = _mk(D, D_ff)
+        self.down_proj = _mk(D_ff, D)
 
-        # ====== 残差路径 ======
+        # ====== 残差路径 (D→D 小, 保持满秩) ======
         self.skip_proj = layer.Linear(D, D, bias=False, step_mode='s')
 
         # ====== 神经元（D 维或 D_ff 维可学习 β 和 V_th） ======
@@ -1785,16 +1789,19 @@ class SNNFFN(MemoryModule):
         self._initialize_parameters(num_layers)
 
     def _initialize_parameters(self, num_layers: int):
-        """初始化投影权重。
+        """初始化投影权重 (低秩 LowRankLinear 的 A/B 已在其 __init__ kaiming 过)。
 
         - gate_proj, up_proj, skip_proj: Kaiming uniform
-        - down_proj: Kaiming uniform × 1/√(num_layers)，防深层梯度爆炸
+        - down_proj: Kaiming uniform × 1/√(num_layers)，防深层梯度爆炸 (低秩: 缩 output 侧 A.weight)
         """
-        for lin in [self.gate_proj, self.up_proj, self.skip_proj]:
-            nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
-
-        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-        self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
+        nn.init.kaiming_uniform_(self.skip_proj.weight, a=math.sqrt(5))
+        if not self.proj_rank:
+            for lin in [self.gate_proj, self.up_proj]:
+                nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+            self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
+        else:
+            self.down_proj.A.weight.data.mul_(1.0 / math.sqrt(num_layers))
 
     def forward_parallel(self, h_seq: torch.Tensor, k_t: torch.Tensor, K: int, training: bool) -> torch.Tensor:
         """
@@ -1814,9 +1821,12 @@ class SNNFFN(MemoryModule):
         D_ff = self.D_ff
         flat = h_seq.reshape(TK * batch, D)
 
-        # ====== Phase 1: 批量投影（gate+up 合并为 1 次 matmul） ======
-        W_gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-        I_gate_up = F.linear(flat, W_gate_up).reshape(TK, batch, 2 * D_ff)
+        # ====== Phase 1: 投影 —— 满秩走 merged matmul; 低秩 (LowRankLinear) 分别投 ======
+        if self.proj_rank:
+            I_gate_up = torch.cat([self.gate_proj(flat), self.up_proj(flat)], dim=-1).reshape(TK, batch, 2 * D_ff)
+        else:
+            W_gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
+            I_gate_up = F.linear(flat, W_gate_up).reshape(TK, batch, 2 * D_ff)
         I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
 
         # ====== Phase 2: Gate+Up 合并 segmented PLIF (row-param) ======
@@ -1855,7 +1865,7 @@ class SNNFFN(MemoryModule):
         # ====== Phase 3: 连续门控（对标 SwiGLU）+ 降维 ======
         gated = gate_out * up_out  # (TK, batch, D_ff), sparser than gate_out alone
         gated_flat = gated.reshape(TK * batch, D_ff)
-        I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
+        I_out = self.down_proj(gated_flat).reshape(TK, batch, D) + I_skip
 
         # 子层级 output_neuron 已移除，改由层级 K 帧聚合处理（模型级 output_neuron 仍保留于 model.py）
         return I_out.to(input_dtype)  # (TK, batch, D), 连续值
@@ -2381,6 +2391,7 @@ class SNNDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
+            proj_rank=snn_proj_rank,
         )
 
         # Pre-LN 分支归一化: h → RMSNorm → PLIFNode
@@ -2683,6 +2694,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
         K: int = 12,
         num_layers: int = 1,
         layer_idx: int = 0,
+        snn_proj_rank: int | None = None,
     ):
         super().__init__()
         self.D = D
@@ -2722,6 +2734,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
             output_v_threshold=ffn_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
+            proj_rank=snn_proj_rank,
         )
         self.ffn_out_proj = nn.Linear(D, D, bias=False)
 
@@ -2986,6 +2999,7 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
+                    snn_proj_rank=snn_proj_rank,
                 ))
                 self.layer_types.append('memory')
             else:
@@ -3399,6 +3413,10 @@ class SNNLanguageModel(nn.Module):
             'ffn_neurons': [],
         }
 
+        # P-A: 投影可能是 LowRankLinear (有 .A/.B 而非 .weight)
+        def _w_of(W):
+            return list(W.parameters()) if isinstance(W, LowRankLinear) else [W.weight]
+
         for layer_module, layer_type in zip(self.layers, self.layer_types):
             if layer_type == 'memory':
                 # SNNAttentionDecoderLayer: attn 子层 + ffn 子层
@@ -3419,9 +3437,9 @@ class SNNLanguageModel(nn.Module):
                 groups['k_predictors'].extend(list(layer_module.ffn_k_predictor.net.parameters()))
                 # SNNFFN 参数
                 ffn = layer_module.snn_ffn
-                groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
-                groups['ffn_up_proj'].append(ffn.up_proj.weight)
-                groups['ffn_down_proj'].append(ffn.down_proj.weight)
+                groups['ffn_gate_proj'].extend(_w_of(ffn.gate_proj))
+                groups['ffn_up_proj'].extend(_w_of(ffn.up_proj))
+                groups['ffn_down_proj'].extend(_w_of(ffn.down_proj))
                 groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
                 groups['ffn_neurons'].extend([
                     ffn.gate_neuron.w, ffn.gate_neuron.v_th,
@@ -3452,9 +3470,7 @@ class SNNLanguageModel(nn.Module):
             groups['k_predictors'].extend(list(layer_module.block_k_predictor.net.parameters()))
             groups['k_predictors'].extend(list(layer_module.ffn_k_predictor.net.parameters()))
 
-            # SNNBlock 参数 — P-A: D↔DN 投影可能是 LowRankLinear (有 .A/.B 而非 .weight)
-            def _w_of(W):
-                return list(W.parameters()) if isinstance(W, LowRankLinear) else [W.weight]
+            # SNNBlock 参数
             groups['W_in'].extend(_w_of(block.W_in))
             groups['W_beta'].extend(_w_of(block.W_beta_x))
             groups['W_alpha'].extend(_w_of(block.W_alpha_x))
@@ -3467,9 +3483,9 @@ class SNNLanguageModel(nn.Module):
             groups['b_th'].append(block.b_th)
 
             # SNNFFN 参数
-            groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
-            groups['ffn_up_proj'].append(ffn.up_proj.weight)
-            groups['ffn_down_proj'].append(ffn.down_proj.weight)
+            groups['ffn_gate_proj'].extend(_w_of(ffn.gate_proj))
+            groups['ffn_up_proj'].extend(_w_of(ffn.up_proj))
+            groups['ffn_down_proj'].extend(_w_of(ffn.down_proj))
             groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
             groups['ffn_neurons'].extend([
                 ffn.gate_neuron.w, ffn.gate_neuron.v_th,

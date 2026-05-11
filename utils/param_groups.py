@@ -105,8 +105,8 @@ def _partition_params_for_muon(model: nn.Module):
                 # Fallback: 1D slipped in, goes to adam norm group
                 adam_norm.append(p)
 
-    # Conv1d weight is 3D (Mamba-style depthwise), NOT matrix-orthogonalizable
-    # → route to adam_norm (generic 2+ moment optimizer is fine for this)
+    # V4: conv1d removed (see docs/v4_early_stop_design.md §1.1). pg.get("conv1d", [])
+    # is now always empty; kept the no-op for backward compat with older ckpts.
     for p in pg.get("conv1d", []):
         adam_norm.append(p)
 

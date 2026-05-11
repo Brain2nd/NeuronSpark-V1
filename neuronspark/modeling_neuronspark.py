@@ -1468,16 +1468,10 @@ class SNNBlock(MemoryModule):
         self.v_th_min = v_th_min
         DN = D * N
 
-        # ====== 因果卷积：局部上下文预混合（参考 Qwen3.5 GatedDeltaNet） ======
-        self.conv_kernel_size = 4
-        self.conv1d = nn.Conv1d(
-            in_channels=D,
-            out_channels=D,
-            kernel_size=self.conv_kernel_size,
-            groups=D,  # 深度卷积
-            padding=self.conv_kernel_size - 1,  # causal padding
-            bias=False,
-        )
+        # V4: 删除 V2.5 的因果卷积 (conv1d over TK 轴). 见 docs/v4_early_stop_design.md §1.1:
+        # 该 conv 沿 TK 轴卷把相邻 token 的 K 帧块耦合起来, 破坏 early-stop; Mamba-3
+        # (ICLR 2026) 也已证明 external short conv 可被递推内化、加回反而略降. 局部上下文
+        # 由 SNNAttentionDecoderLayer + 残差流承担.
 
         # ====== 六条并行输入投影（SNN 突触：连续激活输入） ======
         self.W_in = layer.Linear(D, DN, bias=False, step_mode='s')
@@ -1502,11 +1496,6 @@ class SNNBlock(MemoryModule):
             surrogate_function=surrogate_function,
             detach_reset=False,
         )
-
-        # ====== 缓存生成态: conv1d ring buffer (因果卷积左 context) ======
-        # None = 首次/reset 后, conv1d 用 zero-pad 启动
-        # tensor (batch, D, kernel_size-1) = decode 续传, prepend 到当前帧前
-        self.register_memory('conv_state', None)
 
         # ====== 参数初始化 ======
         self._initialize_parameters()
@@ -1582,30 +1571,7 @@ class SNNBlock(MemoryModule):
         TK, batch, D = h_seq.shape
         DN = self.D * self.N
 
-        # ====== Phase 0: 因果卷积预混合（局部上下文 + ring buffer 支持续传） ======
-        conv_dtype = self.conv1d.weight.dtype
-        PAD = self.conv_kernel_size - 1  # = 3
-        conv_in = h_seq.to(conv_dtype).permute(1, 2, 0)  # (batch, D, TK)
-        if self.conv_state is None:
-            # 首次/reset 后: 左 zero-pad 启动 (与原 self.conv1d 行为等价)
-            conv_in_padded = F.pad(conv_in, (PAD, 0))
-        else:
-            # decode 续传: ring buffer 当左 context, 不补零
-            conv_in_padded = torch.cat([self.conv_state.to(conv_dtype), conv_in], dim=2)
-        # 手动控制 padding -> 用 F.conv1d 不让 nn.Conv1d 再补零
-        conv_out = F.conv1d(
-            conv_in_padded,
-            self.conv1d.weight,
-            self.conv1d.bias,
-            stride=self.conv1d.stride,
-            padding=0,
-            dilation=self.conv1d.dilation,
-            groups=self.conv1d.groups,
-        )  # (batch, D, TK)
-        # 保存最后 PAD 帧供下次调用 (取自 padded 输入末尾，对应"已观察到的"最近 PAD 帧)
-        self.conv_state = conv_in_padded[:, :, -PAD:].detach()
-        h_seq = conv_out.permute(2, 0, 1)  # (TK, batch, D)
-
+        # V4: 已删除 V2.5 的 conv1d 预混合 (见 docs/v4_early_stop_design.md §1.1).
         # ====== Phase 1: 批量投影（全部 TK 帧同时计算）======
         flat = h_seq.reshape(TK * batch, D)
 
@@ -2889,7 +2855,6 @@ class SNNLanguageModel(nn.Module):
             'W_gate': [],
             'W_skip': [],
             'W_out': [],
-            'conv1d': [],               # Mamba-style depthwise short conv (3D weight)
             'b_beta': [],
             'b_alpha': [],
             'b_th': [],
@@ -2963,11 +2928,6 @@ class SNNLanguageModel(nn.Module):
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
-            # Depthwise short conv (Mamba-style). 3D weight (C, 1, kernel) — not
-            # matrix-orthogonalizable, so exclude from Muon group in downstream.
-            groups['conv1d'].append(block.conv1d.weight)
-            if block.conv1d.bias is not None:
-                groups['conv1d'].append(block.conv1d.bias)
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
@@ -3108,10 +3068,9 @@ class NeuronSparkForCausalLM(PreTrainedModel):
     ) -> torch.Tensor:
         """带缓存的 stateful 生成: prefill 整 prompt, 然后逐 token decode 仅推 K 帧.
 
-        正确性依赖三个状态自动 carry:
+        正确性依赖状态自动 carry:
           - PLIF .v (已通过 register_memory)
-          - SNNAttentionDecoderLayer.M_state (已通过 register_memory)
-          - SNNBlock.conv_state + SNNAttentionDecoderLayer.pos_offset (新加)
+          - SNNAttentionDecoderLayer.M_state + pos_offset (已通过 register_memory)
 
         与 HF 默认 model.generate() 等价但每步 O(K) 而非 O(T*K), T 越长加速越明显.
         autocast bf16 包 forward 与 self.forward() 一致.

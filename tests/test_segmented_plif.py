@@ -6,7 +6,10 @@
 """
 import sys, torch
 sys.path.insert(0, "/home/dgxspark/Desktop/NeuronSpark-V1")
-from neuronspark.modeling_neuronspark import segmented_plif_rowparam, plif_rowparam_forward
+from neuronspark.modeling_neuronspark import (
+    segmented_plif_rowparam, plif_rowparam_forward,
+    segmented_plif_selective, plif_parallel_forward,
+)
 
 
 def gather_at_kt(frames_TK, k_t, K):
@@ -86,8 +89,73 @@ def test_gradcheck():
     print("  ==> PASS: backward matches numerical gradients (incl. token-boundary patch path)")
 
 
+# ---------------- selective (non-rowparam) variant ----------------
+
+def test_selective_degenerate():
+    torch.manual_seed(3)
+    T, K, b, H = 5, 4, 2, 8
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    beta = torch.rand(T * K, b, H, device=dev) * 0.5 + 0.4   # per-frame
+    vth = torch.rand(T * K, b, H, device=dev) * 0.3 + 0.1
+    u = torch.randn(T * K, b, H, device=dev) * 0.5
+    v_init = torch.randn(b, H, device=dev) * 0.2
+    out_c, Vp_c, _ = plif_parallel_forward(beta, u, vth, v_init)  # continuous (treats TK as one seq)
+    k_t = torch.full((T, b), K - 1, dtype=torch.long, device=dev)
+    out_s, Vp_s, vcarry_s = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
+    d_out = (out_c - out_s).abs().max().item()
+    d_Vp = (Vp_c - Vp_s).abs().max().item()
+    d_carry = (Vp_c[-1] - vcarry_s).abs().max().item()
+    print(f"[selective degenerate] all k_t=K-1: max|out diff|={d_out:.3e}, max|Vpost diff|={d_Vp:.3e}, max|carry diff|={d_carry:.3e}")
+    assert d_out < 1e-5 and d_Vp < 1e-5 and d_carry < 1e-5
+    print("  ==> PASS: segmented_selective == continuous when all k_t = K-1")
+
+
+def test_selective_early_stop_bit_exact():
+    torch.manual_seed(4)
+    T, K, b, H = 6, 5, 3, 8
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    beta = torch.rand(T * K, b, H, device=dev) * 0.5 + 0.4
+    vth = torch.rand(T * K, b, H, device=dev) * 0.3 + 0.1
+    u = torch.randn(T * K, b, H, device=dev) * 0.5
+    v_init = torch.randn(b, H, device=dev) * 0.2
+    k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
+    out_full, Vp_full, carry_full = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
+    out_es, Vp_es, carry_es = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=False)
+    g_full = gather_at_kt(out_full, k_t, K); g_es = gather_at_kt(out_es, k_t, K)
+    gv_full = gather_at_kt(Vp_full, k_t, K); gv_es = gather_at_kt(Vp_es, k_t, K)
+    d_g = (g_full - g_es).abs().max().item()
+    d_gv = (gv_full - gv_es).abs().max().item()
+    d_c = (carry_full - carry_es).abs().max().item()
+    print(f"[selective early-stop] max|gather@k_t out diff|={d_g:.3e}, max|gather@k_t Vpost diff|={d_gv:.3e}, max|v_carry diff|={d_c:.3e}")
+    assert d_g == 0.0 and d_gv == 0.0 and d_c == 0.0
+    print("  ==> PASS: selective early-stop is bit-exact")
+
+
+def test_selective_gradcheck():
+    torch.manual_seed(5)
+    T, K, b, H = 4, 3, 2, 4
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    beta = (torch.rand(T * K, b, H, device=dev, dtype=torch.float64) * 0.5 + 0.4).requires_grad_(True)
+    vth = (torch.rand(T * K, b, H, device=dev, dtype=torch.float64) * 0.3 + 0.1).requires_grad_(True)
+    u = (torch.randn(T * K, b, H, device=dev, dtype=torch.float64) * 0.3).requires_grad_(True)
+    v_init = (torch.randn(b, H, device=dev, dtype=torch.float64) * 0.1).requires_grad_(True)
+    k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
+
+    def f(beta, u, vth, v_init):
+        out, Vp, carry = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
+        g = gather_at_kt(out, k_t, K)
+        return (g.sum(), carry.sum())
+    ok = torch.autograd.gradcheck(f, (beta, u, vth, v_init), eps=1e-6, atol=1e-4, rtol=1e-3)
+    print(f"[selective gradcheck] fp64: {ok}")
+    assert ok
+    print("  ==> PASS: selective backward matches numerical grads")
+
+
 if __name__ == "__main__":
     test_degenerate_matches_continuous()
     test_early_stop_bit_exact()
     test_gradcheck()
-    print("\nALL P3b-1 TESTS PASSED")
+    test_selective_degenerate()
+    test_selective_early_stop_bit_exact()
+    test_selective_gradcheck()
+    print("\nALL P3b-1 + P3b-2 TESTS PASSED")

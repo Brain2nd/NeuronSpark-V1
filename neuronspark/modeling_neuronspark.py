@@ -1001,6 +1001,69 @@ def segmented_plif_rowparam(
     return output, V_post, v_carry.detach()
 
 
+def segmented_plif_selective(
+    beta: torch.Tensor,
+    u: torch.Tensor,
+    v_th: torch.Tensor,
+    v_init,
+    k_t: torch.Tensor,
+    K: int,
+    training: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """V4 segmented PLIF (selective: β/v_th per-frame data-dependent). 给 snn_block.hidden_neuron.
+
+    与 segmented_plif_rowparam 同结构, 但 β/v_th 逐帧索引. 见 docs/v4_segmented_plif_kernel_design.md.
+    纯 PyTorch (autograd 自动反向); Triton 融合 kernel 后续 (P5.5) 再写.
+
+    Args:
+        beta:   (T*K, b, H) — per-frame 衰减率 (selective)
+        u:      (T*K, b, H) — per-frame 已缩放投影输入
+        v_th:   (T*K, b, H) — per-frame 动态阈值
+        v_init: (b, H) Tensor 或 0 — 初始膜电位
+        k_t:    (T, b) int ∈ {0..K-1} — 每 (token, batch) halt 帧 index
+        K:      K_max
+        training: True=全 K; False=早停到 max(k_t)+1
+
+    Returns:
+        output:  (T*K, b, H) — 超阈电流
+        V_post:  (T*K, b, H) — 发放后膜电位
+        v_carry: (b, H) — 最后 token 第 k_{T-1} 帧 V_post (detached)
+    """
+    TK, b, H = u.shape
+    T = TK // K
+    beta_tk = beta.view(T, K, b, H)
+    u_tk = u.view(T, K, b, H)
+    vth_tk = v_th.view(T, K, b, H)
+    if not isinstance(v_init, torch.Tensor):
+        v_init = torch.zeros(b, H, dtype=u.dtype, device=u.device)
+    v_carry = v_init
+    out_tk: list[torch.Tensor] = []
+    Vp_tk: list[torch.Tensor] = []
+    for t in range(T):
+        v = v_carry
+        K_run = K if training else (int(k_t[t].max().item()) + 1)
+        token_out: list[torch.Tensor] = []
+        token_vp: list[torch.Tensor] = []
+        for k in range(K_run):
+            v_pre = beta_tk[t, k] * v + u_tk[t, k]
+            out = F.relu(v_pre - vth_tk[t, k])
+            v = v_pre - out
+            token_out.append(out)
+            token_vp.append(v)
+        while len(token_out) < K:
+            token_out.append(torch.zeros_like(token_out[0]))
+            token_vp.append(token_vp[-1])
+        token_out_s = torch.stack(token_out, dim=0)
+        token_vp_s = torch.stack(token_vp, dim=0)
+        out_tk.append(token_out_s)
+        Vp_tk.append(token_vp_s)
+        idx = k_t[t].view(1, b, 1).expand(1, b, H)
+        v_carry = token_vp_s.gather(0, idx).squeeze(0)
+    output = torch.stack(out_tk, dim=0).reshape(TK, b, H)
+    V_post = torch.stack(Vp_tk, dim=0).reshape(TK, b, H)
+    return output, V_post, v_carry.detach()
+
+
 # ============================================================
 # Section: plif_node
 # ============================================================

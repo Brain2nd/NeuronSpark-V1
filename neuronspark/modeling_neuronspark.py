@@ -2507,12 +2507,14 @@ class SNNDecoderLayer(MemoryModule):
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )                                                                # y_st: (T, b, K)
         k_t_block = y_hard_block.argmax(dim=-1)                          # (T, b) int — 与 gather 用的 y_st argmax 一致
-        h_normed_k = self.block_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
-        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k, k_t_block, K, self.training)  # (TK, b, D)
-        cont_block = self.snn_block.forward_parallel(v_in, k_t_block, K, self.training)  # (TK, b, D)
-        frames_block = cont_block.view(seq_len, K, batch, D)            # (T, K, b, D)
-        # gather 第 k_t 帧 (STE: forward=y_hard, backward=y_soft)
-        combined_block = (y_st_block.permute(0, 2, 1).unsqueeze(-1) * frames_block).sum(dim=1)  # (T, b, D)
+        # K_act: 训练全 K (梯度需要); 推理只算到 batch 内 max(k_t)+1 帧 —— 投影矩阵 + PLIF 都只对这 K_act 帧做 (完整 FLOP 早停)
+        Ka_b = K if self.training else (int(k_t_block.max().item()) + 1)
+        h_normed_k = self.block_norm(h).repeat_interleave(Ka_b, dim=0)    # (T*Ka_b, b, D), Ka_b 份相同
+        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k, k_t_block, Ka_b, self.training)  # (T*Ka_b, b, D)
+        cont_block = self.snn_block.forward_parallel(v_in, k_t_block, Ka_b, self.training)  # (T*Ka_b, b, D)
+        frames_block = cont_block.view(seq_len, Ka_b, batch, D)         # (T, Ka_b, b, D)
+        # gather 第 k_t 帧 (STE: forward=y_hard, backward=y_soft). 推理时 y_st 是 one-hot at k_t≤Ka_b-1, 切 [:Ka_b] 无损; 训练 Ka_b=K, no-op
+        combined_block = (y_st_block[..., :Ka_b].permute(0, 2, 1).unsqueeze(-1) * frames_block).sum(dim=1)  # (T, b, D)
         ek_block = (y_st_block.detach() * steps_vec[None, None, :]).sum(-1)  # (T, b)
         pc_block = ek_block.mean()
         res_block = self.block_out_proj(combined_block)                 # (T, b, D)
@@ -2526,11 +2528,12 @@ class SNNDecoderLayer(MemoryModule):
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
         k_t_ffn = y_hard_ffn.argmax(dim=-1)                             # (T, b) int
-        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, K, self.training)  # (TK, b, D)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, K, self.training)  # (TK, b, D)
-        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
+        Ka_f = K if self.training else (int(k_t_ffn.max().item()) + 1)
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(Ka_f, dim=0)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, Ka_f, self.training)  # (T*Ka_f, b, D)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, Ka_f, self.training)  # (T*Ka_f, b, D)
+        frames_ffn = cont_ffn.view(seq_len, Ka_f, batch, D)
+        combined_ffn = (y_st_ffn[..., :Ka_f].permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
         ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
         pc_ffn = ek_ffn.mean()
         res_ffn = self.ffn_out_proj(combined_ffn)
@@ -2831,11 +2834,12 @@ class SNNAttentionDecoderLayer(MemoryModule):
             temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
         k_t_ffn = y_hard_ffn.argmax(dim=-1)                             # (T, b) int
-        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, K, self.training)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, K, self.training)  # (TK, b, D)
-        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
+        Ka_f = K if self.training else (int(k_t_ffn.max().item()) + 1)   # 推理只算 max(k_t)+1 帧 (投影+PLIF)
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(Ka_f, dim=0)    # (T*Ka_f, b, D)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2, k_t_ffn, Ka_f, self.training)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2, k_t_ffn, Ka_f, self.training)  # (T*Ka_f, b, D)
+        frames_ffn = cont_ffn.view(seq_len, Ka_f, batch, D)
+        combined_ffn = (y_st_ffn[..., :Ka_f].permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
         ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
         pc_ffn = ek_ffn.mean()
         res_ffn = self.ffn_out_proj(combined_ffn)
@@ -3056,8 +3060,9 @@ class SNNLanguageModel(nn.Module):
         )
         k_t_out = y_hard_out.argmax(dim=-1)                              # (T, b) int
         self._last_y_hard_output = y_hard_out
-        # K 展开 + segmented PLIF
-        h_k = h.repeat_interleave(K, dim=0)                              # (TK, b, D), K 份相同
+        # K_act: 训练全 K; 推理只算 max(k_t^out)+1 帧
+        Ka = K if self.training else (int(k_t_out.max().item()) + 1)
+        h_k = h.repeat_interleave(Ka, dim=0)                             # (T*Ka, b, D)
         beta = self.output_neuron.beta.to(input_dtype)
         u = (1.0 - beta) * h_k
         v_init = self.output_neuron.v
@@ -3068,16 +3073,16 @@ class SNNLanguageModel(nn.Module):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
         output, _V_post, v_carry = segmented_plif_rowparam(
-            beta_row, u, v_th_row, v_init, k_t_out, K, self.training,
+            beta_row, u, v_th_row, v_init, k_t_out, Ka, self.training,
         )
         self.output_neuron.v = v_carry                                   # (b, D), 已 detach
         with torch.no_grad():
             self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
             steps_vec = torch.arange(1, K + 1, device=h.device, dtype=h.dtype)
             self._output_ek = (y_st_out.detach() * steps_vec[None, None, :]).sum(-1).mean().item()
-        # gather 第 k_t^out 帧 (STE: forward=y_hard, backward=y_soft)
-        frames = output.view(seq_len, K, batch, D)                       # (T, K, b, D)
-        readout = (y_st_out.permute(0, 2, 1).unsqueeze(-1) * frames).sum(dim=1)  # (T, b, D)
+        # gather 第 k_t^out 帧 (STE). 推理时 y_st one-hot at k_t≤Ka-1, 切 [:Ka] 无损; 训练 Ka=K, no-op
+        frames = output.view(seq_len, Ka, batch, D)                      # (T, Ka, b, D)
+        readout = (y_st_out[..., :Ka].permute(0, 2, 1).unsqueeze(-1) * frames).sum(dim=1)  # (T, b, D)
         return readout.to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:

@@ -32,6 +32,13 @@ ap.add_argument("--data", default=None,
 ap.add_argument("--binned_len", type=int, default=2048, help="binned .bin 的行长 (sft_think_binned_2048=2048)")
 ap.add_argument("--vocab", type=int, default=None, help="binned 数据时手动指定 vocab (默认 128387)")
 ap.add_argument("--out", default=None, help="日志文件 (默认 stdout)")
+ap.add_argument("--optimizer", default="adam", choices=("adam", "muon_adam_lion"),
+                help="adam (baseline, lr_mult=10 for neurons) | "
+                     "muon_adam_lion (Muon for matrices + Adam for embed/norm + Lion for neuron scalars; DeepSpeed-ZeRO0 兼容)")
+ap.add_argument("--muon_lr", type=float, default=0.02)
+ap.add_argument("--adam_base_lr", type=float, default=2e-4)
+ap.add_argument("--lion_lr", type=float, default=5e-4)
+ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -109,7 +116,15 @@ def run_one(name, overrides):
     model.train()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     n_ahp = sum(1 for nm, _ in model.named_parameters() if nm.endswith('.ahp'))
-    opt = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
+    if args.optimizer == "muon_adam_lion":
+        from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+        groups = build_muon_adam_lion_param_groups(
+            model, muon_lr=args.muon_lr, adam_base_lr=args.adam_base_lr,
+            lion_lr=args.lion_lr, neuron_lr_mult=args.neuron_lr_mult,
+        )
+        opt = SingleDeviceMoonshotMuonAdamLion(groups)
+    else:
+        opt = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     rng = torch.Generator(device=DEV).manual_seed(123)
     losses = []
     t0, step0 = None, 0

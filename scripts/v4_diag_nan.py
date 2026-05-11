@@ -1,0 +1,242 @@
+"""定位 quantal+MAL NaN 触发点的诊断脚本。
+
+策略：
+  1. 跟 ablation 同模型/数据/优化器配置 (D=512, N=16, 12 层, quantal+AHP, MAL).
+  2. 每步检查 loss/params/grads finite; 每 10 步采样 per-layer 激活幅度 (res stream / V_pre / output).
+  3. 前向加 hook: 检查每个 SNNDecoderLayer / SNNAttentionDecoderLayer 输出是否 finite, 第一个不 finite 的层报警.
+  4. 反向加 hook: 检查每个 param 的 grad finite, 第一个 grad NaN 的 param 报警 + 它在哪一层.
+  5. NaN 触发时：
+     - 报告精确 step
+     - 报告前向第一个 NaN tensor 在哪 (layer idx, 名字)
+     - 报告反向第一个 NaN grad 在哪 (param 名字)
+     - dump 关键 param 范数 (W_in/W_out per layer, v_th min/max, ahp min/max)
+     - 回放最近 10 步的 per-layer 激活 max 轨迹
+"""
+import sys, os, time, argparse
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import torch
+from collections import defaultdict, deque
+from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
+from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--spike_mode", default="quantal", choices=("supra", "quantal"))
+ap.add_argument("--use_ahp", action="store_true", default=True)
+ap.add_argument("--no_ahp", dest="use_ahp", action="store_false")
+ap.add_argument("--muon_lr", type=float, default=0.02)
+ap.add_argument("--lion_lr", type=float, default=1e-4)
+ap.add_argument("--neuron_lr_mult", type=float, default=1.0)
+ap.add_argument("--max_steps", type=int, default=300)
+ap.add_argument("--seq", type=int, default=512)
+ap.add_argument("--batch", type=int, default=4)
+ap.add_argument("--n_docs", type=int, default=400)
+args = ap.parse_args()
+
+DEV = "cuda"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_BIN = os.path.join(ROOT, "data/sft_think_binned_2048")
+
+# ----- data -----
+if os.path.isdir(DATA_BIN):
+    bins = sorted([f for f in os.listdir(DATA_BIN) if f.endswith(".bin") and ".mask" not in f])
+    arr = np.fromfile(os.path.join(DATA_BIN, bins[0]), dtype=np.uint32).reshape(-1, 2048)[:args.n_docs]
+    arr = arr[:, :args.seq].astype(np.int64)
+    VOCAB = 128387
+else:
+    import pyarrow.parquet as pq
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(os.path.join(ROOT, "tokenizer_v3"))
+    VOCAB = len(tok)
+    texts = pq.read_table(os.path.join(ROOT, "data/v3_pretrain_mix/train-00000.parquet"),
+                          columns=["text"]).slice(0, args.n_docs * 3).column("text").to_pylist()
+    eos = tok.eos_token_id or 2
+    rows = []
+    for tx in texts:
+        ids = tok(tx, truncation=True, max_length=args.seq)["input_ids"]
+        if len(ids) < 32: continue
+        ids = (ids + [eos])[:args.seq]
+        if len(ids) < args.seq: ids = ids + [eos]*(args.seq-len(ids))
+        rows.append(ids)
+        if len(rows) >= args.n_docs: break
+    arr = np.array(rows, dtype=np.int64)
+data_t = torch.from_numpy(arr).to(DEV)
+print(f"data: {data_t.shape}, vocab {VOCAB}", flush=True)
+
+# ----- model -----
+torch.manual_seed(42)
+cfg = NeuronSparkConfig(vocab_size=VOCAB, D=512, N=16, K=12, num_layers=12, D_ff=1024,
+                        memory_layer_interval=4,
+                        spike_mode=args.spike_mode, use_ahp=args.use_ahp, ahp_init=0.02)
+model = NeuronSparkForCausalLM(cfg).to(DEV)
+for nm, p in model.named_parameters():
+    if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):
+        p.data = p.data.float()
+    else:
+        p.data = p.data.to(torch.bfloat16)
+model.train()
+
+# ----- optimizer -----
+groups = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, adam_base_lr=2e-4,
+                                            lion_lr=args.lion_lr, neuron_lr_mult=args.neuron_lr_mult)
+opt = SingleDeviceMoonshotMuonAdamLion(groups)
+
+# ----- forward NaN-detection hooks: per-layer output -----
+fwd_history = deque(maxlen=20)  # 最近 20 步的 per-layer 激活幅度
+first_nan = {"step": None, "where": None, "details": None}
+
+def make_layer_hook(layer_idx, layer_name):
+    def hook(module, inp, out):
+        # output of SNNDecoderLayer.forward_parallel: (h, ponder_cost). h shape (T, b, D).
+        # if it's a tuple, look at h
+        if isinstance(out, tuple):
+            h = out[0]
+            extras = []
+            for o in out[1:]:
+                if isinstance(o, torch.Tensor) and o.numel() < 100:
+                    extras.append((o.detach().float().abs().max().item(), o.detach().float().abs().min().item()))
+            if h is None or not isinstance(h, torch.Tensor):
+                return
+        else:
+            h = out
+        if not torch.isfinite(h).all():
+            if first_nan["where"] is None:
+                first_nan["where"] = f"layer{layer_idx}[{layer_name}].forward_out"
+                first_nan["details"] = f"shape={tuple(h.shape)}, has_nan={h.isnan().any().item()}, has_inf={h.isinf().any().item()}"
+        return out
+    return hook
+
+handles = []
+for i, layer in enumerate(model.snn.layers):
+    h = layer.register_forward_hook(make_layer_hook(i, type(layer).__name__))
+    handles.append(h)
+
+# also hook output_neuron, decode_proj
+def output_hook(name):
+    def hook(module, inp, out):
+        x = out if isinstance(out, torch.Tensor) else (out[0] if isinstance(out, tuple) else None)
+        if x is not None and not torch.isfinite(x).all() and first_nan["where"] is None:
+            first_nan["where"] = name
+            first_nan["details"] = f"shape={tuple(x.shape)} nan={x.isnan().any().item()} inf={x.isinf().any().item()}"
+    return hook
+handles.append(model.snn.output_neuron.register_forward_hook(output_hook("output_neuron")))
+handles.append(model.snn.decode_proj.register_forward_hook(output_hook("decode_proj")))
+
+
+def dump_state(step):
+    print(f"\n=== DUMP at step {step} ===", flush=True)
+    print(f"[first NaN where] {first_nan.get('where')} :: {first_nan.get('details')}", flush=True)
+    # param norms
+    print("\n[param norms (top 20 by name, max abs)]")
+    rows = []
+    for nm, p in model.named_parameters():
+        if p.numel() == 0: continue
+        finite = torch.isfinite(p.data).all().item()
+        mx = p.data.abs().max().item() if finite else float('inf')
+        mn = p.data.min().item() if finite else float('inf')
+        rows.append((nm, finite, mx, mn, p.data.float().norm().item()))
+    rows.sort(key=lambda r: -r[2])
+    for nm, fin, mx, mn, n in rows[:20]:
+        print(f"  {nm:80s} finite={fin} max|{mx:.4e}|  min={mn:+.4e}  norm={n:.4e}", flush=True)
+    # grad norms
+    print("\n[grad norms (top 20 by max abs)]")
+    grows = []
+    for nm, p in model.named_parameters():
+        if p.grad is None: continue
+        finite = torch.isfinite(p.grad).all().item()
+        mx = p.grad.abs().max().item() if finite else float('inf')
+        n = p.grad.float().norm().item() if finite else float('inf')
+        grows.append((nm, finite, mx, n))
+    grows.sort(key=lambda r: -r[2])
+    for nm, fin, mx, n in grows[:20]:
+        print(f"  {nm:80s} grad finite={fin} max|{mx:.4e}|  norm={n:.4e}", flush=True)
+    # firing rate per layer (hidden + ffn gate)
+    print("\n[per-layer firing rate]")
+    for i, layer in enumerate(model.snn.layers):
+        h_fr = getattr(getattr(layer, 'snn_block', None), 'hidden_neuron', None)
+        h_fr = getattr(h_fr, '_last_firing_rate', None) if h_fr else None
+        g_fr = getattr(getattr(layer, 'snn_ffn', None), 'gate_neuron', None)
+        g_fr = getattr(g_fr, '_last_firing_rate', None) if g_fr else None
+        print(f"  layer{i:2d} ({type(layer).__name__:25s}): hidden={h_fr}  ffn_gate={g_fr}", flush=True)
+    # recent activation max trajectory
+    print(f"\n[recent activation max trajectory (per-layer hidden_neuron.v + V_pre proxies, last {len(fwd_history)} steps)]")
+    for s in fwd_history:
+        line = f"  step {s['step']:4d}: loss={s['loss']:.4f}"
+        if 'res_max' in s:
+            line += f"  res_max={s['res_max']:.3e}"
+        if 'fr_h' in s:
+            line += f"  hidden_fr_μ={s['fr_h']:.4f}"
+        print(line, flush=True)
+
+
+# ----- train loop with NaN detection -----
+rng = torch.Generator(device=DEV).manual_seed(123)
+print(f"\nstart diag run: spike={args.spike_mode}, use_ahp={args.use_ahp}, muon_lr={args.muon_lr}, lion_lr={args.lion_lr}, max_steps={args.max_steps}", flush=True)
+
+for step in range(args.max_steps):
+    idx = torch.randint(0, data_t.shape[0], (args.batch,), generator=rng, device=DEV)
+    ids = data_t[idx]
+    opt.zero_grad()
+    first_nan["where"] = None
+    with torch.amp.autocast(DEV, dtype=torch.bfloat16):
+        out = model(input_ids=ids, labels=ids)
+    loss = out.loss
+    rec = {"step": step, "loss": float(loss) if torch.isfinite(loss) else float('nan')}
+    # 取一个代表的中间激活: model.snn 的 embed_tokens 输出 max (proxy for residual scale)
+    fr_h_list = []
+    for layer in model.snn.layers:
+        nb = getattr(layer, 'snn_block', None)
+        if nb is not None:
+            fr = getattr(nb.hidden_neuron, '_last_firing_rate', None)
+            if fr is not None: fr_h_list.append(fr)
+    if fr_h_list: rec["fr_h"] = sum(fr_h_list) / len(fr_h_list)
+    fwd_history.append(rec)
+
+    if not torch.isfinite(loss):
+        print(f"\n*** NaN/Inf in loss at step {step} ***", flush=True)
+        dump_state(step)
+        break
+    loss.backward()
+    # check grads
+    any_nan_grad = False
+    nan_grad_name = None
+    for nm, p in model.named_parameters():
+        if p.grad is None: continue
+        if not torch.isfinite(p.grad).all():
+            any_nan_grad = True
+            nan_grad_name = nm
+            break
+    if any_nan_grad:
+        print(f"\n*** NaN/Inf in grad at step {step}, first nan param: {nan_grad_name} ***", flush=True)
+        dump_state(step)
+        break
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    opt.step()
+    # check params after step
+    any_nan_param = False
+    nan_param_name = None
+    for nm, p in model.named_parameters():
+        if not torch.isfinite(p.data).all():
+            any_nan_param = True
+            nan_param_name = nm
+            break
+    if any_nan_param:
+        print(f"\n*** NaN/Inf in PARAM after opt.step() at step {step}, first nan param: {nan_param_name} ***", flush=True)
+        dump_state(step)
+        break
+
+    if step % 10 == 0 or step in (50, 100, 150, 200):
+        # 取一些代表性的诊断数字
+        v_th_min = min(p.data.min().item() for nm,p in model.named_parameters() if nm.endswith('.v_th'))
+        v_th_max = max(p.data.max().item() for nm,p in model.named_parameters() if nm.endswith('.v_th'))
+        ahp_vals = [p.data.float() for nm,p in model.named_parameters() if nm.endswith('.ahp')]
+        ahp_str = f"ahp[{min(a.min().item() for a in ahp_vals):.4f}, {max(a.max().item() for a in ahp_vals):.4f}]" if ahp_vals else "ahp=N/A"
+        win_max = max(p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_in' in nm)
+        wout_max = max(p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_out' in nm)
+        gnorm = sum((p.grad.float().norm()**2).item() for p in model.parameters() if p.grad is not None) ** 0.5
+        fr_h = rec.get("fr_h", float('nan'))
+        print(f"step {step:4d}: loss={float(loss):.4f}  fr_h={fr_h:.4f}  gnorm={gnorm:.2e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {ahp_str}  W_in_max={win_max:.3e}  W_out_max={wout_max:.3e}", flush=True)
+
+print("\n=== DIAG END ===", flush=True)
+for h in handles: h.remove()

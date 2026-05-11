@@ -19,6 +19,7 @@ CONFIGS = {
     "quantal_ahp": dict(spike_mode="quantal", use_ahp=True,  ahp_init=0.02),
 }
 
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ap = argparse.ArgumentParser()
 ap.add_argument("--only", default=None, choices=list(CONFIGS), help="只跑这一个配置 (多卡并行用)")
 ap.add_argument("--steps", type=int, default=1500)
@@ -26,34 +27,60 @@ ap.add_argument("--seq", type=int, default=512)
 ap.add_argument("--batch", type=int, default=4)
 ap.add_argument("--n_docs", type=int, default=2400)
 ap.add_argument("--lr", type=float, default=2e-3)
+ap.add_argument("--data", default=None,
+                help="数据源: .parquet (text 列, 用 tokenizer_v3 tokenize) 或 含 *.bin 的目录 (已 tokenize 的 uint32, reshape 到 --binned_len). 默认自动找.")
+ap.add_argument("--binned_len", type=int, default=2048, help="binned .bin 的行长 (sft_think_binned_2048=2048)")
+ap.add_argument("--vocab", type=int, default=None, help="binned 数据时手动指定 vocab (默认 128387)")
 ap.add_argument("--out", default=None, help="日志文件 (默认 stdout)")
 args = ap.parse_args()
 
 DEV = "cuda"
-DATA_PARQUET = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data/v3_pretrain_mix/train-00000.parquet")
-TOK_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_v3")
 SEQ, BATCH, STEPS = args.seq, args.batch, args.steps
 
-# ---- 数据: tokenize 切片 ----
+# ---- 数据 ----
+def _resolve_data():
+    if args.data:
+        return args.data
+    # 自动: 优先本地 parquet, 否则找 binned 目录 (4090 上有 sft_think_binned_2048)
+    p = os.path.join(_ROOT, "data/v3_pretrain_mix/train-00000.parquet")
+    if os.path.exists(p):
+        return p
+    for d in ("data/sft_think_binned_2048", "data/sft_v3_binned_2048"):
+        dd = os.path.join(_ROOT, d)
+        if os.path.isdir(dd) and any(f.endswith(".bin") for f in os.listdir(dd)):
+            return dd
+    raise FileNotFoundError("找不到数据; 用 --data 指定 .parquet 或 binned 目录")
+
+
 def load_data():
-    import pyarrow.parquet as pq
-    from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(TOK_DIR)
-    vocab = len(tok)
-    texts = pq.read_table(DATA_PARQUET, columns=["text"]).slice(0, args.n_docs * 3).column("text").to_pylist()
-    eos = tok.eos_token_id if tok.eos_token_id is not None else 2
-    rows = []
-    for tx in texts:
-        ids = tok(tx, truncation=True, max_length=SEQ)["input_ids"]
-        if len(ids) < 32:
-            continue
-        ids = ids + [eos]
-        if len(ids) < SEQ:
-            ids = ids + [eos] * (SEQ - len(ids))
-        rows.append(ids[:SEQ])
-        if len(rows) >= args.n_docs:
-            break
-    arr = np.array(rows, dtype=np.int64)
+    src = _resolve_data()
+    if src.endswith(".parquet"):
+        import pyarrow.parquet as pq
+        from transformers import AutoTokenizer
+        tok = AutoTokenizer.from_pretrained(os.path.join(_ROOT, "tokenizer_v3"))
+        vocab = len(tok)
+        texts = pq.read_table(src, columns=["text"]).slice(0, args.n_docs * 3).column("text").to_pylist()
+        eos = tok.eos_token_id if tok.eos_token_id is not None else 2
+        rows = []
+        for tx in texts:
+            ids = tok(tx, truncation=True, max_length=SEQ)["input_ids"]
+            if len(ids) < 32:
+                continue
+            ids = ids + [eos]
+            if len(ids) < SEQ:
+                ids = ids + [eos] * (SEQ - len(ids))
+            rows.append(ids[:SEQ])
+            if len(rows) >= args.n_docs:
+                break
+        arr = np.array(rows, dtype=np.int64)
+        print(f"data: parquet {src}", flush=True)
+        return torch.from_numpy(arr).to(DEV), vocab
+    # binned 目录: 已 tokenize 的 uint32, 取第一个 .bin shard, reshape(-1, binned_len), 截到 SEQ
+    bins = sorted(f for f in os.listdir(src) if f.endswith(".bin") and ".mask" not in f)
+    arr = np.fromfile(os.path.join(src, bins[0]), dtype=np.uint32).reshape(-1, args.binned_len)[:args.n_docs]
+    arr = arr[:, :SEQ].astype(np.int64)
+    vocab = args.vocab or 128387
+    print(f"data: binned {src}/{bins[0]}", flush=True)
     return torch.from_numpy(arr).to(DEV), vocab
 
 data_t, VOCAB = load_data()
@@ -103,11 +130,14 @@ def run_one(name, overrides):
         if step == 20:
             torch.cuda.synchronize(); t0 = time.time(); step0 = step
         if step % 200 == 0 or step == STEPS - 1:
-            # 发放率: 取一层的 hidden_neuron + ffn gate
-            fr_hidden = getattr(model.snn.layers[0].snn_block.hidden_neuron, '_last_firing_rate', float('nan'))
+            # 发放率: 所有层的 hidden_neuron (min~max·μ) + 第 0 层 gate; + 输出 E[K]
+            fr_h = [getattr(l.snn_block.hidden_neuron, '_last_firing_rate', float('nan'))
+                    for l in model.snn.layers if hasattr(l, 'snn_block')]
+            fr_h = [x for x in fr_h if x == x]  # drop nan
+            hsum = (f"{min(fr_h):.3f}~{max(fr_h):.3f}μ{sum(fr_h)/len(fr_h):.3f}" if fr_h else "?")
             fr_gate = getattr(model.snn.layers[0].snn_ffn.gate_neuron, '_last_firing_rate', float('nan'))
             ek = getattr(model.snn, '_output_ek', float('nan'))
-            log(f"  [{name}] step {step:4d}: loss={float(loss):.4f}  E[K]_out={ek:.2f}  fire(hidden)={fr_hidden:.3f} fire(gate)={fr_gate:.3f}")
+            log(f"  [{name}] step {step:4d}: loss={float(loss):.4f}  E[K]_out={ek:.2f}  fire(hidden)={hsum} fire(gate0)={fr_gate:.3f}")
     torch.cuda.synchronize()
     spm = (time.time() - t0) / max(1, (len(losses) - 1 - step0)) * 1000 if t0 else 0
     final = sum(losses[-100:]) / len(losses[-100:]) if len(losses) >= 100 else (sum(losses) / max(1, len(losses)))

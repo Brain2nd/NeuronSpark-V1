@@ -37,6 +37,27 @@
 - `tests/verify_residual_redundant.py`：残差 K 轴偏差 = 0。
 - 4090 上 P5.5-5：133.5M 模型（D=512, 12 层, K=12, seq=512）overfit smoke loss 9.09→0.0073，kernel 生效（_seg_rowparam_call=20100, _seg_selective_call=5400），E[K] range [1,12]，无 NaN，479ms/step。
 
+### 1.8 神经元设计 v4.1 —— 量子化释放 (quantal) + AHP (后超极化)，可配置
+
+**动机**（讨论结论）：v3 默认的 bio-ReLU `output = relu(V_pre - v_th)` + 软重置 `V_post = min(V_pre, v_th)` 在「保留膜内历史上下文」上削得太狠 —— 一旦发放，膜被钉回 v_th，「这个神经元累积了多强的上下文」这个量从膜里被抹掉（只活在 output 流里）。**硬重置 (V→0) 完全不可取**（膜电位是递归状态、承载历史上下文）—— 不讨论。改进方向：**量子化释放** —— 发放只释放固定一份 `v_th`，超阈的**剩余余量留在膜里**：
+```
+spike = 𝟙[V_pre > v_th]                     # 硬发放 (forward); sigmoid surrogate (α) 提供反向梯度
+output = v_th · spike                        # 释放固定一份 v_th (= 「V_th × spike」, 与 spike_current 语义对齐)
+V_post = V_pre - v_th·spike - ahp·spike      # 剩余余量 (V_pre - v_th) 留膜里; AHP 额外下压 ahp
+```
+强输入 → 一串 spike (rate code, 串长 ∝ V_pre/v_th)；膜保留「还没释放成整份的余量」。**代价**：output 是阶跃 → 反向必须用 surrogate (sigmoid'(α·(V_pre-v_th)))，不像 supra 是精确 ReLU 梯度。
+
+**AHP（后超极化 / 不应期）**：发放后膜额外下压 `ahp·𝟙[V_pre>v_th]`（ahp = per-channel 可学习参数, 初值小 ≈0）。**不导致梯度消失** —— 膜递推的 per-step 雅可比 `∂V_post/∂V_pre` 在 supra 模式下 `= 1 - s_hard`（与加 AHP 前相同，AHP·s_hard 用零梯度的硬指示子）；AHP 通过降发放率反而让长程膜梯度更通畅（少一些「发放步 = 梯度屏障」）。唯一副作用：AHP 太大时膜被恢复曲线主导 → 输入对输出贡献变小（信号衰减，非时序梯度消失）→ ahp 初值小、可学习/可 data-dependent 缓解。AHP 与现有 selective `v_th(t)` 功能分工：v_th(t) = 慢的输入条件阈值调制，AHP = 快的事件触发不应期。
+
+**实现（可配置, config 默认 = v3 的 supra/no-ahp，向后兼容）**：
+- `NeuronSparkConfig`: `spike_mode ∈ {"supra","quantal"}`、`use_ahp: bool`、`ahp_init: float`、`surrogate_alpha: float`。
+- `modeling_neuronspark.py`: 模块级 `NEURON_SPIKE_MODE/USE_AHP/...`（`SNNLanguageModel.__init__` 从 config 设, 构造层之前）；`PLIFNode`/`SelectivePLIFNode` 据此创建 per-channel `ahp` 参数 + 记 `spike_mode/surrogate_alpha`；`_spike_step()` 是 fire+reset 的统一 PyTorch 实现（supra = 精确 ReLU；quantal = straight-through `s = sig + (s_hard - sig).detach()`，forward 值 = 硬指示子, 反向梯度 = sigmoid'）。
+- Triton: `_segmented_plif_fwd/bwd_{rowparam,selective}_kernel` 加 `SPIKE_QUANTAL: tl.constexpr` + `ALPHA` runtime + `AHP_ROW_ptr` (per-channel, 全 0 = 无 AHP) + `GRAD_AHP_ROW_ptr`。backward 量子化梯度：`g_surr = α·σ·(1-σ)`；`∂out/∂V_pre = v_th·g_surr`；`∂V_post/∂V_pre = 1 - (v_th+ahp)·g_surr`；`∂out/∂v_th = s - v_th·g_surr`；`∂V_post/∂v_th = (v_th+ahp)·g_surr - s`；`∂V_post/∂ahp = -s`（out 与 AHP 项共用同一个 surrogate-graded s）。
+- 覆盖 6 处 segmented PLIF（input_neuron1/2、hidden_neuron[selective]、ffn gate/up[merged]、output_neuron）+ `PLIFNode.forward`/`single_step_forward` 单步路径。SNNAttentionDecoderLayer 的 token 级 `_gate_neuron_parallel`（非 segmented）暂未切（dead-ish, 跟早停无关）—— 待 quantal 确认后补。
+- 测试（`tests/test_segmented_plif.py`，全过）：supra+AHP fp64 gradcheck（rowparam+selective，含 ahp 参数）；quantal(+ahp) 早停 bit-exact；Triton kernel vs PyTorch reference fwd+bwd（quantal+ahp、supra+ahp、rowparam+selective，~1e-4 / grad ~2e-3）。`tests/test_v4_end_to_end.py` 4 配置 overfit smoke（loss 下降、grad finite、无 NaN；quantal 的 grad norm 小 ~3x，因 output ≈ v_th·s ≈ 0.05·s 信号幅度小）。
+
+**待办**：① 消融 {supra / supra+AHP / quantal / quantal+AHP}（4090 四卡并行，同 P-A 那套，比 loss / E[K] / 发放率）→ 决定是否把 config 默认翻成 quantal+AHP。② quantal 若胜：W_out 初始化 / LR 可能要随 output 幅度变小调；补 token 级 gate_neuron 的 spike form；重训。
+
 ### 1.7 设计文档
 - `docs/v4_early_stop_design.md` —— 早停修正的总规格（哪些耦合点、怎么改）。
 - `docs/v4_segmented_plif_kernel_design.md` —— segmented PLIF 的 forward/backward 数学 + Triton kernel 实现细则（§6）。

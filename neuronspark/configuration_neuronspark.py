@@ -16,6 +16,15 @@ class NeuronSparkConfig(PretrainedConfig):
         memory_layer_interval=4,
         D_key=128,
         D_value=128,
+        # 神经元发放形式 (v4.1 — 见 docs/v4_status_and_roadmap.md §神经元设计)
+        #   "supra"   = bio-ReLU 超阈电流: output = relu(V_pre - v_th), V_post = min(V_pre, v_th) — 精确 ReLU 梯度
+        #   "quantal" = 量子化释放: output = v_th·𝟙[V_pre>v_th], V_post = V_pre - v_th·𝟙[...] (剩余余量留膜里) — surrogate 梯度
+        spike_mode="supra",
+        # surrogate gradient α (sigmoid surrogate, 仅 spike_mode="quantal" 时用于 output 的反向)
+        surrogate_alpha=4.0,
+        # 后超极化 (AHP / 不应期): 发放后膜额外下压 ahp (per-channel 可学), V_post -= ahp·𝟙[V_pre>v_th]
+        use_ahp=False,
+        ahp_init=0.0,  # ahp 参数初始值 (per-channel scalar)
         # v3 PonderNet fields (input-conditioned KPredictor)
         k_predictor_hidden=None,
         ponder_T_init=2.0,
@@ -41,6 +50,10 @@ class NeuronSparkConfig(PretrainedConfig):
         self.memory_layer_interval = memory_layer_interval
         self.D_key = D_key
         self.D_value = D_value
+        self.spike_mode = spike_mode
+        self.surrogate_alpha = surrogate_alpha
+        self.use_ahp = use_ahp
+        self.ahp_init = ahp_init
         # v3 PonderNet
         self.k_predictor_hidden = k_predictor_hidden
         self.ponder_T_init = ponder_T_init

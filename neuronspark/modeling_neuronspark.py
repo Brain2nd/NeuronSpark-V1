@@ -410,20 +410,24 @@ if _HAS_TRITON:
 
     @triton.jit
     def _segmented_plif_fwd_rowparam_kernel(
-        BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, INIT_ptr, KT_COLS_ptr,
+        BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, AHP_ROW_ptr, INIT_ptr, KT_COLS_ptr,
         OUTPUT_ptr, VPOST_ptr, VCARRY_ptr,
         T, K, num_cols,
         IS_TRAINING: tl.constexpr,
+        SPIKE_QUANTAL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """V4 segmented PLIF forward (row-param β/v_th).
+        """V4 segmented PLIF forward (row-param β/v_th/ahp).
 
         Per-token K-frame 递推, token 边界把运行膜电位 patch 成上 token 第 k_{t-1} 帧的 V_post.
         IS_TRAINING: 跑全 K 帧 (梯度需要); 否则早停只跑到 block 内 max(k_t)+1 帧.
+        SPIKE_QUANTAL: True → output = v_th·𝟙[V_pre>v_th] (量子化, 剩余余量留膜里);
+                       False → output = relu(V_pre - v_th) (bio-ReLU 超阈电流).
+        AHP: 发放后膜额外下压 ahp·𝟙[fired] (ahp 全 0 时等价于无 AHP).
         见 docs/v4_segmented_plif_kernel_design.md §1 / §6.2.
 
         U/OUTPUT/VPOST: (TK, num_cols) 行主序; KT_COLS: (T, num_cols) int (= k_t expanded per col).
-        BETA_ROW/VTH_ROW/INIT/VCARRY: (num_cols,).
+        BETA_ROW/VTH_ROW/AHP_ROW/INIT/VCARRY: (num_cols,).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -432,6 +436,7 @@ if _HAS_TRITON:
         v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
         for t in range(T):
             if t > 0:
@@ -449,8 +454,12 @@ if _HAS_TRITON:
                     off = (t * K + k) * num_cols + cols
                     u_ik = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
                     v_pre = beta * v + u_ik
-                    out_ik = tl.maximum(v_pre - vth, 0.0)
-                    v = v_pre - out_ik
+                    fired = v_pre > vth
+                    if SPIKE_QUANTAL:
+                        out_ik = tl.where(fired, vth, 0.0)
+                    else:
+                        out_ik = tl.maximum(v_pre - vth, 0.0)
+                    v = v_pre - out_ik - tl.where(fired, ahp, 0.0)
                     tl.store(OUTPUT_ptr + off, out_ik, mask=mask)
                     tl.store(VPOST_ptr + off, v, mask=mask)
         # v_carry = 序列最后 token 第 k_t 帧的 V_post
@@ -460,10 +469,12 @@ if _HAS_TRITON:
 
     @triton.jit
     def _segmented_plif_bwd_rowparam_kernel(
-        BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr, U_ptr, KT_COLS_ptr, VPOST_ptr,
+        BETA_ROW_ptr, VTH_ROW_ptr, AHP_ROW_ptr, INIT_ptr, U_ptr, KT_COLS_ptr, VPOST_ptr,
         GRAD_OUTPUT_ptr,
-        GRAD_BETA_ROW_ptr, GRAD_U_ptr, GRAD_VTH_ROW_ptr, GRAD_INIT_ptr,
+        GRAD_BETA_ROW_ptr, GRAD_U_ptr, GRAD_VTH_ROW_ptr, GRAD_AHP_ROW_ptr, GRAD_INIT_ptr,
+        ALPHA,
         T, K, num_cols,
+        SPIKE_QUANTAL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         """V4 segmented PLIF backward (row-param). 见 docs/v4_segmented_plif_kernel_design.md §6.3.
@@ -471,8 +482,11 @@ if _HAS_TRITON:
         逆序 token / frame 递推. g_v = 同 token 内下一帧传回的 ∂L/∂V_post[当前];
         g_patch = 下 token frame 0 的 patch 该给「当前 token 第 k_t 帧」的梯度 (单寄存器, 生命周期 ≤ K+1 帧).
         v_prev[i]: k>0 → V_post[i-1]; k==0,t>0 → V_post[(t-1)*K + k_{t-1}]; k==0,t==0 → v_init.
-        v_pre[i] = β·v_prev[i] + u[i] (recompute); s = (v_pre > vth);
-        ∂L/∂v_pre = g_Vpost·(1-s) + g_out·s ;  ∂L/∂vth += s·(g_Vpost - g_out) ;
+        v_pre[i] = β·v_prev[i] + u[i] (recompute); s = (v_pre > vth).
+        SPIKE_QUANTAL=False (supra): ∂out/∂v_pre=s, ∂V_post/∂v_pre=1-s; ∂out/∂vth=-s, ∂V_post/∂vth=s; ∂V_post/∂ahp=-s.
+        SPIKE_QUANTAL=True  (quantal): out=v_th·s, V_post=v_pre-v_th·s-ahp·s; g_surr=σ'(α·(v_pre-v_th));
+            ∂out/∂v_pre=v_th·g_surr, ∂V_post/∂v_pre=1-(v_th+ahp)·g_surr;
+            ∂out/∂vth=s-v_th·g_surr,  ∂V_post/∂vth=(v_th+ahp)·g_surr-s;  ∂V_post/∂ahp=-s.
         ∂L/∂u[i] = ∂L/∂v_pre ;  ∂L/∂β += ∂L/∂v_pre · v_prev ;  传回 v_prev 的梯度 = ∂L/∂v_pre · β.
         训练始终全 K (推理不反向).
         """
@@ -481,10 +495,12 @@ if _HAS_TRITON:
         mask = cols < num_cols
         beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         g_v = tl.zeros([BLOCK], dtype=tl.float32)
         g_patch = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_beta = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_vth = tl.zeros([BLOCK], dtype=tl.float32)
+        acc_grad_ahp = tl.zeros([BLOCK], dtype=tl.float32)
         g_v_init = tl.zeros([BLOCK], dtype=tl.float32)
         for t_rev in range(T):
             t = T - 1 - t_rev
@@ -504,8 +520,16 @@ if _HAS_TRITON:
                 s = tl.where(v_pre > vth, 1.0, 0.0)
                 g_out_i = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
                 g_Vpost = g_v + tl.where(k == kt_t, g_patch, 0.0)
-                g_v_pre = g_Vpost * (1.0 - s) + g_out_i * s
-                acc_grad_vth += s * (g_Vpost - g_out_i)
+                if SPIKE_QUANTAL:
+                    sg = tl.sigmoid(ALPHA * (v_pre - vth))
+                    g_surr = ALPHA * sg * (1.0 - sg)
+                    vth_ahp = vth + ahp
+                    g_v_pre = g_out_i * (vth * g_surr) + g_Vpost * (1.0 - vth_ahp * g_surr)
+                    acc_grad_vth += g_out_i * (s - vth * g_surr) + g_Vpost * (vth_ahp * g_surr - s)
+                else:
+                    g_v_pre = g_Vpost * (1.0 - s) + g_out_i * s
+                    acc_grad_vth += s * (g_Vpost - g_out_i)
+                acc_grad_ahp += -g_Vpost * s
                 tl.store(GRAD_U_ptr + off, g_v_pre, mask=mask)
                 acc_grad_beta += g_v_pre * v_prev
                 g_back = g_v_pre * beta
@@ -519,22 +543,25 @@ if _HAS_TRITON:
         tl.store(GRAD_INIT_ptr + cols, g_v_init, mask=mask)
         tl.store(GRAD_BETA_ROW_ptr + cols, acc_grad_beta, mask=mask)
         tl.store(GRAD_VTH_ROW_ptr + cols, acc_grad_vth, mask=mask)
+        tl.store(GRAD_AHP_ROW_ptr + cols, acc_grad_ahp, mask=mask)
 
     @triton.jit
     def _segmented_plif_fwd_selective_kernel(
-        BETA_ptr, U_ptr, VTH_ptr, INIT_ptr, KT_COLS_ptr,
+        BETA_ptr, U_ptr, VTH_ptr, AHP_ROW_ptr, INIT_ptr, KT_COLS_ptr,
         OUTPUT_ptr, VPOST_ptr, VCARRY_ptr,
         T, K, num_cols,
         IS_TRAINING: tl.constexpr,
+        SPIKE_QUANTAL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """V4 segmented PLIF forward (selective: β/v_th per-frame). 同 rowparam, β/vth 逐帧 load.
-        BETA/VTH/U/OUTPUT/VPOST: (TK, num_cols); KT_COLS: (T, num_cols) int; INIT/VCARRY: (num_cols,).
+        """V4 segmented PLIF forward (selective: β/v_th per-frame). 同 rowparam, β/vth 逐帧 load; ahp per-channel.
+        BETA/VTH/U/OUTPUT/VPOST: (TK, num_cols); KT_COLS: (T, num_cols) int; AHP_ROW/INIT/VCARRY: (num_cols,).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
         v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         for t in range(T):
             if t > 0:
                 kt_prev = tl.load(KT_COLS_ptr + (t - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
@@ -551,8 +578,12 @@ if _HAS_TRITON:
                     beta_ik = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
                     vth_ik = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
                     v_pre = beta_ik * v + u_ik
-                    out_ik = tl.maximum(v_pre - vth_ik, 0.0)
-                    v = v_pre - out_ik
+                    fired = v_pre > vth_ik
+                    if SPIKE_QUANTAL:
+                        out_ik = tl.where(fired, vth_ik, 0.0)
+                    else:
+                        out_ik = tl.maximum(v_pre - vth_ik, 0.0)
+                    v = v_pre - out_ik - tl.where(fired, ahp, 0.0)
                     tl.store(OUTPUT_ptr + off, out_ik, mask=mask)
                     tl.store(VPOST_ptr + off, v, mask=mask)
         kt_last = tl.load(KT_COLS_ptr + (T - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
@@ -561,18 +592,24 @@ if _HAS_TRITON:
 
     @triton.jit
     def _segmented_plif_bwd_selective_kernel(
-        BETA_ptr, VTH_ptr, INIT_ptr, U_ptr, KT_COLS_ptr, VPOST_ptr,
+        BETA_ptr, VTH_ptr, AHP_ROW_ptr, INIT_ptr, U_ptr, KT_COLS_ptr, VPOST_ptr,
         GRAD_OUTPUT_ptr,
-        GRAD_BETA_ptr, GRAD_U_ptr, GRAD_VTH_ptr, GRAD_INIT_ptr,
+        GRAD_BETA_ptr, GRAD_U_ptr, GRAD_VTH_ptr, GRAD_AHP_ROW_ptr, GRAD_INIT_ptr,
+        ALPHA,
         T, K, num_cols,
+        SPIKE_QUANTAL: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
-        """V4 segmented PLIF backward (selective). 同 rowparam bwd, β/vth 逐帧 load, grad_β/grad_vth 逐帧 store."""
+        """V4 segmented PLIF backward (selective). 同 rowparam bwd, β/vth 逐帧 load; ahp per-channel accumulate.
+        梯度公式见 _segmented_plif_bwd_rowparam_kernel docstring (vth → vth_i 逐帧).
+        """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
+        ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         g_v = tl.zeros([BLOCK], dtype=tl.float32)
         g_patch = tl.zeros([BLOCK], dtype=tl.float32)
+        acc_grad_ahp = tl.zeros([BLOCK], dtype=tl.float32)
         g_v_init = tl.zeros([BLOCK], dtype=tl.float32)
         for t_rev in range(T):
             t = T - 1 - t_rev
@@ -594,8 +631,17 @@ if _HAS_TRITON:
                 s = tl.where(v_pre > vth_i, 1.0, 0.0)
                 g_out_i = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
                 g_Vpost = g_v + tl.where(k == kt_t, g_patch, 0.0)
-                g_v_pre = g_Vpost * (1.0 - s) + g_out_i * s
-                tl.store(GRAD_VTH_ptr + off, s * (g_Vpost - g_out_i), mask=mask)
+                if SPIKE_QUANTAL:
+                    sg = tl.sigmoid(ALPHA * (v_pre - vth_i))
+                    g_surr = ALPHA * sg * (1.0 - sg)
+                    vth_ahp = vth_i + ahp
+                    g_v_pre = g_out_i * (vth_i * g_surr) + g_Vpost * (1.0 - vth_ahp * g_surr)
+                    grad_vth_i = g_out_i * (s - vth_i * g_surr) + g_Vpost * (vth_ahp * g_surr - s)
+                else:
+                    g_v_pre = g_Vpost * (1.0 - s) + g_out_i * s
+                    grad_vth_i = s * (g_Vpost - g_out_i)
+                acc_grad_ahp += -g_Vpost * s
+                tl.store(GRAD_VTH_ptr + off, grad_vth_i, mask=mask)
                 tl.store(GRAD_U_ptr + off, g_v_pre, mask=mask)
                 tl.store(GRAD_BETA_ptr + off, g_v_pre * v_prev, mask=mask)
                 g_back = g_v_pre * beta_i
@@ -607,6 +653,7 @@ if _HAS_TRITON:
                 else:
                     g_v_init = g_back
         tl.store(GRAD_INIT_ptr + cols, g_v_init, mask=mask)
+        tl.store(GRAD_AHP_ROW_ptr + cols, acc_grad_ahp, mask=mask)
 
     @triton.jit
     def _fused_plif_bwd_rowparam_kernel(
@@ -1137,11 +1184,36 @@ def plif_rowparam_forward(
     return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0)
 
 
-def segmented_plif_rowparam(beta_row, u, v_th_row, v_init, k_t, K, training=True):
-    """V4 segmented PLIF (row-param) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference."""
+def _spike_step(v_pre, v_th, ahp, spike_quantal, alpha):
+    """单帧 fire + reset (PyTorch reference, 与 Triton kernel 数学等价 — forward 用严格 > , 量子化用 sigmoid surrogate).
+
+    supra  (spike_quantal=False): output = relu(V_pre - v_th) — 精确 ReLU 梯度; s_hard 在 reset 里零梯度.
+    quantal(spike_quantal=True ): output = v_th·s, V_post = V_pre - v_th·s - ahp·s, s 的 forward 值 = 𝟙[V_pre>v_th],
+                                  s 的反向梯度 = sigmoid'(alpha·(V_pre-v_th)) (output 与 AHP 项共用同一个 s).
+    返回 (output, V_post).
+    """
+    s_hard = (v_pre > v_th).to(v_pre.dtype)
+    if spike_quantal:
+        sig = torch.sigmoid(alpha * (v_pre - v_th))
+        s = sig + (s_hard - sig).detach()   # straight-through: forward 值 = s_hard, 反向梯度 = sigmoid'
+        out = v_th * s
+        v_post = v_pre - out - ahp * s      # output 与 AHP 项用同一个 s
+    else:
+        out = F.relu(v_pre - v_th)          # exact ReLU 梯度 (= s_hard); AHP 项用零梯度的 s_hard
+        v_post = v_pre - out - ahp * s_hard
+    return out, v_post
+
+
+def segmented_plif_rowparam(beta_row, u, v_th_row, v_init, k_t, K, training=True,
+                            ahp_row=None, alpha=4.0, spike_mode="supra"):
+    """V4 segmented PLIF (row-param) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference.
+
+    ahp_row: (b, H) per-channel 后超极化量 (None → 视为 0). spike_mode: "supra" | "quantal".
+    """
+    spike_quantal = (spike_mode == "quantal")
     if _HAS_TRITON and u.is_cuda:
-        return _seg_rowparam_call(beta_row, u, v_th_row, v_init, k_t, K, training)
-    return _segmented_plif_rowparam_pytorch(beta_row, u, v_th_row, v_init, k_t, K, training)
+        return _seg_rowparam_call(beta_row, u, v_th_row, v_init, k_t, K, training, ahp_row, alpha, spike_quantal)
+    return _segmented_plif_rowparam_pytorch(beta_row, u, v_th_row, v_init, k_t, K, training, ahp_row, alpha, spike_quantal)
 
 
 def _segmented_plif_rowparam_pytorch(
@@ -1152,11 +1224,14 @@ def _segmented_plif_rowparam_pytorch(
     k_t: torch.Tensor,
     K: int,
     training: bool = True,
+    ahp_row=None,
+    alpha: float = 4.0,
+    spike_quantal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """V4 segmented PLIF (row-param β/v_th) — PyTorch reference. 见 docs/v4_segmented_plif_kernel_design.md.
+    """V4 segmented PLIF (row-param β/v_th/ahp) — PyTorch reference. 见 docs/v4_segmented_plif_kernel_design.md.
 
     Per-token K-frame 递推, token 边界把运行膜电位 patch 成上 token 第 k_{t-1} 帧的 V_post.
-    纯 PyTorch (autograd 自动反向); Triton 融合 kernel 后续 (P5.5) 再写, 用本函数当 reference.
+    纯 PyTorch (autograd 自动反向); 作为 Triton 融合 kernel 的 reference.
 
     Args:
         beta_row: (b, H) — per-column 衰减率 (所有帧相同)
@@ -1166,9 +1241,12 @@ def _segmented_plif_rowparam_pytorch(
         k_t:      (T, b) int ∈ {0..K-1} — 每 (token, batch) 的 halt 帧 index
         K:        K_max (每 token 最大帧数)
         training: True=跑全 K 帧; False=早停只跑到 batch 内 max(k_t)+1 (FLOP 节省)
+        ahp_row:  (b, H) Tensor 或 None — per-channel 后超极化量 (None → 0)
+        alpha:    surrogate gradient α (仅 quantal 模式用)
+        spike_quantal: True=量子化释放, False=bio-ReLU 超阈电流
 
     Returns:
-        output:  (T*K, b, H) — 超阈电流 (sparse). 推理模式下 frame > running token 的 max-k_t 是
+        output:  (T*K, b, H) — 发放幅度 (sparse). 推理模式下 frame > running token 的 max-k_t 是
                  未定义填充值, 但下游绝不读它 (gather 是 one-hot at k_t, patch 读 frame k_{t-1}).
         V_post:  (T*K, b, H) — 发放后膜电位 (同上 caveat)
         v_carry: (b, H) — 最后一个 token 第 k_{T-1} 帧的 V_post (detached; 给下次 forward call)
@@ -1178,6 +1256,8 @@ def _segmented_plif_rowparam_pytorch(
     u_tk = u.view(T, K, b, H)
     if not isinstance(v_init, torch.Tensor):
         v_init = torch.zeros(b, H, dtype=u.dtype, device=u.device)
+    if ahp_row is None:
+        ahp_row = torch.zeros(b, H, dtype=u.dtype, device=u.device)
     v_carry = v_init
     out_tk: list[torch.Tensor] = []
     Vp_tk: list[torch.Tensor] = []
@@ -1188,8 +1268,7 @@ def _segmented_plif_rowparam_pytorch(
         token_vp: list[torch.Tensor] = []
         for k in range(K_run):
             v_pre = beta_row * v + u_tk[t, k]
-            out = F.relu(v_pre - v_th_row)
-            v = v_pre - out
+            out, v = _spike_step(v_pre, v_th_row, ahp_row, spike_quantal, alpha)
             token_out.append(out)
             token_vp.append(v)
         # 早停时补齐到 K 帧 (零填充; 推理无反向, 且这些帧永不被读)
@@ -1211,31 +1290,33 @@ def _segmented_plif_rowparam_pytorch(
 if _HAS_TRITON:
     class _SegmentedPLIFRowParam(torch.autograd.Function):
         """Triton fused segmented PLIF (row-param). forward + backward kernels.
-        与 PyTorch reference segmented_plif_rowparam bit-exact (forward) / 数值一致 (backward).
+        与 PyTorch reference segmented_plif_rowparam 数值一致.
         """
         _BLOCK = 128
 
         @staticmethod
-        def forward(ctx, beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training):
-            # 所有输入已 flatten + fp32 + contiguous (由 _seg_rowparam_call 处理)
+        def forward(ctx, beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols,
+                    K, T, num_cols, training, alpha, spike_quantal):
+            # 所有 tensor 输入已 flatten + fp32 + contiguous (由 _seg_rowparam_call 处理)
             output = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             V_post = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             v_carry = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             BLOCK = _SegmentedPLIFRowParam._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
             _segmented_plif_fwd_rowparam_kernel[grid](
-                beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols,
+                beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols,
                 output, V_post, v_carry,
-                T, K, num_cols, IS_TRAINING=bool(training), BLOCK=BLOCK,
+                T, K, num_cols, IS_TRAINING=bool(training), SPIKE_QUANTAL=bool(spike_quantal), BLOCK=BLOCK,
             )
-            ctx.save_for_backward(beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post)
+            ctx.save_for_backward(beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post)
             ctx.K = K; ctx.T = T; ctx.num_cols = num_cols
+            ctx.alpha = float(alpha); ctx.spike_quantal = bool(spike_quantal)
             return output, V_post, v_carry.detach()
 
         @staticmethod
         def backward(ctx, g_out, g_Vpost_unused, g_vcarry_unused):
-            # V_post / v_carry 无下游梯度入口 (前者只内部用, 后者 detach) → g_Vpost_unused/g_vcarry_unused 忽略
-            beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post = ctx.saved_tensors
+            # V_post / v_carry 无下游梯度入口 → g_Vpost_unused/g_vcarry_unused 忽略
+            beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post = ctx.saved_tensors
             K, T, num_cols = ctx.K, ctx.T, ctx.num_cols
             if g_out is None:
                 g_out = torch.zeros(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
@@ -1243,37 +1324,40 @@ if _HAS_TRITON:
             grad_u = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             grad_beta = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             grad_vth = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
+            grad_ahp = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             grad_v_init = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             BLOCK = _SegmentedPLIFRowParam._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
             _segmented_plif_bwd_rowparam_kernel[grid](
-                beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post,
+                beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post,
                 g_out,
-                grad_beta, grad_u, grad_vth, grad_v_init,
-                T, K, num_cols, BLOCK=BLOCK,
+                grad_beta, grad_u, grad_vth, grad_ahp, grad_v_init,
+                ctx.alpha,
+                T, K, num_cols, SPIKE_QUANTAL=ctx.spike_quantal, BLOCK=BLOCK,
             )
-            # 返回顺序对齐 forward 的输入: (beta, u, vth, v_init, k_t_cols, K, T, num_cols, training)
-            return grad_beta, grad_u, grad_vth, grad_v_init, None, None, None, None, None
+            # 对齐 forward 输入: (beta, u, vth, ahp, v_init, k_t_cols, K, T, num_cols, training, alpha, spike_quantal)
+            return grad_beta, grad_u, grad_vth, grad_ahp, grad_v_init, None, None, None, None, None, None, None
 
 
-def _seg_rowparam_call(beta_row, u, vth_row, v_init, k_t, K, training):
-    """Triton 路径: 把 (TK,b,H) / (b,H) 形状转成 kernel 要的 flat 形状, 调 autograd.Function, 再 reshape 回.
-
-    Args / Returns: 与 segmented_plif_rowparam 相同.
-    """
+def _seg_rowparam_call(beta_row, u, vth_row, v_init, k_t, K, training, ahp_row=None, alpha=4.0, spike_quantal=False):
+    """Triton 路径: 把 (TK,b,H) / (b,H) 形状转成 kernel 要的 flat 形状, 调 autograd.Function, 再 reshape 回."""
     TK, b, H = u.shape
     T = TK // K
     num_cols = b * H
     u_flat = u.reshape(TK, num_cols).contiguous().to(torch.float32)
     beta_flat = beta_row.reshape(num_cols).contiguous().to(torch.float32)
     vth_flat = vth_row.reshape(num_cols).contiguous().to(torch.float32)
+    if ahp_row is None:
+        ahp_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
+    else:
+        ahp_flat = ahp_row.reshape(num_cols).contiguous().to(torch.float32)
     if not isinstance(v_init, torch.Tensor):
         v_init_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
     else:
         v_init_flat = v_init.reshape(num_cols).contiguous().to(torch.float32)
     k_t_cols = k_t.repeat_interleave(H, dim=1).contiguous().to(torch.int32)
     output, V_post, v_carry = _SegmentedPLIFRowParam.apply(
-        beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training,
+        beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols, K, T, num_cols, training, alpha, spike_quantal,
     )
     return (output.reshape(TK, b, H).to(u.dtype),
             V_post.reshape(TK, b, H).to(u.dtype),
@@ -1287,28 +1371,30 @@ def _segmented_plif_rowparam_fwd_triton(beta_row, u, vth_row, v_init, k_t, K, tr
 
 if _HAS_TRITON:
     class _SegmentedPLIFSelective(torch.autograd.Function):
-        """Triton fused segmented PLIF (selective: β/v_th per-frame). forward + backward kernels."""
+        """Triton fused segmented PLIF (selective: β/v_th per-frame; ahp per-channel). forward + backward kernels."""
         _BLOCK = 128
 
         @staticmethod
-        def forward(ctx, beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training):
+        def forward(ctx, beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols,
+                    K, T, num_cols, training, alpha, spike_quantal):
             output = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             V_post = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             v_carry = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             BLOCK = _SegmentedPLIFSelective._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
             _segmented_plif_fwd_selective_kernel[grid](
-                beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols,
+                beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols,
                 output, V_post, v_carry,
-                T, K, num_cols, IS_TRAINING=bool(training), BLOCK=BLOCK,
+                T, K, num_cols, IS_TRAINING=bool(training), SPIKE_QUANTAL=bool(spike_quantal), BLOCK=BLOCK,
             )
-            ctx.save_for_backward(beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post)
+            ctx.save_for_backward(beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post)
             ctx.K = K; ctx.T = T; ctx.num_cols = num_cols
+            ctx.alpha = float(alpha); ctx.spike_quantal = bool(spike_quantal)
             return output, V_post, v_carry.detach()
 
         @staticmethod
         def backward(ctx, g_out, g_Vpost_unused, g_vcarry_unused):
-            beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post = ctx.saved_tensors
+            beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post = ctx.saved_tensors
             K, T, num_cols = ctx.K, ctx.T, ctx.num_cols
             if g_out is None:
                 g_out = torch.zeros(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
@@ -1316,19 +1402,21 @@ if _HAS_TRITON:
             grad_u = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             grad_beta = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
             grad_vth = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            grad_ahp = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             grad_v_init = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
             BLOCK = _SegmentedPLIFSelective._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
             _segmented_plif_bwd_selective_kernel[grid](
-                beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post,
+                beta_flat, vth_flat, ahp_flat, v_init_flat, u_flat, k_t_cols, V_post,
                 g_out,
-                grad_beta, grad_u, grad_vth, grad_v_init,
-                T, K, num_cols, BLOCK=BLOCK,
+                grad_beta, grad_u, grad_vth, grad_ahp, grad_v_init,
+                ctx.alpha,
+                T, K, num_cols, SPIKE_QUANTAL=ctx.spike_quantal, BLOCK=BLOCK,
             )
-            return grad_beta, grad_u, grad_vth, grad_v_init, None, None, None, None, None
+            return grad_beta, grad_u, grad_vth, grad_ahp, grad_v_init, None, None, None, None, None, None, None
 
 
-def _seg_selective_call(beta, u, v_th, v_init, k_t, K, training):
+def _seg_selective_call(beta, u, v_th, v_init, k_t, K, training, ahp_row=None, alpha=4.0, spike_quantal=False):
     """Triton 路径 for segmented_plif_selective: (TK,b,H) per-frame β/u/vth → flat → autograd.Function → reshape."""
     TK, b, H = u.shape
     T = TK // K
@@ -1336,24 +1424,33 @@ def _seg_selective_call(beta, u, v_th, v_init, k_t, K, training):
     u_flat = u.reshape(TK, num_cols).contiguous().to(torch.float32)
     beta_flat = beta.reshape(TK, num_cols).contiguous().to(torch.float32)
     vth_flat = v_th.reshape(TK, num_cols).contiguous().to(torch.float32)
+    if ahp_row is None:
+        ahp_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
+    else:
+        ahp_flat = ahp_row.reshape(num_cols).contiguous().to(torch.float32)
     if not isinstance(v_init, torch.Tensor):
         v_init_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
     else:
         v_init_flat = v_init.reshape(num_cols).contiguous().to(torch.float32)
     k_t_cols = k_t.repeat_interleave(H, dim=1).contiguous().to(torch.int32)
     output, V_post, v_carry = _SegmentedPLIFSelective.apply(
-        beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training,
+        beta_flat, u_flat, vth_flat, ahp_flat, v_init_flat, k_t_cols, K, T, num_cols, training, alpha, spike_quantal,
     )
     return (output.reshape(TK, b, H).to(u.dtype),
             V_post.reshape(TK, b, H).to(u.dtype),
             v_carry.reshape(b, H).to(u.dtype).detach())
 
 
-def segmented_plif_selective(beta, u, v_th, v_init, k_t, K, training=True):
-    """V4 segmented PLIF (selective) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference."""
+def segmented_plif_selective(beta, u, v_th, v_init, k_t, K, training=True,
+                             ahp_row=None, alpha=4.0, spike_mode="supra"):
+    """V4 segmented PLIF (selective) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference.
+
+    ahp_row: (b, H) per-channel 后超极化量 (None → 0). spike_mode: "supra" | "quantal".
+    """
+    spike_quantal = (spike_mode == "quantal")
     if _HAS_TRITON and u.is_cuda:
-        return _seg_selective_call(beta, u, v_th, v_init, k_t, K, training)
-    return _segmented_plif_selective_pytorch(beta, u, v_th, v_init, k_t, K, training)
+        return _seg_selective_call(beta, u, v_th, v_init, k_t, K, training, ahp_row, alpha, spike_quantal)
+    return _segmented_plif_selective_pytorch(beta, u, v_th, v_init, k_t, K, training, ahp_row, alpha, spike_quantal)
 
 
 def _segmented_plif_selective_pytorch(
@@ -1364,22 +1461,13 @@ def _segmented_plif_selective_pytorch(
     k_t: torch.Tensor,
     K: int,
     training: bool = True,
+    ahp_row=None,
+    alpha: float = 4.0,
+    spike_quantal: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """V4 segmented PLIF (selective: β/v_th per-frame data-dependent) — PyTorch reference.
+    """V4 segmented PLIF (selective: β/v_th per-frame data-dependent; ahp per-channel) — PyTorch reference.
 
-    Args:
-        beta:   (T*K, b, H) — per-frame 衰减率 (selective)
-        u:      (T*K, b, H) — per-frame 已缩放投影输入
-        v_th:   (T*K, b, H) — per-frame 动态阈值
-        v_init: (b, H) Tensor 或 0 — 初始膜电位
-        k_t:    (T, b) int ∈ {0..K-1} — 每 (token, batch) halt 帧 index
-        K:      K_max
-        training: True=全 K; False=早停到 max(k_t)+1
-
-    Returns:
-        output:  (T*K, b, H) — 超阈电流
-        V_post:  (T*K, b, H) — 发放后膜电位
-        v_carry: (b, H) — 最后 token 第 k_{T-1} 帧 V_post (detached)
+    Args: 同 _segmented_plif_rowparam_pytorch, 但 beta/v_th 为 (T*K, b, H) per-frame; ahp_row 仍 (b, H) per-channel.
     """
     TK, b, H = u.shape
     T = TK // K
@@ -1388,6 +1476,8 @@ def _segmented_plif_selective_pytorch(
     vth_tk = v_th.view(T, K, b, H)
     if not isinstance(v_init, torch.Tensor):
         v_init = torch.zeros(b, H, dtype=u.dtype, device=u.device)
+    if ahp_row is None:
+        ahp_row = torch.zeros(b, H, dtype=u.dtype, device=u.device)
     v_carry = v_init
     out_tk: list[torch.Tensor] = []
     Vp_tk: list[torch.Tensor] = []
@@ -1398,8 +1488,7 @@ def _segmented_plif_selective_pytorch(
         token_vp: list[torch.Tensor] = []
         for k in range(K_run):
             v_pre = beta_tk[t, k] * v + u_tk[t, k]
-            out = F.relu(v_pre - vth_tk[t, k])
-            v = v_pre - out
+            out, v = _spike_step(v_pre, vth_tk[t, k], ahp_row, spike_quantal, alpha)
             token_out.append(out)
             token_vp.append(v)
         while len(token_out) < K:
@@ -1419,6 +1508,34 @@ def _segmented_plif_selective_pytorch(
 # ============================================================
 # Section: plif_node
 # ============================================================
+
+# 神经元发放形式 — 由 SNNLanguageModel.__init__ 从 config 设置 (一个进程一个 config).
+#   spike_mode "supra"  : output = relu(V_pre - v_th), V_post = min(V_pre, v_th) — 精确 ReLU 梯度 (v3 默认)
+#   spike_mode "quantal": output = v_th·𝟙[V_pre>v_th], V_post = V_pre - v_th·𝟙[..] - ahp·𝟙[..] — 量子化释放 (剩余余量留膜里), surrogate 梯度
+#   use_ahp=True 时各 PLIF 神经元有 per-channel 可学习 ahp (后超极化); 否则不创建该参数 (等价 ahp=0).
+# 见 docs/v4_status_and_roadmap.md §神经元设计 v4.1.
+NEURON_SPIKE_MODE = "supra"
+NEURON_SURROGATE_ALPHA = 4.0
+NEURON_USE_AHP = False
+NEURON_AHP_INIT = 0.0
+
+
+def _set_neuron_dynamics(spike_mode="supra", surrogate_alpha=4.0, use_ahp=False, ahp_init=0.0):
+    """模块级设置 (SNNLanguageModel.__init__ 在构造层之前调用)。"""
+    global NEURON_SPIKE_MODE, NEURON_SURROGATE_ALPHA, NEURON_USE_AHP, NEURON_AHP_INIT
+    NEURON_SPIKE_MODE = spike_mode
+    NEURON_SURROGATE_ALPHA = float(surrogate_alpha)
+    NEURON_USE_AHP = bool(use_ahp)
+    NEURON_AHP_INIT = float(ahp_init)
+
+
+def _ahp_row_of(neuron, batch: int):
+    """neuron.ahp (dim,) → (batch, dim) per-channel ahp_row, 或 None (无 ahp 参数 / use_ahp=False)。"""
+    ahp = getattr(neuron, 'ahp', None)
+    if ahp is None:
+        return None
+    return ahp.unsqueeze(0).expand(batch, ahp.shape[0]).contiguous()
+
 
 class PLIFNode(MemoryModule):
     """
@@ -1454,6 +1571,11 @@ class PLIFNode(MemoryModule):
             v_threshold * 0.05, v_threshold * 0.3,
         ))
         self.surrogate_function = surrogate_function
+        self.spike_mode = NEURON_SPIKE_MODE
+        self.surrogate_alpha = NEURON_SURROGATE_ALPHA
+        if NEURON_USE_AHP:
+            # 后超极化量 (per-channel 可学), 初始化小 (≈0) → 模型自己决定要不要不应期
+            self.ahp = nn.Parameter(torch.full((dim,), NEURON_AHP_INIT))
         # 膜电位状态（functional.reset_net 时重置为 0.）
         self.register_memory('v', 0.)
 
@@ -1463,21 +1585,14 @@ class PLIFNode(MemoryModule):
         return torch.sigmoid(self.w)
 
     def forward(self, x):
-        """
-        单步 bio-inspired PLIF 前向:
-          V_pre  = β · V_{t-1} + (1-β) · x
-          output = max(V_pre - V_th, 0)   # 超阈电流 (ReLU, sparse)
-          V_t    = V_pre - output         # = min(V_pre, V_th) (降到阈值)
-
-        Returns:
-            output: 连续值 (超阈电流), shape (batch, dim), 非发放位置 == 0
-        """
+        """单步 PLIF 前向 (V_pre = β·V_{t-1} + (1-β)·x → fire → reset)。spike_mode/ahp 见 _spike_step。"""
         if isinstance(self.v, float):
             self.v = torch.zeros_like(x)
         beta = self.beta
         v_pre = beta * self.v + (1.0 - beta) * x
-        output = F.relu(v_pre - self.v_th)
-        self.v = v_pre - output
+        ahp = getattr(self, 'ahp', None)
+        ahp_t = ahp if ahp is not None else v_pre.new_zeros(())
+        output, self.v = _spike_step(v_pre, self.v_th, ahp_t, self.spike_mode == "quantal", self.surrogate_alpha)
         return output
 
 
@@ -1501,6 +1616,7 @@ class SelectivePLIFNode(BaseNode):
         self,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
         detach_reset: bool = False,
+        dim: int | None = None,
     ):
         # v_threshold=1.0 是占位值，实际使用外部传入的 v_th
         # v_reset=None 触发 soft reset 模式，register_memory('v', 0.)
@@ -1513,6 +1629,10 @@ class SelectivePLIFNode(BaseNode):
             backend='torch',
             store_v_seq=False,
         )
+        self.spike_mode = NEURON_SPIKE_MODE
+        self.surrogate_alpha = NEURON_SURROGATE_ALPHA
+        if NEURON_USE_AHP and dim is not None:
+            self.ahp = nn.Parameter(torch.full((dim,), NEURON_AHP_INIT))
 
     def single_step_forward(
         self,
@@ -1521,26 +1641,12 @@ class SelectivePLIFNode(BaseNode):
         alpha: torch.Tensor,
         v_th: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Bio-inspired 单步前向 (v3 超阈电流):
-          V_pre  = β(t) · V[t-1] + α(t) · I[t]
-          output = max(V_pre - V_th(t), 0)    # 超阈电流 (ReLU, sparse)
-          V[t]   = V_pre - output             # = min(V_pre, V_th(t))
-
-        Args:
-            x:    输入电流 I[t],   shape (batch, D*N)
-            beta: 衰减率 β(t),    shape (batch, D*N), 值域 (0, 1)
-            alpha: 写入增益 α(t),  shape (batch, D*N), 值域 R+
-            v_th: 动态阈值 V_th(t), shape (batch, D*N), 值域 R+
-
-        Returns:
-            output: 超阈电流 (连续, sparse), shape (batch, D*N), 非发放位置 == 0
-        """
+        """Bio-inspired 单步前向 (V_pre = β(t)·V[t-1] + α(t)·I[t] → fire → reset)。spike_mode/ahp 见 _spike_step。"""
         self.v_float_to_tensor(x)
-
         v_pre = beta * self.v + alpha * x
-        output = F.relu(v_pre - v_th)
-        self.v = v_pre - output
+        ahp = getattr(self, 'ahp', None)
+        ahp_t = ahp if ahp is not None else v_pre.new_zeros(())
+        output, self.v = _spike_step(v_pre, v_th, ahp_t, self.spike_mode == "quantal", self.surrogate_alpha)
         return output
 
     def extra_repr(self) -> str:
@@ -1839,11 +1945,20 @@ class SNNFFN(MemoryModule):
             v_init_up = v_init_up.to(input_dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
+        # spike form / ahp (gate+up 合并; ahp 为 per-channel)
+        spike_mode = self.gate_neuron.spike_mode
+        alpha = self.gate_neuron.surrogate_alpha
+        ahp_gate = getattr(self.gate_neuron, 'ahp', None)
+        if ahp_gate is not None:
+            ahp_row = torch.cat([ahp_gate.to(input_dtype), self.up_neuron.ahp.to(input_dtype)]).unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
+        else:
+            ahp_row = None
         output_merged, _V_post_merged, v_carry_merged = segmented_plif_rowparam(
             beta_row, u_merged, v_th_row, v_init_merged, k_t, K, training,
+            ahp_row=ahp_row, alpha=alpha, spike_mode=spike_mode,
         )
 
-        # 超阈电流输出 (sparse): 非发放位置严格 == 0, 发放位置 = V_pre - V_th > 0
+        # 发放幅度输出 (sparse): 非发放位置严格 == 0; supra → V_pre-V_th, quantal → V_th
         gate_out = output_merged[:, :, :D_ff]
         up_out = output_merged[:, :, D_ff:]
         self.gate_neuron.v = v_carry_merged[:, :D_ff]   # (batch, D_ff), 已 detach
@@ -1964,6 +2079,7 @@ class SNNBlock(MemoryModule):
         self.hidden_neuron = SelectivePLIFNode(
             surrogate_function=surrogate_function,
             detach_reset=False,
+            dim=DN,
         )
 
         # ====== 参数初始化 ======
@@ -2087,6 +2203,9 @@ class SNNBlock(MemoryModule):
         # V4 segmented selective PLIF: per-token K 帧, token 边界携带第 k_t 帧膜电位
         output_hidden, _V_post_hidden, v_carry_hidden = segmented_plif_selective(
             beta_all, u_hidden, v_th_all, v_init_hidden, k_t, K, training,
+            ahp_row=_ahp_row_of(self.hidden_neuron, batch),
+            alpha=self.hidden_neuron.surrogate_alpha,
+            spike_mode=self.hidden_neuron.spike_mode,
         )
 
         # 携带状态 = 序列最后 token 第 k_t 帧的膜电位 (segmented_plif_* 已 detach)
@@ -2419,6 +2538,9 @@ class SNNDecoderLayer(MemoryModule):
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
         output, _V_post, v_carry = segmented_plif_rowparam(
             beta_row, u, v_th_row, v_init, k_t, K, training,
+            ahp_row=_ahp_row_of(input_neuron, batch),
+            alpha=input_neuron.surrogate_alpha,
+            spike_mode=input_neuron.spike_mode,
         )
         input_neuron.v = v_carry  # (batch, D), 已 detach
         with torch.no_grad():
@@ -2723,6 +2845,9 @@ class SNNAttentionDecoderLayer(MemoryModule):
         v_th_row = input_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
         output, _V_post, v_carry = segmented_plif_rowparam(
             beta_row, u, v_th_row, v_init, k_t, K, training,
+            ahp_row=_ahp_row_of(input_neuron, batch),
+            alpha=input_neuron.surrogate_alpha,
+            spike_mode=input_neuron.spike_mode,
         )
         input_neuron.v = v_carry
         with torch.no_grad():
@@ -2902,8 +3027,17 @@ class SNNLanguageModel(nn.Module):
         memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
+        spike_mode: str = "supra",
+        surrogate_alpha: float = 4.0,
+        use_ahp: bool = False,
+        ahp_init: float = 0.0,
     ):
         super().__init__()
+        # 必须在构造任何 PLIF 神经元之前设置 (它们在 __init__ 里读模块级 NEURON_* 决定 ahp 参数 / spike_mode)
+        _set_neuron_dynamics(spike_mode=spike_mode, surrogate_alpha=surrogate_alpha,
+                             use_ahp=use_ahp, ahp_init=ahp_init)
+        self.spike_mode = spike_mode
+        self.use_ahp = use_ahp
         self.vocab_size = vocab_size
         self.D = D
         self.N = N
@@ -3074,6 +3208,9 @@ class SNNLanguageModel(nn.Module):
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
         output, _V_post, v_carry = segmented_plif_rowparam(
             beta_row, u, v_th_row, v_init, k_t_out, Ka, self.training,
+            ahp_row=_ahp_row_of(self.output_neuron, batch),
+            alpha=self.output_neuron.surrogate_alpha,
+            spike_mode=self.output_neuron.spike_mode,
         )
         self.output_neuron.v = v_carry                                   # (b, D), 已 detach
         with torch.no_grad():
@@ -3439,6 +3576,12 @@ class SNNLanguageModel(nn.Module):
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
             ])
 
+        # AHP (后超极化) 参数 — 仅 use_ahp 时存在; 跟其它神经元参数同组 (neuron LR mult)
+        ahp_params = [m.ahp for m in self.modules()
+                      if isinstance(m, (PLIFNode, SelectivePLIFNode)) and getattr(m, 'ahp', None) is not None]
+        if ahp_params:
+            groups['input_neurons'].extend(ahp_params)
+
         return groups
 
 
@@ -3465,6 +3608,10 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             memory_layer_interval=config.memory_layer_interval,
             D_key=config.D_key,
             D_value=config.D_value,
+            spike_mode=getattr(config, "spike_mode", "supra"),
+            surrogate_alpha=getattr(config, "surrogate_alpha", 4.0),
+            use_ahp=getattr(config, "use_ahp", False),
+            ahp_init=getattr(config, "ahp_init", 0.0),
         )
 
     def get_input_embeddings(self):

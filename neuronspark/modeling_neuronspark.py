@@ -2574,6 +2574,12 @@ class SNNLanguageModel(nn.Module):
             v_threshold=0.3,
             surrogate_function=surrogate.Sigmoid(alpha=4.0),
         )
+        # V4: output_neuron 也走统一原则 — 自己的 k_predictor, readout/携带都用第 k_t^out 帧
+        self.output_k_predictor = KPredictor(D=D, K=K, hidden=None)
+        self.output_ponder_T = 1.0
+        self.output_eps_explore = 0.0
+        self._last_y_hard_output = None
+        self._output_ek = float(K)
 
         # ====== 混合层栈: SNN Decoder + SNN-Attention Decoder ======
         # 每 memory_layer_interval 层插入 1 层 SNN-Attention 解码层
@@ -2621,28 +2627,32 @@ class SNNLanguageModel(nn.Module):
         return emb.permute(1, 0, 2).contiguous()  # (seq_len, batch, D)
 
     def set_ponder_temperature(self, T: float) -> None:
-        """Set Gumbel temperature on every layer's KPredictor path.
+        """Set Gumbel temperature on every layer's KPredictor path + output_neuron's.
 
         Call from training loop each step to anneal T_init → T_final.
         """
         for layer in self.layers:
             if hasattr(layer, "ponder_T"):
                 layer.ponder_T = float(T)
+        self.output_ponder_T = float(T)
 
     def set_ponder_exploration(self, eps: float) -> None:
-        """Set forced-exploration probability on every layer."""
+        """Set forced-exploration probability on every layer + output_neuron."""
         for layer in self.layers:
             if hasattr(layer, "eps_explore"):
                 layer.eps_explore = float(eps)
+        self.output_eps_explore = float(eps)
 
     def update_ponder_bias(self, lr_bias: float = 1e-3, ema_decay: float = 0.99) -> None:
-        """Apply DeepSeek-V3 style gradient-free bias balancing across all layers.
+        """Apply DeepSeek-V3 style gradient-free bias balancing across all layers + output_neuron.
 
         Call once per training step AFTER optimizer.step().
         """
         for layer in self.layers:
             if hasattr(layer, "update_bias"):
                 layer.update_bias(lr_bias=lr_bias, ema_decay=ema_decay)
+        # NCCL-safe: always call (inner update_bias handles None / empty).
+        self.output_k_predictor.update_bias(self._last_y_hard_output, lr_bias=lr_bias, ema_decay=ema_decay)
 
     def snn_forward(self, h_seq: torch.Tensor):
         """SNN 核心：h_seq → (h_out, ponder_cost)。
@@ -2675,43 +2685,48 @@ class SNNLanguageModel(nn.Module):
         return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
-        """输出 PLIF 神经元: token-level h → 内部 repeat K 帧 → PLIF → K 帧 mean → token-level.
+        """输出 PLIF 神经元: V4 统一原则 — 自己的 k_predictor 选 k_t^out, segmented PLIF,
+        readout = 第 k_t^out 帧的超阈电流 (STE gather), 携带 = 第 k_t^out 帧的膜电位.
 
         Args:
             h: (seq_len, batch, D) token-level 连续值（SNN 最后一层输出, RMSNorm 后）
-
         Returns:
-            (seq_len, batch, D) — output_neuron 超阈电流的 K 帧均值
-
-        V4: K 展开局部进行 (残差流为 token-level). 行为暂与 v3 一致 (跑全 K, 携带第 K 帧);
-        P4 会改成 output 自己的 k_predictor + 携带第 k_t 帧.
+            (seq_len, batch, D) — output_neuron 在第 k_t^out 帧的超阈电流
         """
         seq_len, batch, D = h.shape
         input_dtype = h.dtype
         K = self.K
-        h_k = h.repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
-        TK = seq_len * K
-
+        # k_predictor on token-level h
+        k_logits = self.output_k_predictor(h)                            # (T, b, K)
+        y_st_out, y_hard_out = _ponder_v3_pick(
+            k_logits, training=self.training,
+            temperature=self.output_ponder_T, eps_explore=self.output_eps_explore,
+        )
+        k_t_out = y_hard_out.argmax(dim=-1)                              # (T, b) int
+        self._last_y_hard_output = y_hard_out
+        # K 展开 + segmented PLIF
+        h_k = h.repeat_interleave(K, dim=0)                              # (TK, b, D), K 份相同
         beta = self.output_neuron.beta.to(input_dtype)
         u = (1.0 - beta) * h_k
-
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
             v_init = torch.zeros(batch, D, device=h.device, dtype=input_dtype)
-
+        else:
+            v_init = v_init.to(input_dtype)
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.to(input_dtype).unsqueeze(0).expand(batch, D).contiguous()
-
-        output, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
+        output, _V_post, v_carry = segmented_plif_rowparam(
+            beta_row, u, v_th_row, v_init, k_t_out, K, self.training,
         )
-
-        self.output_neuron.v = V_post[-1].detach()
+        self.output_neuron.v = v_carry                                   # (b, D), 已 detach
         with torch.no_grad():
             self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
-        # K 帧聚合 → token-level
-        out_frames = output.view(seq_len, K, batch, D)
-        return out_frames.mean(dim=1).to(input_dtype)  # (seq_len, batch, D)
+            steps_vec = torch.arange(1, K + 1, device=h.device, dtype=h.dtype)
+            self._output_ek = (y_st_out.detach() * steps_vec[None, None, :]).sum(-1).mean().item()
+        # gather 第 k_t^out 帧 (STE: forward=y_hard, backward=y_soft)
+        frames = output.view(seq_len, K, batch, D)                       # (T, K, b, D)
+        readout = (y_st_out.permute(0, 2, 1).unsqueeze(-1) * frames).sum(dim=1)  # (T, b, D)
+        return readout.to(input_dtype)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
         """输出边界：token-level 连续 h → 输出神经元 → logits。

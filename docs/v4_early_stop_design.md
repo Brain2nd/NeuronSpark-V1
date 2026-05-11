@@ -26,6 +26,12 @@
 
 **影响**：`SNNBlock.__init__` 删 `self.conv1d` / `register_memory('conv_state')`；`forward_parallel` 删 Phase 0；`single_step_forward` 删 conv；`get_param_groups` 删 conv1d 覆盖。
 
+### 1.1b 残差流简化为 token-level (T, B, D)
+
+**已实测确认**（`tests/verify_residual_redundant.py`）：残差流 `h` 的 K 维是严格逐 bit 冗余 —— 每 token 的 K 份副本在 fp32 和 bf16 下、每一层输出处，沿 K 轴最大偏差 = 0.000e+00。原因：emb 展开是 K 份相同，每层加的残差是 token 级广播 K 份，attn 子层是 `mean(K)→...→expand(K)`（对相同副本是恒等）。K 维只在 SNN block / output_neuron 内部「活起来」（PLIF 递推让 K 帧 diverge）。
+
+因此 V4 把残差流改为 `(T, B, D)`，K 展开只在 SNN block / SNNFFN / output_neuron 内部局部进行。去掉所有 `view(seq,K,...)` / `repeat_interleave(K)` / attn 的 `mean(dim=1)→expand(K)` 往返。数值零偏差。
+
 ### 1.2 PLIF 递推改成「per-token K-frame，inter-token 携带第 k_t 帧」
 
 设 token t 的 halt 帧 = index `k_t ∈ {0,..,K-1}`（"k_t 步" = 计算 frame 0..k_t）。

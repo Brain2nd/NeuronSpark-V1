@@ -9,6 +9,7 @@ sys.path.insert(0, "/home/dgxspark/Desktop/NeuronSpark-V1")
 from neuronspark.modeling_neuronspark import (
     segmented_plif_rowparam, plif_rowparam_forward,
     segmented_plif_selective, plif_parallel_forward,
+    _segmented_plif_rowparam_pytorch, _segmented_plif_selective_pytorch,
 )
 try:
     from neuronspark.modeling_neuronspark import _segmented_plif_rowparam_fwd_triton, _seg_rowparam_call
@@ -38,7 +39,7 @@ def test_degenerate_matches_continuous():
     out_c, Vp_c = plif_rowparam_forward(beta, u, vth, v_init)
     # segmented, 所有 k_t = K-1:
     k_t = torch.full((T, b), K - 1, dtype=torch.long, device=dev)
-    out_s, Vp_s, vcarry_s = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, training=True)
+    out_s, Vp_s, vcarry_s = _segmented_plif_rowparam_pytorch(beta, u, vth, v_init, k_t, K, training=True)
     d_out = (out_c - out_s).abs().max().item()
     d_Vp = (Vp_c - Vp_s).abs().max().item()
     d_carry = (Vp_c[-1] - vcarry_s).abs().max().item()
@@ -56,8 +57,8 @@ def test_early_stop_bit_exact():
     u = torch.randn(T * K, b, H, device=dev) * 0.5
     v_init = torch.randn(b, H, device=dev) * 0.2
     k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
-    out_full, Vp_full, carry_full = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, training=True)
-    out_es, Vp_es, carry_es = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, training=False)
+    out_full, Vp_full, carry_full = _segmented_plif_rowparam_pytorch(beta, u, vth, v_init, k_t, K, training=True)
+    out_es, Vp_es, carry_es = _segmented_plif_rowparam_pytorch(beta, u, vth, v_init, k_t, K, training=False)
     # gather @ k_t 必须相等
     g_full = gather_at_kt(out_full, k_t, K)
     g_es = gather_at_kt(out_es, k_t, K)
@@ -84,7 +85,7 @@ def test_gradcheck():
     k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
 
     def f(beta, u, vth, v_init):
-        out, Vp, carry = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, training=True)
+        out, Vp, carry = _segmented_plif_rowparam_pytorch(beta, u, vth, v_init, k_t, K, training=True)
         # 只对 gather@k_t 的 output (下游真实使用的) 求梯度, 加上 carry
         g = gather_at_kt(out, k_t, K)  # (T, b, H)
         return (g.sum(), carry.sum())
@@ -106,7 +107,7 @@ def test_selective_degenerate():
     v_init = torch.randn(b, H, device=dev) * 0.2
     out_c, Vp_c, _ = plif_parallel_forward(beta, u, vth, v_init)  # continuous (treats TK as one seq)
     k_t = torch.full((T, b), K - 1, dtype=torch.long, device=dev)
-    out_s, Vp_s, vcarry_s = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
+    out_s, Vp_s, vcarry_s = _segmented_plif_selective_pytorch(beta, u, vth, v_init, k_t, K, training=True)
     d_out = (out_c - out_s).abs().max().item()
     d_Vp = (Vp_c - Vp_s).abs().max().item()
     d_carry = (Vp_c[-1] - vcarry_s).abs().max().item()
@@ -124,8 +125,8 @@ def test_selective_early_stop_bit_exact():
     u = torch.randn(T * K, b, H, device=dev) * 0.5
     v_init = torch.randn(b, H, device=dev) * 0.2
     k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
-    out_full, Vp_full, carry_full = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
-    out_es, Vp_es, carry_es = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=False)
+    out_full, Vp_full, carry_full = _segmented_plif_selective_pytorch(beta, u, vth, v_init, k_t, K, training=True)
+    out_es, Vp_es, carry_es = _segmented_plif_selective_pytorch(beta, u, vth, v_init, k_t, K, training=False)
     g_full = gather_at_kt(out_full, k_t, K); g_es = gather_at_kt(out_es, k_t, K)
     gv_full = gather_at_kt(Vp_full, k_t, K); gv_es = gather_at_kt(Vp_es, k_t, K)
     d_g = (g_full - g_es).abs().max().item()
@@ -147,7 +148,7 @@ def test_selective_gradcheck():
     k_t = torch.randint(0, K, (T, b), dtype=torch.long, device=dev)
 
     def f(beta, u, vth, v_init):
-        out, Vp, carry = segmented_plif_selective(beta, u, vth, v_init, k_t, K, training=True)
+        out, Vp, carry = _segmented_plif_selective_pytorch(beta, u, vth, v_init, k_t, K, training=True)
         g = gather_at_kt(out, k_t, K)
         return (g.sum(), carry.sum())
     ok = torch.autograd.gradcheck(f, (beta, u, vth, v_init), eps=1e-6, atol=1e-4, rtol=1e-3)
@@ -174,7 +175,7 @@ def test_kernel_rowparam_fwd_matches_reference():
             k_t = (torch.randint(0, K, (T, b), dtype=torch.long, device=dev) if kt_mode == "random"
                    else torch.full((T, b), K - 1, dtype=torch.long, device=dev))
             with torch.no_grad():
-                o_ref, vp_ref, vc_ref = segmented_plif_rowparam(beta, u, vth, v_init, k_t, K, train)
+                o_ref, vp_ref, vc_ref = _segmented_plif_rowparam_pytorch(beta, u, vth, v_init, k_t, K, train)
                 o_k, vp_k, vc_k = _segmented_plif_rowparam_fwd_triton(beta, u, vth, v_init, k_t, K, train)
             if train:
                 d_o = (o_ref - o_k).abs().max().item(); d_vp = (vp_ref - vp_k).abs().max().item()
@@ -204,7 +205,7 @@ def test_kernel_rowparam_bwd_matches_reference():
         g_out = torch.randn(T * K, b, H, device=dev, dtype=torch.float32)
         # reference
         beta2, vth2, u2, vi2 = (x.clone().requires_grad_(True) for x in (beta_v, vth_v, u_v, vi_v))
-        o_ref, _, _ = segmented_plif_rowparam(beta2, u2, vth2, vi2, k_t, K, True)
+        o_ref, _, _ = _segmented_plif_rowparam_pytorch(beta2, u2, vth2, vi2, k_t, K, True)
         (o_ref * g_out).sum().backward()
         # kernel
         beta1, vth1, u1, vi1 = (x.clone().requires_grad_(True) for x in (beta_v, vth_v, u_v, vi_v))

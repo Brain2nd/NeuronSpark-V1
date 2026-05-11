@@ -521,6 +521,94 @@ if _HAS_TRITON:
         tl.store(GRAD_VTH_ROW_ptr + cols, acc_grad_vth, mask=mask)
 
     @triton.jit
+    def _segmented_plif_fwd_selective_kernel(
+        BETA_ptr, U_ptr, VTH_ptr, INIT_ptr, KT_COLS_ptr,
+        OUTPUT_ptr, VPOST_ptr, VCARRY_ptr,
+        T, K, num_cols,
+        IS_TRAINING: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """V4 segmented PLIF forward (selective: β/v_th per-frame). 同 rowparam, β/vth 逐帧 load.
+        BETA/VTH/U/OUTPUT/VPOST: (TK, num_cols); KT_COLS: (T, num_cols) int; INIT/VCARRY: (num_cols,).
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+        v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        for t in range(T):
+            if t > 0:
+                kt_prev = tl.load(KT_COLS_ptr + (t - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
+                v = tl.load(VPOST_ptr + ((t - 1) * K + kt_prev) * num_cols + cols, mask=mask, other=0.0).to(tl.float32)
+            kt_t = tl.load(KT_COLS_ptr + t * num_cols + cols, mask=mask, other=0).to(tl.int32)
+            if IS_TRAINING:
+                k_run = K
+            else:
+                k_run = tl.max(tl.where(mask, kt_t + 1, 0))
+            for k in range(K):
+                if k < k_run:
+                    off = (t * K + k) * num_cols + cols
+                    u_ik = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                    beta_ik = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                    vth_ik = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                    v_pre = beta_ik * v + u_ik
+                    out_ik = tl.maximum(v_pre - vth_ik, 0.0)
+                    v = v_pre - out_ik
+                    tl.store(OUTPUT_ptr + off, out_ik, mask=mask)
+                    tl.store(VPOST_ptr + off, v, mask=mask)
+        kt_last = tl.load(KT_COLS_ptr + (T - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
+        vc = tl.load(VPOST_ptr + ((T - 1) * K + kt_last) * num_cols + cols, mask=mask, other=0.0).to(tl.float32)
+        tl.store(VCARRY_ptr + cols, vc, mask=mask)
+
+    @triton.jit
+    def _segmented_plif_bwd_selective_kernel(
+        BETA_ptr, VTH_ptr, INIT_ptr, U_ptr, KT_COLS_ptr, VPOST_ptr,
+        GRAD_OUTPUT_ptr,
+        GRAD_BETA_ptr, GRAD_U_ptr, GRAD_VTH_ptr, GRAD_INIT_ptr,
+        T, K, num_cols,
+        BLOCK: tl.constexpr,
+    ):
+        """V4 segmented PLIF backward (selective). 同 rowparam bwd, β/vth 逐帧 load, grad_β/grad_vth 逐帧 store."""
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+        g_v = tl.zeros([BLOCK], dtype=tl.float32)
+        g_patch = tl.zeros([BLOCK], dtype=tl.float32)
+        g_v_init = tl.zeros([BLOCK], dtype=tl.float32)
+        for t_rev in range(T):
+            t = T - 1 - t_rev
+            kt_t = tl.load(KT_COLS_ptr + t * num_cols + cols, mask=mask, other=0).to(tl.int32)
+            for k_rev in range(K):
+                k = K - 1 - k_rev
+                off = (t * K + k) * num_cols + cols
+                if k > 0:
+                    v_prev = tl.load(VPOST_ptr + (t * K + k - 1) * num_cols + cols, mask=mask, other=0.0).to(tl.float32)
+                elif t > 0:
+                    kt_prev = tl.load(KT_COLS_ptr + (t - 1) * num_cols + cols, mask=mask, other=0).to(tl.int32)
+                    v_prev = tl.load(VPOST_ptr + ((t - 1) * K + kt_prev) * num_cols + cols, mask=mask, other=0.0).to(tl.float32)
+                else:
+                    v_prev = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                u_i = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                beta_i = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                vth_i = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                v_pre = beta_i * v_prev + u_i
+                s = tl.where(v_pre > vth_i, 1.0, 0.0)
+                g_out_i = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
+                g_Vpost = g_v + tl.where(k == kt_t, g_patch, 0.0)
+                g_v_pre = g_Vpost * (1.0 - s) + g_out_i * s
+                tl.store(GRAD_VTH_ptr + off, s * (g_Vpost - g_out_i), mask=mask)
+                tl.store(GRAD_U_ptr + off, g_v_pre, mask=mask)
+                tl.store(GRAD_BETA_ptr + off, g_v_pre * v_prev, mask=mask)
+                g_back = g_v_pre * beta_i
+                if k > 0:
+                    g_v = g_back
+                elif t > 0:
+                    g_patch = g_back
+                    g_v = tl.zeros([BLOCK], dtype=tl.float32)
+                else:
+                    g_v_init = g_back
+        tl.store(GRAD_INIT_ptr + cols, g_v_init, mask=mask)
+
+    @triton.jit
     def _fused_plif_bwd_rowparam_kernel(
         BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr, VPOST_ptr, OUTPUT_ptr,
         GRAD_OUTPUT_ptr, GRAD_VPOST_ptr,
@@ -1049,7 +1137,14 @@ def plif_rowparam_forward(
     return torch.stack(outputs, dim=0), torch.stack(V_posts, dim=0)
 
 
-def segmented_plif_rowparam(
+def segmented_plif_rowparam(beta_row, u, v_th_row, v_init, k_t, K, training=True):
+    """V4 segmented PLIF (row-param) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference."""
+    if _HAS_TRITON and u.is_cuda:
+        return _seg_rowparam_call(beta_row, u, v_th_row, v_init, k_t, K, training)
+    return _segmented_plif_rowparam_pytorch(beta_row, u, v_th_row, v_init, k_t, K, training)
+
+
+def _segmented_plif_rowparam_pytorch(
     beta_row: torch.Tensor,
     u: torch.Tensor,
     v_th_row: torch.Tensor,
@@ -1058,7 +1153,7 @@ def segmented_plif_rowparam(
     K: int,
     training: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """V4 segmented PLIF (row-param β/v_th). 见 docs/v4_segmented_plif_kernel_design.md.
+    """V4 segmented PLIF (row-param β/v_th) — PyTorch reference. 见 docs/v4_segmented_plif_kernel_design.md.
 
     Per-token K-frame 递推, token 边界把运行膜电位 patch 成上 token 第 k_{t-1} 帧的 V_post.
     纯 PyTorch (autograd 自动反向); Triton 融合 kernel 后续 (P5.5) 再写, 用本函数当 reference.
@@ -1190,7 +1285,78 @@ def _segmented_plif_rowparam_fwd_triton(beta_row, u, vth_row, v_init, k_t, K, tr
     return _seg_rowparam_call(beta_row, u, vth_row, v_init, k_t, K, training)
 
 
-def segmented_plif_selective(
+if _HAS_TRITON:
+    class _SegmentedPLIFSelective(torch.autograd.Function):
+        """Triton fused segmented PLIF (selective: β/v_th per-frame). forward + backward kernels."""
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training):
+            output = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            V_post = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            v_carry = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
+            BLOCK = _SegmentedPLIFSelective._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+            _segmented_plif_fwd_selective_kernel[grid](
+                beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols,
+                output, V_post, v_carry,
+                T, K, num_cols, IS_TRAINING=bool(training), BLOCK=BLOCK,
+            )
+            ctx.save_for_backward(beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post)
+            ctx.K = K; ctx.T = T; ctx.num_cols = num_cols
+            return output, V_post, v_carry.detach()
+
+        @staticmethod
+        def backward(ctx, g_out, g_Vpost_unused, g_vcarry_unused):
+            beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post = ctx.saved_tensors
+            K, T, num_cols = ctx.K, ctx.T, ctx.num_cols
+            if g_out is None:
+                g_out = torch.zeros(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            g_out = g_out.contiguous().to(torch.float32)
+            grad_u = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            grad_beta = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            grad_vth = torch.empty(T * K, num_cols, device=u_flat.device, dtype=torch.float32)
+            grad_v_init = torch.empty(num_cols, device=u_flat.device, dtype=torch.float32)
+            BLOCK = _SegmentedPLIFSelective._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+            _segmented_plif_bwd_selective_kernel[grid](
+                beta_flat, vth_flat, v_init_flat, u_flat, k_t_cols, V_post,
+                g_out,
+                grad_beta, grad_u, grad_vth, grad_v_init,
+                T, K, num_cols, BLOCK=BLOCK,
+            )
+            return grad_beta, grad_u, grad_vth, grad_v_init, None, None, None, None, None
+
+
+def _seg_selective_call(beta, u, v_th, v_init, k_t, K, training):
+    """Triton 路径 for segmented_plif_selective: (TK,b,H) per-frame β/u/vth → flat → autograd.Function → reshape."""
+    TK, b, H = u.shape
+    T = TK // K
+    num_cols = b * H
+    u_flat = u.reshape(TK, num_cols).contiguous().to(torch.float32)
+    beta_flat = beta.reshape(TK, num_cols).contiguous().to(torch.float32)
+    vth_flat = v_th.reshape(TK, num_cols).contiguous().to(torch.float32)
+    if not isinstance(v_init, torch.Tensor):
+        v_init_flat = torch.zeros(num_cols, device=u.device, dtype=torch.float32)
+    else:
+        v_init_flat = v_init.reshape(num_cols).contiguous().to(torch.float32)
+    k_t_cols = k_t.repeat_interleave(H, dim=1).contiguous().to(torch.int32)
+    output, V_post, v_carry = _SegmentedPLIFSelective.apply(
+        beta_flat, u_flat, vth_flat, v_init_flat, k_t_cols, K, T, num_cols, training,
+    )
+    return (output.reshape(TK, b, H).to(u.dtype),
+            V_post.reshape(TK, b, H).to(u.dtype),
+            v_carry.reshape(b, H).to(u.dtype).detach())
+
+
+def segmented_plif_selective(beta, u, v_th, v_init, k_t, K, training=True):
+    """V4 segmented PLIF (selective) — dispatcher: CUDA+Triton 走 fused kernel, 否则 PyTorch reference."""
+    if _HAS_TRITON and u.is_cuda:
+        return _seg_selective_call(beta, u, v_th, v_init, k_t, K, training)
+    return _segmented_plif_selective_pytorch(beta, u, v_th, v_init, k_t, K, training)
+
+
+def _segmented_plif_selective_pytorch(
     beta: torch.Tensor,
     u: torch.Tensor,
     v_th: torch.Tensor,
@@ -1199,10 +1365,7 @@ def segmented_plif_selective(
     K: int,
     training: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """V4 segmented PLIF (selective: β/v_th per-frame data-dependent). 给 snn_block.hidden_neuron.
-
-    与 segmented_plif_rowparam 同结构, 但 β/v_th 逐帧索引. 见 docs/v4_segmented_plif_kernel_design.md.
-    纯 PyTorch (autograd 自动反向); Triton 融合 kernel 后续 (P5.5) 再写.
+    """V4 segmented PLIF (selective: β/v_th per-frame data-dependent) — PyTorch reference.
 
     Args:
         beta:   (T*K, b, H) — per-frame 衰减率 (selective)

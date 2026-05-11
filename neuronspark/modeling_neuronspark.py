@@ -2032,31 +2032,40 @@ class SNNDecoderLayer(MemoryModule):
         """
         seq_len, batch, D = h.shape
         K = self.K
+        steps_vec = torch.arange(1, K + 1, device=h.device, dtype=h.dtype)
 
         # ==== 子层 1: SNNBlock ====
-        h_block_input = h  # token-level input 给 k_predictor
-        h_normed_k = self.block_norm(h).repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
-        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k)  # (TK, batch, D)
-        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D)
-
-        frames_block = cont_block.view(seq_len, K, batch, D)
-        combined_block, pc_block, ek_block, y_hard_block = self._ponder_aggregate_v3(
-            frames_block, h_block_input, self.block_k_predictor,
-        )
-        res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
+        # v3 PonderNet reorder: 先用 token-level input 算 k_t (早停时 k_t 必须在跑帧前已知)
+        k_logits_block = self.block_k_predictor(h)                       # (T, b, K)
+        y_st_block, y_hard_block = _ponder_v3_pick(
+            k_logits_block, training=self.training,
+            temperature=self.ponder_T, eps_explore=self.eps_explore,
+        )                                                                # y_st: (T, b, K)
+        h_normed_k = self.block_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
+        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k)  # (TK, b, D)
+        cont_block = self.snn_block.forward_parallel(v_in)               # (TK, b, D)
+        frames_block = cont_block.view(seq_len, K, batch, D)            # (T, K, b, D)
+        # gather 第 k_t 帧 (STE: forward=y_hard, backward=y_soft)
+        combined_block = (y_st_block.permute(0, 2, 1).unsqueeze(-1) * frames_block).sum(dim=1)  # (T, b, D)
+        ek_block = (y_st_block.detach() * steps_vec[None, None, :]).sum(-1)  # (T, b)
+        pc_block = ek_block.mean()
+        res_block = self.block_out_proj(combined_block)                 # (T, b, D)
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)
         h = h + res_block
 
         # ==== 子层 2: SNNFFN ====
-        h_ffn_input = h
-        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)  # (TK, batch, D)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
-
-        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn, pc_ffn, ek_ffn, y_hard_ffn = self._ponder_aggregate_v3(
-            frames_ffn, h_ffn_input, self.ffn_k_predictor,
+        k_logits_ffn = self.ffn_k_predictor(h)                          # (T, b, K)
+        y_st_ffn, y_hard_ffn = _ponder_v3_pick(
+            k_logits_ffn, training=self.training,
+            temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)  # (TK, b, D)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)                 # (TK, b, D)
+        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
+        combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
+        ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
+        pc_ffn = ek_ffn.mean()
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
         h = h + res_ffn
@@ -2305,6 +2314,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
         """
         seq_len, batch, D = h.shape
         K = self.K
+        steps_vec = torch.arange(1, K + 1, device=h.device, dtype=h.dtype)
 
         # ====== 子层 1: SNN-Attention (token 级) ======
         h_normed = self.attn_norm(h)
@@ -2349,15 +2359,18 @@ class SNNAttentionDecoderLayer(MemoryModule):
         h = h + res_attn  # token-level
 
         # ====== 子层 2: SNNFFN (v3 PonderNet) ======
-        h_ffn_input = h
-        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
-
-        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn, pc_ffn, ek_ffn, y_hard_ffn = self._ponder_aggregate_v3(
-            frames_ffn, h_ffn_input, self.ffn_k_predictor,
+        k_logits_ffn = self.ffn_k_predictor(h)                          # (T, b, K)
+        y_st_ffn, y_hard_ffn = _ponder_v3_pick(
+            k_logits_ffn, training=self.training,
+            temperature=self.ponder_T, eps_explore=self.eps_explore,
         )
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)       # (TK, b, D), K 份相同
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)                 # (TK, b, D)
+        frames_ffn = cont_ffn.view(seq_len, K, batch, D)
+        combined_ffn = (y_st_ffn.permute(0, 2, 1).unsqueeze(-1) * frames_ffn).sum(dim=1)  # (T, b, D)
+        ek_ffn = (y_st_ffn.detach() * steps_vec[None, None, :]).sum(-1)
+        pc_ffn = ek_ffn.mean()
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
         h = h + res_ffn

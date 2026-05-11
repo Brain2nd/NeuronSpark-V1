@@ -23,8 +23,6 @@ class NeuronSparkConfig(PretrainedConfig):
         eps_explore=0.05,
         bias_balancing_lr=1e-3,
         bias_balancing_ema=0.99,
-        # V4 P-A: SNN block D↔DN 投影低秩 rank (None=满秩). 见 docs/v4_status_and_roadmap.md §3.
-        snn_proj_rank=None,
         bos_token_id=1,
         eos_token_id=2,
         **kwargs,
@@ -50,7 +48,6 @@ class NeuronSparkConfig(PretrainedConfig):
         self.eps_explore = eps_explore
         self.bias_balancing_lr = bias_balancing_lr
         self.bias_balancing_ema = bias_balancing_ema
-        self.snn_proj_rank = snn_proj_rank
 
         # auto_map: HF 文件路径/类名 两段式（neuronspark/ 子目录）
         kwargs.setdefault("auto_map", {

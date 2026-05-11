@@ -2017,29 +2017,26 @@ class SNNDecoderLayer(MemoryModule):
 
     def forward_parallel(self, h):
         """
-        并行前向传播：连续残差流 + v3 PonderNet 硬选 k_t。
+        并行前向传播：token-level 连续残差流 + v3 PonderNet 硬选 k_t。
 
-        每子层流程:
-          1. Pre-LN + PLIF(V_post) 输入神经元 → SNN 子层 K 帧输出
-          2. v3 PonderNet: k_predictor(input_emb) → Gumbel-ST 硬选 k_t 位置
-          3. output = frame[k_t] (单一时刻膜电位状态)
-          4. out_proj + 残差中心化 → 广播回 TK
+        V4 layout: 残差流 h 为 token-level (T, batch, D). 每子层内部把 token 输入
+        repeat K 次喂 input_neuron + SNN 子层 (PLIF 沿 K 帧递推使其 diverge),
+        然后 k_predictor 硬选 k_t, gather 第 k_t 帧, out_proj 后加回 token-level h.
 
         Args:
-            h: (TK, batch, D) — 连续值输入
+            h: (seq_len, batch, D) — token-level 连续值输入
 
         Returns:
-            h: (TK, batch, D) — 连续值输出
+            h: (seq_len, batch, D) — token-level 连续值输出
             ponder_cost: scalar — 两个子层的平均 E[k_t]（仅 log 用）
         """
-        TK, batch, D = h.shape
+        seq_len, batch, D = h.shape
         K = self.K
-        seq_len = TK // K
 
         # ==== 子层 1: SNNBlock ====
-        # input_emb 取第 0 帧作为 token-level 输入给 k_predictor
-        h_block_input = h.view(seq_len, K, batch, D)[:, 0]  # (seq_len, batch, D)
-        v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
+        h_block_input = h  # token-level input 给 k_predictor
+        h_normed_k = self.block_norm(h).repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
+        v_in = self._input_neuron_parallel(self.input_neuron1, h_normed_k)  # (TK, batch, D)
         cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D)
 
         frames_block = cont_block.view(seq_len, K, batch, D)
@@ -2048,11 +2045,12 @@ class SNNDecoderLayer(MemoryModule):
         )
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)
-        h = h + res_block.repeat_interleave(K, dim=0)
+        h = h + res_block
 
         # ==== 子层 2: SNNFFN ====
-        h_ffn_input = h.view(seq_len, K, batch, D)[:, 0]
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
+        h_ffn_input = h
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)  # (TK, batch, D)
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
@@ -2061,7 +2059,7 @@ class SNNDecoderLayer(MemoryModule):
         )
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
-        h = h + res_ffn.repeat_interleave(K, dim=0)
+        h = h + res_ffn
 
         ponder_cost = (pc_block + pc_ffn) / 2.0
 
@@ -2301,15 +2299,15 @@ class SNNAttentionDecoderLayer(MemoryModule):
     def forward_parallel(self, h):
         """
         并行前向传播, 返回 (h, ponder_cost) 对齐 SNNDecoderLayer 接口。
-        """
-        TK, batch, D = h.shape
-        K = self.K
-        seq_len = TK // K
 
-        # ====== 子层 1: SNN-Attention ======
-        # K 帧平均聚合 → token 级
-        h_token = h.view(seq_len, K, batch, D).mean(dim=1)
-        h_normed = self.attn_norm(h_token)
+        V4 layout: 残差流 h 为 token-level (T, batch, D). attn 子层本就在 token 级
+        工作 (M_state/pos_offset/gate_neuron 都是 token 级); FFN 子层内部 repeat K 次.
+        """
+        seq_len, batch, D = h.shape
+        K = self.K
+
+        # ====== 子层 1: SNN-Attention (token 级) ======
+        h_normed = self.attn_norm(h)
 
         # 投影 q, k, v
         flat = h_normed.reshape(seq_len * batch, D)
@@ -2327,7 +2325,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
         k = _apply_rope(k, rope_cos, rope_sin)
         self.pos_offset = pos + seq_len
 
-        # PLIFNode gate
+        # PLIFNode gate (token 级)
         gate = self._gate_neuron_parallel(h_normed)
 
         # L2 归一化 k
@@ -2348,14 +2346,13 @@ class SNNAttentionDecoderLayer(MemoryModule):
         res_attn = self.attn_out_proj(attn_out.reshape(seq_len * batch, self.D_value))
         res_attn = res_attn.reshape(seq_len, batch, D)
         res_attn = res_attn - res_attn.mean(dim=-1, keepdim=True)  # 残差中心化
-
-        # 广播回 TK 帧 + 残差
-        h = h + res_attn.unsqueeze(1).expand(-1, K, -1, -1).reshape(TK, batch, D)
+        h = h + res_attn  # token-level
 
         # ====== 子层 2: SNNFFN (v3 PonderNet) ======
-        h_ffn_input = h.view(seq_len, K, batch, D)[:, 0]
-        v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
-        cont_ffn = self.snn_ffn.forward_parallel(v_in2)
+        h_ffn_input = h
+        h_normed_k2 = self.ffn_norm(h).repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, h_normed_k2)
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D)
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
         combined_ffn, pc_ffn, ek_ffn, y_hard_ffn = self._ponder_aggregate_v3(
@@ -2363,8 +2360,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
         )
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
-
-        h = h + res_ffn.repeat_interleave(K, dim=0)
+        h = h + res_ffn
 
         # Cache y_hard for bias update
         self._last_y_hard_ffn = y_hard_ffn
@@ -2486,18 +2482,15 @@ class SNNLanguageModel(nn.Module):
         nn.init.xavier_uniform_(self.decode_proj.weight)
 
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """输入边界：token_ids → 连续值序列。
+        """输入边界：token_ids → token-level 连续值序列。
 
-        Embedding lookup，每 token 重复 K 次作为 SNN 时间步输入。
-        梯度可通过 embedding 直接反传。
+        V4: 残差流为 token-level (T, batch, D) — K 展开只在 SNN block / output_neuron
+        内部进行 (见 docs/v4_early_stop_design.md §1.1b: 实测残差流的 K 维严格冗余).
 
-        Returns: (seq_len*K, batch, D), 连续值
+        Returns: (seq_len, batch, D), 连续值
         """
         emb = self.embed_tokens(token_ids)       # (batch, seq_len, D)
-        batch, seq_len, D = emb.shape
-        # 每 token 重复 K 次: (batch, seq_len, D) → (batch, seq_len*K, D) → (TK, batch, D)
-        emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
-        return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
+        return emb.permute(1, 0, 2).contiguous()  # (seq_len, batch, D)
 
     def set_ponder_temperature(self, T: float) -> None:
         """Set Gumbel temperature on every layer's KPredictor path.
@@ -2554,19 +2547,25 @@ class SNNLanguageModel(nn.Module):
         return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
-        """输出 PLIF 神经元的 parallel scan 前向：连续 h → 膜电位泄漏量。
+        """输出 PLIF 神经元: token-level h → 内部 repeat K 帧 → PLIF → K 帧 mean → token-level.
 
         Args:
-            h: (TK, batch, D) 连续值（SNN 最后一层输出）
+            h: (seq_len, batch, D) token-level 连续值（SNN 最后一层输出, RMSNorm 后）
 
         Returns:
-            leak: (TK, batch, D) 膜电位泄漏量 (1-β)·V_post
+            (seq_len, batch, D) — output_neuron 超阈电流的 K 帧均值
+
+        V4: K 展开局部进行 (残差流为 token-level). 行为暂与 v3 一致 (跑全 K, 携带第 K 帧);
+        P4 会改成 output 自己的 k_predictor + 携带第 k_t 帧.
         """
-        TK, batch, D = h.shape
+        seq_len, batch, D = h.shape
         input_dtype = h.dtype
+        K = self.K
+        h_k = h.repeat_interleave(K, dim=0)  # (TK, batch, D), K 份相同
+        TK = seq_len * K
 
         beta = self.output_neuron.beta.to(input_dtype)
-        u = (1.0 - beta) * h
+        u = (1.0 - beta) * h_k
 
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
@@ -2582,21 +2581,19 @@ class SNNLanguageModel(nn.Module):
         self.output_neuron.v = V_post[-1].detach()
         with torch.no_grad():
             self.output_neuron._last_firing_rate = (output > 0).float().mean().item()
-        # 输出神经元: 传超阈电流 (sparse, bio-ReLU)
-        return output.to(input_dtype)
+        # K 帧聚合 → token-level
+        out_frames = output.view(seq_len, K, batch, D)
+        return out_frames.mean(dim=1).to(input_dtype)  # (seq_len, batch, D)
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。
+        """输出边界：token-level 连续 h → 输出神经元 → logits。
 
-        梯度流: loss → logits → norm → decode_proj → K帧mean
-                → V_post(output_neuron) → h_out → SNN layers
-
+        Args:
+            h_out: (seq_len, batch, D) — SNN 最后一层 token-level 输出
         Returns: (batch, seq_len, vocab_size)
         """
         h_out = self.output_norm(h_out)                    # RMSNorm: 控制 scale
-        v_out = self._output_neuron_parallel(h_out)    # (TK, batch, D), V_post 膜电位
-        # K 帧聚合: (TK, batch, D) → (seq_len, K, batch, D) → mean → (seq_len, batch, D)
-        decoded = v_out.view(seq_len, self.K, -1, self.D).mean(dim=1)
+        decoded = self._output_neuron_parallel(h_out)      # (seq_len, batch, D)
         decoded = decoded.permute(1, 0, 2)                 # (batch, seq_len, D)
         h = self.decode_proj(decoded)                      # (batch, seq_len, D)
         h = self.norm(h)                                   # (batch, seq_len, D)

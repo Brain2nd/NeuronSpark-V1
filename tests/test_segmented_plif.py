@@ -11,7 +11,7 @@ from neuronspark.modeling_neuronspark import (
     segmented_plif_selective, plif_parallel_forward,
 )
 try:
-    from neuronspark.modeling_neuronspark import _segmented_plif_rowparam_fwd_triton
+    from neuronspark.modeling_neuronspark import _segmented_plif_rowparam_fwd_triton, _seg_rowparam_call
     _HAS_SEG_KERNEL = True
 except ImportError:
     _HAS_SEG_KERNEL = False
@@ -187,6 +187,38 @@ def test_kernel_rowparam_fwd_matches_reference():
     print("  ==> PASS: Triton rowparam forward kernel bit-exact vs PyTorch reference")
 
 
+def test_kernel_rowparam_bwd_matches_reference():
+    if not _HAS_SEG_KERNEL or not torch.cuda.is_available():
+        print("[kernel rowparam bwd] skipped (no triton/cuda)")
+        return
+    torch.manual_seed(0)
+    dev = "cuda"
+    for kt_mode in ("random", "degenerate"):
+        T, K, b, H = 5, 4, 2, 16
+        mk = lambda lo, hi, *s: (torch.rand(*s, device=dev, dtype=torch.float32) * (hi - lo) + lo)
+        beta_v = mk(0.4, 0.9, b, H); vth_v = mk(0.1, 0.4, b, H)
+        u_v = torch.randn(T * K, b, H, device=dev, dtype=torch.float32) * 0.5
+        vi_v = torch.randn(b, H, device=dev, dtype=torch.float32) * 0.2
+        k_t = (torch.randint(0, K, (T, b), dtype=torch.long, device=dev) if kt_mode == "random"
+               else torch.full((T, b), K - 1, dtype=torch.long, device=dev))
+        g_out = torch.randn(T * K, b, H, device=dev, dtype=torch.float32)
+        # reference
+        beta2, vth2, u2, vi2 = (x.clone().requires_grad_(True) for x in (beta_v, vth_v, u_v, vi_v))
+        o_ref, _, _ = segmented_plif_rowparam(beta2, u2, vth2, vi2, k_t, K, True)
+        (o_ref * g_out).sum().backward()
+        # kernel
+        beta1, vth1, u1, vi1 = (x.clone().requires_grad_(True) for x in (beta_v, vth_v, u_v, vi_v))
+        o_k, _, _ = _seg_rowparam_call(beta1, u1, vth1, vi1, k_t, K, True)
+        (o_k * g_out).sum().backward()
+        d_f = (o_ref - o_k).abs().max().item()
+        d = [(g.detach() if g is not None else None) for g in (beta2.grad, u2.grad, vth2.grad, vi2.grad)]
+        e = [beta1.grad, u1.grad, vth1.grad, vi1.grad]
+        diffs = [(a - bb).abs().max().item() for a, bb in zip(d, e)]
+        print(f"[kernel rowparam bwd] kt={kt_mode}: d_fwd={d_f:.2e} d_grad(beta,u,vth,vinit)={[f'{x:.1e}' for x in diffs]}")
+        assert d_f < 1e-5 and all(x < 1e-3 for x in diffs)
+    print("  ==> PASS: Triton rowparam backward kernel matches PyTorch reference autograd")
+
+
 if __name__ == "__main__":
     test_degenerate_matches_continuous()
     test_early_stop_bit_exact()
@@ -195,4 +227,5 @@ if __name__ == "__main__":
     test_selective_early_stop_bit_exact()
     test_selective_gradcheck()
     test_kernel_rowparam_fwd_matches_reference()
-    print("\nALL P3b-1 + P3b-2 + P5.5-1 TESTS PASSED")
+    test_kernel_rowparam_bwd_matches_reference()
+    print("\nALL TESTS PASSED (P3b-1/2 + P5.5-1/2)")

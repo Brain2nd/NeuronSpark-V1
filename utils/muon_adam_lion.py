@@ -83,7 +83,8 @@ def _validate_group(group):
         group.setdefault("lr", 1e-4)
         group.setdefault("betas", (0.9, 0.99))  # Lion 推荐 β1=0.9 β2=0.99
         group.setdefault("weight_decay", 0)
-        allowed = {"params", "lr", "betas", "weight_decay", "use_muon", "aux_kind"}
+        # clamp_min: 可选下界，每步更新后 p.clamp_(min=cmin)。设 1e-4 防 v_th/ahp 漂负数 (quantal 翻转 NaN)
+        allowed = {"params", "lr", "betas", "weight_decay", "use_muon", "aux_kind", "clamp_min"}
         assert set(group.keys()) <= allowed
     else:
         raise ValueError(f"unknown aux_kind: {kind!r}")
@@ -177,6 +178,10 @@ class MoonshotMuonAdamLion(torch.optim.Optimizer):
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
+                    # 可选: 钳到 [clamp_min, ...) 防止 v_th/ahp 漂到负数引发动力学翻转 → NaN
+                    cmin = group.get("clamp_min", None)
+                    if cmin is not None:
+                        p.clamp_(min=cmin)
         return loss
 
 
@@ -239,6 +244,9 @@ class SingleDeviceMoonshotMuonAdamLion(torch.optim.Optimizer):
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
                     p.add_(update, alpha=-group["lr"])
+                    cmin = group.get("clamp_min", None)
+                    if cmin is not None:
+                        p.clamp_(min=cmin)
         return loss
 
 
@@ -258,15 +266,30 @@ def build_muon_adam_lion_param_groups(
     weight_decay_muon: float = 0.0,
     weight_decay_adam: float = 0.0,
     weight_decay_lion: float = 0.0,
+    clamp_pos_lion: float = 1e-4,
 ) -> list[dict]:
-    """Build 4-group param layout: Muon matrices / Adam embed / Adam norm / **Lion neuron**.
+    """Build 5-group param layout: Muon matrices / Adam embed / Adam norm / Lion neuron-pos / Lion neuron-free.
 
-    Lion 用于神经元标量/向量参数（β/v_th/ahp/b_beta/b_alpha/b_th 等 fp32 master copies），
-    其它跟 `build_muon_param_groups` 一致。`neuron_lr_mult` 应用到 lion_lr 上。
+    Neuron 参数拆成两 Lion 子组:
+      - neuron-pos: `.v_th`, `.ahp` —— **必须 ≥ 0** (负值会翻转 quantal 动力学引发 NaN), 每步更新后 clamp_(min=clamp_pos_lion)
+      - neuron-free: `.w`, `.b_beta`, `.b_alpha`, `.b_th` —— 无约束 (β = sigmoid(w) 需要 w 自由取值;
+        b_* 是 modulation 偏置, 加 |..| 后才进 v_th(t))
+    其它 (Muon/Adam) 跟 build_muon_param_groups 一致。`neuron_lr_mult` 应用到 lion_lr。
     """
     from .param_groups import _partition_params_for_muon
 
     muon_params, adam_embed, adam_norm, adam_neuron = _partition_params_for_muon(model)
+
+    # 按 name 拆 neuron_pos (v_th + ahp) / neuron_free (其它)
+    name_by_id = {id(p): n for n, p in model.named_parameters()}
+    neuron_pos, neuron_free = [], []
+    for p in adam_neuron:
+        nm = name_by_id.get(id(p), "")
+        if nm.endswith((".v_th", ".ahp")):
+            neuron_pos.append(p)
+        else:
+            neuron_free.append(p)
+
     groups: list[dict] = []
     if muon_params:
         groups.append({
@@ -296,9 +319,19 @@ def build_muon_adam_lion_param_groups(
             "use_muon": False,
             "aux_kind": "adam",
         })
-    if adam_neuron:
+    if neuron_pos:
         groups.append({
-            "params": adam_neuron,
+            "params": neuron_pos,
+            "lr": lion_lr * neuron_lr_mult,
+            "betas": lion_betas,
+            "weight_decay": weight_decay_lion,
+            "use_muon": False,
+            "aux_kind": "lion",
+            "clamp_min": clamp_pos_lion,
+        })
+    if neuron_free:
+        groups.append({
+            "params": neuron_free,
             "lr": lion_lr * neuron_lr_mult,
             "betas": lion_betas,
             "weight_decay": weight_decay_lion,

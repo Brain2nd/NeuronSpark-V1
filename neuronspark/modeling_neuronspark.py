@@ -1913,6 +1913,28 @@ _fused_modulation = torch.compile(_fused_modulation_eager, backend='inductor', f
 # Kept as a flag for future experiments (e.g., if layer ckpt is removed).
 _FUSED_MODULATION_CHECKPOINT = False
 
+class LowRankLinear(nn.Module):
+    """y = A(B(x)), B:(in→r), A:(r→out), 无 bias. 低秩投影 (r≪min(in,out)).
+
+    P-A (见 docs/v4_status_and_roadmap.md §3): SNN block 的 D↔DN=16384 满秩投影
+    每帧执行 K 次, 是单 token 大头. 低秩分解 → 每帧 (in·r + r·out) vs (in·out),
+    K 步串行选择性动力学完全不动 (只是每次 matmul 低秩). 依据: Mamba 的 Δ 投影本就低秩.
+
+    暴露 .A / .B (nn.Linear) 供 SNNBlock 的结构化初始化做缩放 (output 侧 → A.weight, input 侧 → B.weight).
+    """
+    def __init__(self, in_features: int, out_features: int, rank: int):
+        super().__init__()
+        r = max(1, min(rank, in_features, out_features))
+        self.rank = r
+        self.B = nn.Linear(in_features, r, bias=False)
+        self.A = nn.Linear(r, out_features, bias=False)
+        nn.init.kaiming_uniform_(self.B.weight, a=math.sqrt(5))
+        nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        return self.A(self.B(x))
+
+
 class SNNBlock(MemoryModule):
     """
     单个 SNN Block（并行化）。
@@ -1921,6 +1943,7 @@ class SNNBlock(MemoryModule):
         D: 可见维度（Block 间通信的维度）
         N: 状态扩展因子（每个通道的隐神经元数）
         v_th_min: 动态阈值下限
+        proj_rank: 若设, D↔DN 投影 (W_in/W_beta_x/W_alpha_x/W_th_x/W_out) 用低秩 (rank=proj_rank); None=满秩
         surrogate_function: surrogate gradient 函数
     """
 
@@ -1929,25 +1952,26 @@ class SNNBlock(MemoryModule):
         D: int,
         N: int = 8,
         v_th_min: float = 0.1,
+        proj_rank: int | None = None,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
     ):
         super().__init__()
         self.D = D
         self.N = N
         self.v_th_min = v_th_min
+        self.proj_rank = proj_rank
         DN = D * N
 
-        # V4: 删除 V2.5 的因果卷积 (conv1d over TK 轴). 见 docs/v4_early_stop_design.md §1.1:
-        # 该 conv 沿 TK 轴卷把相邻 token 的 K 帧块耦合起来, 破坏 early-stop; Mamba-3
-        # (ICLR 2026) 也已证明 external short conv 可被递推内化、加回反而略降. 局部上下文
-        # 由 SNNAttentionDecoderLayer + 残差流承担.
+        # V4: 删除 V2.5 的因果卷积 (conv1d over TK 轴). 见 docs/v4_early_stop_design.md §1.1.
 
-        # ====== 六条并行输入投影（SNN 突触：连续激活输入） ======
-        self.W_in = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_beta_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_alpha_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_th_x = layer.Linear(D, DN, bias=False, step_mode='s')
-        self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')
+        # ====== 六条并行输入投影（SNN 突触）—— P-A: D↔DN 的用低秩 (若 proj_rank 设) ======
+        def _mk(i, o):
+            return LowRankLinear(i, o, proj_rank) if proj_rank else layer.Linear(i, o, bias=False, step_mode='s')
+        self.W_in = _mk(D, DN)
+        self.W_beta_x = _mk(D, DN)
+        self.W_alpha_x = _mk(D, DN)
+        self.W_th_x = _mk(D, DN)
+        self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')   # D→D 较小, 保持满秩
         self.W_skip = layer.Linear(D, D, bias=False, step_mode='s')
 
         # ====== β/α/V_th 仅依赖 x（无 W^(V)·V 项） ======
@@ -1957,8 +1981,8 @@ class SNNBlock(MemoryModule):
         self.b_alpha = nn.Parameter(torch.empty(DN))
         self.b_th = nn.Parameter(torch.empty(DN))
 
-        # ====== 输出投影：D*N → D（SNN 突触） ======
-        self.W_out = layer.Linear(DN, D, bias=False, step_mode='s')
+        # ====== 输出投影：D*N → D（SNN 突触）—— P-A: 低秩 (若 proj_rank 设) ======
+        self.W_out = _mk(DN, D)
 
         # ====== 隐状态空间神经元（D*N 个，动态参数） ======
         self.hidden_neuron = SelectivePLIFNode(
@@ -1988,17 +2012,25 @@ class SNNBlock(MemoryModule):
         self.b_alpha.data.normal_(0.5413, 0.1)
 
         # ====== 3. W^(x) 权重 ======
-        for lin in [self.W_in, self.W_gate, self.W_skip, self.W_out]:
+        # 低秩投影 (LowRankLinear) 的 A/B 已在其 __init__ 里 kaiming 过; 满秩 (layer.Linear) 这里 kaiming.
+        lr = self.proj_rank is not None
+        for lin in [self.W_gate, self.W_skip]:                       # D→D 始终满秩
             nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
-        for lin in [self.W_beta_x, self.W_alpha_x, self.W_th_x]:
-            nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
-            lin.weight.data.mul_(0.1)
+        if not lr:
+            for lin in [self.W_in, self.W_out]:
+                nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
+            for lin in [self.W_beta_x, self.W_alpha_x, self.W_th_x]:
+                nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
+                lin.weight.data.mul_(0.1)
+        else:
+            for lr_lin in [self.W_beta_x, self.W_alpha_x, self.W_th_x]:
+                lr_lin.A.weight.data.mul_(0.1)                        # 小 init (低秩: 缩 output 侧)
 
-        # ====== 4. W_in 时间尺度缩放 ======
+        # ====== 4. W_in 时间尺度缩放 (缩 output=DN 维) ======
         scale_per_n = torch.sqrt(1.0 - beta_values ** 2)  # (N,)
         scale_DN = scale_per_n.repeat(D)  # (D*N,)
         with torch.no_grad():
-            self.W_in.weight.mul_(scale_DN.unsqueeze(1))
+            (self.W_in.A.weight if lr else self.W_in.weight).mul_(scale_DN.unsqueeze(1))
 
         # ====== 5. b_th：σ_V 校准 ======
         # σ_V = sqrt(p/3) * sqrt(1 - β^{2K})
@@ -2020,12 +2052,12 @@ class SNNBlock(MemoryModule):
         self.b_th.data.copy_(b_th_per_n.repeat(D))
         self.b_th.data.add_(torch.empty_like(self.b_th).normal_(0, 0.02))
 
-        # ====== 6. W_out 发放率均衡缩放 ======
+        # ====== 6. W_out 发放率均衡缩放 (缩 input=DN 维) ======
         out_scale_per_n = 1.0 / torch.sqrt(target_p_fire)
         out_scale_per_n = out_scale_per_n / out_scale_per_n.mean()
         out_scale_DN = out_scale_per_n.repeat(D)
         with torch.no_grad():
-            self.W_out.weight.mul_(out_scale_DN.unsqueeze(0))
+            (self.W_out.B.weight if lr else self.W_out.weight).mul_(out_scale_DN.unsqueeze(0))
 
     def forward_parallel(self, h_seq: torch.Tensor, k_t: torch.Tensor, K: int, training: bool) -> torch.Tensor:
         """
@@ -2047,13 +2079,12 @@ class SNNBlock(MemoryModule):
         # ====== Phase 1: 批量投影（全部 TK 帧同时计算）======
         flat = h_seq.reshape(TK * batch, D)
 
-        I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
-        raw_beta = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
-        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
-        raw_th = F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN)
-        gate_all = torch.sigmoid(
-            F.linear(flat, self.W_gate.weight).reshape(TK, batch, D)
-        )
+        # P-A: W_in/W_beta_x/W_alpha_x/W_th_x/W_out 可能是 LowRankLinear → 用模块 __call__ (满秩 layer.Linear 也支持)
+        I_all = self.W_in(flat).reshape(TK, batch, DN)
+        raw_beta = self.W_beta_x(flat).reshape(TK, batch, DN)
+        raw_alpha = self.W_alpha_x(flat).reshape(TK, batch, DN)
+        raw_th = self.W_th_x(flat).reshape(TK, batch, DN)
+        gate_all = torch.sigmoid(F.linear(flat, self.W_gate.weight).reshape(TK, batch, D))
         I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
         # ====== Phase 1b: 融合激活（torch.compile → 单 kernel）======
@@ -2100,7 +2131,7 @@ class SNNBlock(MemoryModule):
         #   - 生物上对应"离子流过突触"的量, W_out 只对"真正发放"的神经元做 GEMM
         #   - 梯度 ∂output/∂V_pre = s (exact ReLU, 不需 surrogate)
         out_flat = output_hidden.reshape(TK * batch, DN)
-        I_out_all = F.linear(out_flat, self.W_out.weight).reshape(TK, batch, D)
+        I_out_all = self.W_out(out_flat).reshape(TK, batch, D)
         I_total_all = I_out_all * gate_all + I_skip_all  # (TK, batch, D)
 
         # 子层级 output_neuron 已移除，改由层级 K 帧聚合处理（模型级 output_neuron 仍保留于 model.py）
@@ -2336,13 +2367,14 @@ class SNNDecoderLayer(MemoryModule):
         num_layers: int = 1,
         layer_idx: int = 0,
         k_predictor_hidden: int | None = None,
+        snn_proj_rank: int | None = None,
     ):
         super().__init__()
         self.D = D
         self.K = K
 
         self.snn_block = SNNBlock(
-            D=D, N=N, v_th_min=v_th_min,
+            D=D, N=N, v_th_min=v_th_min, proj_rank=snn_proj_rank,
         )
         self.snn_ffn = SNNFFN(
             D=D, D_ff=D_ff,
@@ -2902,6 +2934,7 @@ class SNNLanguageModel(nn.Module):
         memory_layer_interval: int = 4,  # 0=禁用联想记忆层
         D_key: int = 128,
         D_value: int = 128,
+        snn_proj_rank: int | None = None,  # P-A: SNN block D↔DN 投影低秩 rank; None=满秩
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -2911,6 +2944,7 @@ class SNNLanguageModel(nn.Module):
         self.num_layers = num_layers
         self.D_ff = D_ff
         self.memory_layer_interval = memory_layer_interval
+        self.snn_proj_rank = snn_proj_rank
         self.v_th_min = v_th_min
         self.D_key = D_key
         self.D_value = D_value
@@ -2961,6 +2995,7 @@ class SNNLanguageModel(nn.Module):
                     K=K,
                     num_layers=num_layers,
                     layer_idx=i,
+                    snn_proj_rank=snn_proj_rank,
                 ))
                 self.layer_types.append('snn')
 
@@ -3417,14 +3452,16 @@ class SNNLanguageModel(nn.Module):
             groups['k_predictors'].extend(list(layer_module.block_k_predictor.net.parameters()))
             groups['k_predictors'].extend(list(layer_module.ffn_k_predictor.net.parameters()))
 
-            # SNNBlock 参数
-            groups['W_in'].append(block.W_in.weight)
-            groups['W_beta'].extend([block.W_beta_x.weight])
-            groups['W_alpha'].extend([block.W_alpha_x.weight])
-            groups['W_th'].extend([block.W_th_x.weight])
+            # SNNBlock 参数 — P-A: D↔DN 投影可能是 LowRankLinear (有 .A/.B 而非 .weight)
+            def _w_of(W):
+                return list(W.parameters()) if isinstance(W, LowRankLinear) else [W.weight]
+            groups['W_in'].extend(_w_of(block.W_in))
+            groups['W_beta'].extend(_w_of(block.W_beta_x))
+            groups['W_alpha'].extend(_w_of(block.W_alpha_x))
+            groups['W_th'].extend(_w_of(block.W_th_x))
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
-            groups['W_out'].append(block.W_out.weight)
+            groups['W_out'].extend(_w_of(block.W_out))
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
@@ -3465,6 +3502,7 @@ class NeuronSparkForCausalLM(PreTrainedModel):
             memory_layer_interval=config.memory_layer_interval,
             D_key=config.D_key,
             D_value=config.D_value,
+            snn_proj_rank=getattr(config, "snn_proj_rank", None),
         )
 
     def get_input_embeddings(self):

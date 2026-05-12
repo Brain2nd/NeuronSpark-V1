@@ -54,6 +54,7 @@ ap.add_argument("--freeze_vth", action="store_true", help="冻结所有 *.v_th �
 ap.add_argument("--freeze_beta", action="store_true", help="冻结所有 *.b_beta 参数")
 ap.add_argument("--freeze_ahp", action="store_true", help="冻结所有 *.ahp 参数")
 ap.add_argument("--ahp_init", type=float, default=0.02, help="AHP 初值（per-channel，use_ahp 时生效）")
+ap.add_argument("--vth_reg", type=float, default=0.0, help="PLIFNode.v_th 朝 init 的二次正则权重（0=关）")
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -90,7 +91,8 @@ print(f"data: {data_t.shape}, vocab {VOCAB}", flush=True)
 torch.manual_seed(42)
 cfg = NeuronSparkConfig(vocab_size=VOCAB, D=512, N=16, K=12, num_layers=12, D_ff=1024,
                         memory_layer_interval=4,
-                        spike_mode=args.spike_mode, use_ahp=args.use_ahp, ahp_init=args.ahp_init)
+                        spike_mode=args.spike_mode, use_ahp=args.use_ahp, ahp_init=args.ahp_init,
+                        v_th_reg_weight=args.vth_reg)
 model = NeuronSparkForCausalLM(cfg).to(DEV)
 for nm, p in model.named_parameters():
     if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):

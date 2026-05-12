@@ -1570,6 +1570,9 @@ class PLIFNode(MemoryModule):
         self.v_th = nn.Parameter(torch.empty(dim).uniform_(
             v_threshold * 0.05, v_threshold * 0.3,
         ))
+        # init 快照 (不持久化): v_th_reg_weight>0 时把 v_th 拉回 init, 防止它漂到 clamp floor
+        # (quantal 下 v_th→0 ⇒ spike 输出 v_th·s→0 ⇒ 下游 W 必须暴涨补偿 ⇒ SNNBlock 膜 runaway ⇒ NaN)
+        self.register_buffer('v_th_init', self.v_th.data.clone(), persistent=False)
         self.surrogate_function = surrogate_function
         self.spike_mode = NEURON_SPIKE_MODE
         self.surrogate_alpha = NEURON_SURROGATE_ALPHA
@@ -3641,6 +3644,11 @@ class NeuronSparkForCausalLM(PreTrainedModel):
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1), ignore_index=-100,
             )
+            vw = getattr(self.config, "v_th_reg_weight", 0.0)
+            if vw and vw > 0:
+                vth_reg = sum(((m.v_th - m.v_th_init) ** 2).mean()
+                              for m in self.modules() if isinstance(m, PLIFNode))
+                loss = loss + vw * vth_reg
         return CausalLMOutputWithPast(loss=loss, logits=logits)
 
     @classmethod

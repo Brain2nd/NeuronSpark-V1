@@ -25,6 +25,8 @@ class NeuronSparkConfig(PretrainedConfig):
         # 后超极化 (AHP / 不应期): 发放后膜额外下压 ahp (per-channel 可学), V_post -= ahp·𝟙[V_pre>v_th]
         use_ahp=False,
         ahp_init=0.0,  # ahp 参数初始值 (per-channel scalar)
+        # PLIFNode.v_th 朝 init 的二次正则 (打破 v_th↔下游W 的尺度冗余: v_th 漂到 floor → W_in 补偿性暴涨 → SNNBlock 膜 runaway → NaN). 0 = 关.
+        v_th_reg_weight=0.0,
         # v3 PonderNet fields (input-conditioned KPredictor)
         k_predictor_hidden=None,
         ponder_T_init=2.0,
@@ -54,6 +56,7 @@ class NeuronSparkConfig(PretrainedConfig):
         self.surrogate_alpha = surrogate_alpha
         self.use_ahp = use_ahp
         self.ahp_init = ahp_init
+        self.v_th_reg_weight = v_th_reg_weight
         # v3 PonderNet
         self.k_predictor_hidden = k_predictor_hidden
         self.ponder_T_init = ponder_T_init

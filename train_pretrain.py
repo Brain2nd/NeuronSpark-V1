@@ -100,7 +100,8 @@ def load_model(args) -> tuple[NeuronSparkForCausalLM, AutoTokenizer, torch.devic
                 cfg_kwargs = json.load(f)
         else:
             cfg_kwargs = {}
-        for k in ("vocab_size", "D", "N", "K", "num_layers", "D_ff", "v_th_min"):
+        for k in ("vocab_size", "D", "N", "K", "num_layers", "D_ff", "v_th_min",
+                  "spike_mode", "use_ahp", "ahp_init", "surrogate_alpha", "memory_layer_interval"):
             v = getattr(args, k, None)
             if v is not None:
                 cfg_kwargs[k] = v
@@ -266,6 +267,12 @@ def main():
     ap.add_argument("--num_layers", type=int, default=None)
     ap.add_argument("--D_ff", type=int, default=None)
     ap.add_argument("--v_th_min", type=float, default=None)
+    ap.add_argument("--memory_layer_interval", type=int, default=None)
+    ap.add_argument("--spike_mode", type=str, default=None, choices=[None, "supra", "quantal"],
+                    help="V4.1 spike form (only for fresh model; from-ckpt uses ckpt config). quantal needs --lsuv + --optimizer muon_adam_lion.")
+    ap.add_argument("--use_ahp", action="store_true", default=None)
+    ap.add_argument("--ahp_init", type=float, default=None)
+    ap.add_argument("--surrogate_alpha", type=float, default=None)
     # Data
     ap.add_argument("--data_path", required=True)
     ap.add_argument("--tokenizer_path", default="tokenizer_v3/")

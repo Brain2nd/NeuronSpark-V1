@@ -224,8 +224,10 @@ def main():
         ids, ap_, ans = make_batch(args.batch)
         opt.zero_grad()
         out = _fwd(model, ids)
-        logits_q = out.logits[torch.arange(args.batch, device=DEV), ap_].float()
-        loss = F.cross_entropy(logits_q, ans)
+        # 全序列 next-token CE（标准 MQAR 训练；中间 pair-list 位置也给梯度 → 表征训好 → induction circuit 学得出来）
+        logits = out.logits[:, :-1, :].float().reshape(-1, out.logits.shape[-1])
+        targets = ids[:, 1:].reshape(-1)
+        loss = F.cross_entropy(logits, targets)
         if not torch.isfinite(loss):
             log(f"  NaN at step {step}!"); break
         loss.backward()
@@ -233,7 +235,8 @@ def main():
         opt.step()
         if step % 200 == 0 or step == args.train_steps - 1:
             with torch.no_grad():
-                acc = (logits_q.argmax(-1) == ans).float().mean().item()
+                pred_q = out.logits[torch.arange(args.batch, device=DEV), ap_].argmax(-1)
+                acc = (pred_q == ans).float().mean().item()
             best_acc = max(best_acc, acc)
             log(f"  step {step:5d}: loss={float(loss):.4f}  train_recall_acc={acc:.3f}  best={best_acc:.3f}  ({(time.time()-t0)/(step+1)*1000:.0f} ms/step)")
     log(f"=== EVAL (recall acc by distance, {args.eval_samples} samples each) ===")

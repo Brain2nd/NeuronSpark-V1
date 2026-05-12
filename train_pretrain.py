@@ -279,15 +279,18 @@ def main():
     ap.add_argument("--accumulation_steps", type=int, default=64)
     ap.add_argument("--learning_rate", type=float, default=2e-4,
                     help="Base LR for Adam (non-Muon params). Neuron LR = base * neuron_lr_mult.")
-    ap.add_argument("--optimizer", choices=["muon", "adam"], default="muon",
-                    help="muon = MuonWithAuxAdam hybrid (default, forces ZeRO stage=0). "
-                         "adam = pure Adam.")
+    ap.add_argument("--optimizer", choices=["muon", "adam", "muon_adam_lion"], default="muon",
+                    help="muon = MuonWithAuxAdam hybrid (forces ZeRO stage=0). adam = pure Adam. "
+                         "muon_adam_lion = Muon(matrices)+Adam(embed/norm)+Lion(neuron scalars) "
+                         "(V4.1; forces ZeRO stage=0; recommended muon_lr≈0.005 lion_lr≈1e-4 for SNN).")
     ap.add_argument("--muon_lr", type=float, default=0.02,
-                    help="Muon LR for matrix params (only used when --optimizer muon).")
+                    help="Muon LR for matrix params (--optimizer muon: 0.02; --optimizer muon_adam_lion: 0.005 recommended).")
     ap.add_argument("--muon_momentum", type=float, default=0.95)
     ap.add_argument("--muon_variant", choices=["keller", "moonshot"], default="moonshot",
                     help="keller = KellerJordan original (max(1,m/n)^0.5 rectangular scaling). "
                          "moonshot = Moonshot RMS-match 0.2*max(m,n)^0.5 (paper 2025-02, scalable).")
+    ap.add_argument("--lion_lr", type=float, default=1e-4,
+                    help="Lion LR for neuron scalar params (only used when --optimizer muon_adam_lion).")
     ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
     ap.add_argument("--warmup_iters", type=int, default=500)
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -365,6 +368,35 @@ def main():
             f"(matrix→Muon lr={args.muon_lr} | "
             f"embed/norm→Adam lr={args.learning_rate} | "
             f"neuron→Adam lr={args.learning_rate * args.neuron_lr_mult})")
+    elif args.optimizer == "muon_adam_lion":
+        from utils.muon_adam_lion import MoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+        param_groups = build_muon_adam_lion_param_groups(
+            model,
+            muon_lr=args.muon_lr,
+            muon_momentum=args.muon_momentum,
+            adam_base_lr=args.learning_rate,
+            adam_embed_lr=args.learning_rate,
+            lion_lr=args.lion_lr,
+            neuron_lr_mult=args.neuron_lr_mult,
+        )
+        optimizer = MoonshotMuonAdamLion(param_groups)
+        # inject lr_mult AFTER init (validator forbids extra keys at init).
+        # NOTE: cosine_lr scheduler does `g["lr"] = cosine_lr(args.learning_rate, step) * lr_mult` each step
+        # (cosine_lr ramps 0→args.learning_rate over warmup then decays to /10). So set lr_mult = (target group lr / args.learning_rate)
+        # → the group's effective peak lr = the target. Muon → muon_lr; Lion → lion_lr (sign-based, NOT ×neuron_lr_mult — that boost
+        # was for Adam to overcome tiny neuron grads; Lion is magnitude-invariant); embed/norm Adam → args.learning_rate.
+        for g in optimizer.param_groups:
+            if g.get("use_muon"):
+                g["lr_mult"] = round(args.muon_lr / args.learning_rate, 6) if args.learning_rate > 0 else 1.0
+            elif g.get("aux_kind") == "lion":
+                g["lr_mult"] = round(args.lion_lr / args.learning_rate, 6) if args.learning_rate > 0 else 1.0
+            else:
+                g["lr_mult"] = 1.0               # embed/norm Adam groups
+        n_groups = {("muon" if g.get("use_muon") else g.get("aux_kind", "adam")): 0 for g in optimizer.param_groups}
+        for g in optimizer.param_groups:
+            n_groups[("muon" if g.get("use_muon") else g.get("aux_kind", "adam"))] += sum(p.numel() for p in g["params"])
+        log(f"Optimizer: MoonshotMuonAdamLion (matrix→Muon lr={args.muon_lr} | embed/norm→Adam lr={args.learning_rate} | "
+            f"neuron→Lion lr={args.lion_lr * args.neuron_lr_mult}, clamp v_th/ahp≥1e-4) | param-elems by kind: {n_groups}")
     elif args.optimizer == "adam":
         param_groups = build_param_groups(
             model, learning_rate=args.learning_rate, neuron_lr_mult=args.neuron_lr_mult,
@@ -372,7 +404,7 @@ def main():
         optimizer = torch.optim.Adam(param_groups)
         log(f"Optimizer: Adam (base lr={args.learning_rate}, neuron × {args.neuron_lr_mult})")
     else:
-        raise ValueError(f"Unknown --optimizer {args.optimizer}; choose 'muon' or 'adam'")
+        raise ValueError(f"Unknown --optimizer {args.optimizer}; choose 'muon', 'adam', or 'muon_adam_lion'")
 
     # DeepSpeed
     ds_cfg_path = getattr(args, "deepspeed_config", "ds_config.json")
@@ -382,10 +414,10 @@ def main():
     ds_cfg["gradient_accumulation_steps"] = args.accumulation_steps
     ds_cfg["gradient_clipping"] = args.grad_clip
     # Muon has its own distributed-update mechanism (round-robin params + all_gather),
-    # incompatible with ZeRO-2 optimizer sharding. Force ZeRO stage=0 when using Muon.
-    if args.optimizer == "muon":
+    # incompatible with ZeRO-2 optimizer sharding. Force ZeRO stage=0 when using Muon (or MAL).
+    if args.optimizer in ("muon", "muon_adam_lion"):
         ds_cfg.setdefault("zero_optimization", {})["stage"] = 0
-        log(f"  (Muon requires ZeRO stage=0, config overridden)")
+        log(f"  ({args.optimizer} requires ZeRO stage=0, config overridden)")
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_cfg,

@@ -176,6 +176,12 @@ def main():
     ap.add_argument("--accumulation_steps", type=int, default=32)
     ap.add_argument("--learning_rate", type=float, default=5e-5)
     ap.add_argument("--neuron_lr_mult", type=float, default=5.0)
+    ap.add_argument("--optimizer", choices=["adam", "muon", "muon_adam_lion"], default="adam",
+                    help="adam = pure Adam (default for SFT). muon / muon_adam_lion force ZeRO stage=0. "
+                         "muon_adam_lion = Muon(matrices)+Adam(embed/norm)+Lion(neuron) — V4.1; muon_lr≈0.005 lion_lr≈1e-4 recommended.")
+    ap.add_argument("--muon_lr", type=float, default=0.005)
+    ap.add_argument("--muon_momentum", type=float, default=0.95)
+    ap.add_argument("--lion_lr", type=float, default=1e-4)
     ap.add_argument("--warmup_iters", type=int, default=100)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--ponder_weight", type=float, default=0.0)
@@ -236,10 +242,38 @@ def main():
     log(f"  Promoted {n_fp32} neuron params to fp32")
 
     # Optimizer
-    param_groups = build_param_groups(
-        model, learning_rate=args.learning_rate, neuron_lr_mult=args.neuron_lr_mult,
-    )
-    optimizer = torch.optim.Adam(param_groups)
+    if args.optimizer == "muon":
+        from utils.muon_moonshot import MoonshotMuonWithAuxAdam
+        from utils.param_groups import build_muon_param_groups
+        param_groups = build_muon_param_groups(model, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+                                               adam_base_lr=args.learning_rate, adam_embed_lr=args.learning_rate,
+                                               neuron_lr_mult=args.neuron_lr_mult)
+        optimizer = MoonshotMuonWithAuxAdam(param_groups)
+        for g in optimizer.param_groups:
+            g["lr_mult"] = 1.0 if g.get("use_muon") else round(g["lr"] / args.learning_rate if args.learning_rate > 0 else 1.0, 4)
+        log(f"Optimizer: MoonshotMuonWithAuxAdam (muon_lr={args.muon_lr}, neuron×{args.neuron_lr_mult})")
+    elif args.optimizer == "muon_adam_lion":
+        from utils.muon_adam_lion import MoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+        param_groups = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, muon_momentum=args.muon_momentum,
+                                                          adam_base_lr=args.learning_rate, adam_embed_lr=args.learning_rate,
+                                                          lion_lr=args.lion_lr, neuron_lr_mult=args.neuron_lr_mult)
+        optimizer = MoonshotMuonAdamLion(param_groups)
+        # cosine_lr scheduler does g["lr"] = cosine_lr(args.learning_rate, step) * lr_mult each step → set lr_mult = target/args.learning_rate.
+        # Lion uses lion_lr directly (sign-based, no ×neuron_lr_mult boost); Muon uses muon_lr; embed/norm Adam uses args.learning_rate.
+        for g in optimizer.param_groups:
+            if g.get("use_muon"):
+                g["lr_mult"] = round(args.muon_lr / args.learning_rate, 6) if args.learning_rate > 0 else 1.0
+            elif g.get("aux_kind") == "lion":
+                g["lr_mult"] = round(args.lion_lr / args.learning_rate, 6) if args.learning_rate > 0 else 1.0
+            else:
+                g["lr_mult"] = 1.0
+        log(f"Optimizer: MoonshotMuonAdamLion (muon_lr={args.muon_lr}, lion_lr={args.lion_lr}, clamp v_th/ahp≥1e-4)")
+    else:
+        param_groups = build_param_groups(
+            model, learning_rate=args.learning_rate, neuron_lr_mult=args.neuron_lr_mult,
+        )
+        optimizer = torch.optim.Adam(param_groups)
+        log(f"Optimizer: Adam (base lr={args.learning_rate}, neuron×{args.neuron_lr_mult})")
 
     # DeepSpeed
     ds_cfg_path = getattr(args, "deepspeed_config", "ds_config.json")
@@ -248,6 +282,9 @@ def main():
     ds_cfg["train_micro_batch_size_per_gpu"] = args.batch_size
     ds_cfg["gradient_accumulation_steps"] = args.accumulation_steps
     ds_cfg["gradient_clipping"] = args.grad_clip
+    if args.optimizer in ("muon", "muon_adam_lion"):
+        ds_cfg.setdefault("zero_optimization", {})["stage"] = 0
+        log(f"  ({args.optimizer} requires ZeRO stage=0, config overridden)")
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=model, optimizer=optimizer, config=ds_cfg,

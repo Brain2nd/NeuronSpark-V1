@@ -1,88 +1,157 @@
-"""Track B / B1 — Induction Heads (Mamba §4.1 招牌合成任务).
+"""Track B / B1 — Induction Heads (Mamba §4.1.2 招牌合成任务 + 长度外推).
 
-任务: 序列里某个早期位置 p 放一个 SPECIAL token, 紧跟一个随机 X token; 序列末位再放 SPECIAL;
-要求模型在末位预测 X (= "上次 SPECIAL 后面跟的那个 token"). 这是关联召回 + **长度外推** 的金标准:
-训短序列 (~256) → 测外推到远超训练长度的序列, Mamba/SSM/线性注意力外推不掉点, softmax-attention 掉.
+任务 (严格照 HazyResearch/safari `src/dataloaders/synthetics.py::generate_induction_head`):
+  序列 = [input_seq_len 个随机 token, COPY_PREFIX] —— 然后在前面随机 num_triggers 个位置插入
+  COPY_PREFIX, 紧跟 induction_len 个 "to_copy" token (= 第一个 trigger 后面那几个原始随机 token);
+  最后把 to_copy 再拼到序列尾部. 模型当作**标准自回归 LM** 训 —— 在第一个 COPY_PREFIX 之后的每个
+  位置上算 next-token CE loss (前面随机段 mask 掉 -100, 学不了也不该学). "答案" = 序列尾部那
+  induction_len 个 to_copy token (跟在最后一个 COPY_PREFIX 后面, 模型必须靠 induction head 召回).
 
-测: V4.1 (含 SNNAttention) vs (可选) V4.1-no-SNNAttention-xpos 消融 vs (可选) 极简 RoPE-Transformer baseline.
-报: answer accuracy (argmax(logits[:,-1,:]) == X) vs eval seq_len.
+长度外推: 训短序列 (train_len ~64-256) → eval 时把 input_seq_len 拉到远超训练长度, 报答案
+  token 准确率 vs eval seq_len. Mamba / SSM / 线性注意力外推不掉点; softmax-attention 掉点.
 
-用法: CUDA_VISIBLE_DEVICES=N python scripts/v4_induction_heads.py --model v4 --train_len 256 --steps 5000 \
-        [--D 256 --N 8 --K 8 --num_layers 6 --D_ff 512 --vocab 64 --batch 32 --no_xpos] [--out log.txt]
+模型: v4 (NeuronSpark, 含 SNNAttention) / v4 --no_xpos (关 SNNAttention 跨位置混合, 消融) /
+      transformer (RoPE baseline, 用来 sanity-check 配方 —— 它在 in-dist 上必须学到 ~100%).
+
+参考超参 (safari induction_head config): vocab~16-20, 小模型 (d~32-64, 2-4 层), AdamW lr=5e-4
+  wd=0.1 + cosine warmup, batch 32, 训到收敛 (~40k+ 步, 见 Mamba issue #62). v4 用自己的 MAL.
+
+用法: CUDA_VISIBLE_DEVICES=N python scripts/v4_induction_heads.py --model v4 --train_len 256 \
+        --steps 40000 [--vocab 16 --induction_len 1 --batch 32 --no_xpos] [--out log.txt]
 """
-import sys, os, time, argparse, math
+import sys, os, math, argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default="v4", choices=("v4", "transformer"))
-ap.add_argument("--train_len", type=int, default=256)
-ap.add_argument("--steps", type=int, default=5000)
+ap.add_argument("--train_len", type=int, default=64, help="训练时 input_seq_len (随机段长度; 总序列 = +1 COPY_PREFIX +induction_len 尾巴)")
+ap.add_argument("--steps", type=int, default=40000)
 ap.add_argument("--batch", type=int, default=32)
-ap.add_argument("--vocab", type=int, default=64, help="token 词表 (含 1 个 SPECIAL = vocab-1)")
-ap.add_argument("--lr", type=float, default=3e-4)
-# v4 config
-ap.add_argument("--D", type=int, default=256)
+ap.add_argument("--vocab", type=int, default=16, help="普通 token 数; COPY_PREFIX = vocab (embedding 大小 = vocab+1)")
+ap.add_argument("--induction_len", type=int, default=1, help="每个 trigger 后要复制的 token 数 (=尾部答案长度)")
+ap.add_argument("--num_triggers", type=int, default=1, help="序列中插入 COPY_PREFIX 的次数 (0.5 概率强制为 1, 同 safari)")
+ap.add_argument("--lr", type=float, default=5e-4)
+ap.add_argument("--wd", type=float, default=0.1)
+ap.add_argument("--warmup_frac", type=float, default=0.05)
+ap.add_argument("--lr_min_frac", type=float, default=0.1, help="cosine 衰减的下限 (× base lr)")
+ap.add_argument("--clip", type=float, default=1.0)
+ap.add_argument("--log_every", type=int, default=1000)
+ap.add_argument("--seed", type=int, default=0)
+# v4 config (小模型)
+ap.add_argument("--D", type=int, default=64)
 ap.add_argument("--N", type=int, default=8)
 ap.add_argument("--K", type=int, default=8)
-ap.add_argument("--num_layers", type=int, default=6)
-ap.add_argument("--D_ff", type=int, default=512)
+ap.add_argument("--num_layers", type=int, default=4)
+ap.add_argument("--D_ff", type=int, default=128)
 ap.add_argument("--memory_layer_interval", type=int, default=2)
-ap.add_argument("--D_key", type=int, default=32)
-ap.add_argument("--D_value", type=int, default=32)
-ap.add_argument("--no_xpos", action="store_true", help="(v4) 关掉 SNNAttention 的跨位置 cumsum 混合 → 消融")
-# transformer baseline config
-ap.add_argument("--t_d", type=int, default=256)
-ap.add_argument("--t_layers", type=int, default=4)
-ap.add_argument("--t_heads", type=int, default=4)
+ap.add_argument("--D_key", type=int, default=16)
+ap.add_argument("--D_value", type=int, default=16)
+ap.add_argument("--no_xpos", action="store_true", help="(v4) 关掉 SNNAttention 跨位置 cumsum 混合 → 消融")
+ap.add_argument("--muon_lr", type=float, default=0.005)
+ap.add_argument("--adam_lr", type=float, default=2e-4)
+ap.add_argument("--lion_lr", type=float, default=1e-4)
+# transformer baseline config (小, 同 safari 量级但用 RoPE 以支持外推对照)
+ap.add_argument("--t_d", type=int, default=64)
+ap.add_argument("--t_layers", type=int, default=2)
+ap.add_argument("--t_heads", type=int, default=2)
 ap.add_argument("--eval_lens", default="64,128,256,512,1024,2048,4096,8192,16384")
-ap.add_argument("--eval_batch", type=int, default=16)
+ap.add_argument("--eval_examples", type=int, default=512)
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
-SPECIAL = args.vocab - 1
+COPY_PREFIX = args.vocab           # special token id
+EMB_SIZE = args.vocab + 1          # embedding / output dim
+IGN = -100
 LOGF = open(args.out, "a") if args.out else None
 def log(s):
     print(s, flush=True)
     if LOGF: LOGF.write(s + "\n"); LOGF.flush()
 
 
-def make_batch(B, L, gen):
-    """[t0..., SPECIAL@p, X@p+1, ..., SPECIAL@(L-1)]; target at pos L-1 (next-token) = X.
-    其余 token ∈ [0, vocab-2); SPECIAL 只出现在 p 和 L-1; X ∈ [0, vocab-2)."""
-    seq = torch.randint(0, args.vocab - 1, (B, L), generator=gen, device=DEV)
-    p = torch.randint(1, L - 2, (B,), generator=gen, device=DEV)            # needle 位置 (留 X 的位置 + 不撞末位)
-    X = torch.randint(0, args.vocab - 1, (B,), generator=gen, device=DEV)   # 答案 token
-    ar = torch.arange(B, device=DEV)
-    seq[ar, p] = SPECIAL
-    seq[ar, p + 1] = X
-    seq[:, L - 1] = SPECIAL
-    return seq, X
+# ---------------- data: induction-heads (port of safari generate_induction_head) ----------------
+_torch_gen = torch.Generator(device=DEV)
+
+def _make_labels(ids_t, first_cp, T):
+    labels = ids_t.clone()
+    pos = torch.arange(T, device=DEV)[None, :]
+    labels[pos <= first_cp[:, None]] = IGN
+    return labels
+
+def make_batch(B, input_seq_len, np_rng):
+    """返回 (ids[B,T], labels[B,T], T) ; T = input_seq_len + 1 + induction_len.
+    labels = next-token target, 第一个 COPY_PREFIX 之前(含)的位置设 IGN. 尾部 induction_len 个 = 答案.
+    nt==1 走全向量化 (快); nt>1 走 per-example python 循环 (照 safari spacing filter)."""
+    il = args.induction_len
+    T = input_seq_len + 1 + il
+    if args.num_triggers == 1:
+        seq = torch.randint(0, args.vocab, (B, input_seq_len), generator=_torch_gen, device=DEV)
+        cp_col = torch.full((B, 1), COPY_PREFIX, device=DEV, dtype=seq.dtype)
+        seq = torch.cat([seq, cp_col], dim=1)                                   # (B, input_seq_len+1), pos input_seq_len = COPY_PREFIX
+        p = torch.randint(0, input_seq_len - (1 + il), (B,), generator=_torch_gen, device=DEV)  # trigger 位置
+        ar = torch.arange(B, device=DEV)
+        copy_idx = p[:, None] + 1 + torch.arange(il, device=DEV)[None, :]        # (B, il)
+        to_copy = torch.gather(seq, 1, copy_idx)                                 # (B, il) = trigger 后的 il 个原始 token
+        seq[ar, p] = COPY_PREFIX                                                 # 插入 trigger (后面的 il 个 token 本就是 to_copy, 无需改)
+        ids_t = torch.cat([seq, to_copy], dim=1)                                 # (B, T)
+        return ids_t, _make_labels(ids_t, p, T), T
+    # nt > 1: per-example
+    ids = np.empty((B, T), dtype=np.int64)
+    first_cp = np.empty(B, dtype=np.int64)
+    for b in range(B):
+        s = np_rng.integers(0, args.vocab, size=input_seq_len).tolist()
+        s.append(COPY_PREFIX)
+        nt = 1 if np_rng.uniform() < 0.5 else args.num_triggers
+        raw = np.sort(np_rng.integers(input_seq_len - (1 + il), size=max(nt, 1)))
+        pf = []
+        for i, q in enumerate(raw):
+            if i == 0 or q - pf[-1] > il:
+                pf.append(int(q))
+        tc = [s[pf[0] + 1 + i] for i in range(il)]
+        for q in pf:
+            s[q] = COPY_PREFIX
+            for i in range(il):
+                s[q + 1 + i] = tc[i]
+        ids[b] = s + tc
+        first_cp[b] = pf[0]
+    ids_t = torch.from_numpy(ids).to(DEV)
+    return ids_t, _make_labels(ids_t, torch.from_numpy(first_cp).to(DEV), T), T
+
+
+def lm_loss(logits, labels):
+    """next-token CE: logits[:, :-1] 预测 labels[:, 1:]. labels 里 IGN 的位置不算."""
+    return F.cross_entropy(logits[:, :-1].reshape(-1, logits.size(-1)), labels[:, 1:].reshape(-1), ignore_index=IGN)
+
+
+def answer_acc(logits, ids, T):
+    """尾部 induction_len 个 token 的预测准确率 (= induction-head 召回是否对). 位置 [T-il, T-1] 由 logits[T-il-1, T-2] 预测."""
+    il = args.induction_len
+    pred = logits[:, T - il - 1: T - 1, :].argmax(-1)  # (B, il)
+    tgt = ids[:, T - il:]                              # (B, il)
+    return (pred == tgt).float().mean().item()
 
 
 # ---------------- models ----------------
 def build_v4():
     from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
-    cfg = NeuronSparkConfig(vocab_size=args.vocab, D=args.D, N=args.N, K=args.K, num_layers=args.num_layers,
+    cfg = NeuronSparkConfig(vocab_size=EMB_SIZE, D=args.D, N=args.N, K=args.K, num_layers=args.num_layers,
                             D_ff=args.D_ff, memory_layer_interval=args.memory_layer_interval,
                             D_key=args.D_key, D_value=args.D_value, spike_mode="quantal", use_ahp=False)
     m = NeuronSparkForCausalLM(cfg).to(DEV)
     for n, p in m.named_parameters():
-        p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含神经元参数 —— canonical 配置, MAL+SR 训得动)
+        p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含逐通道神经元参数 —— canonical 配置, MAL+SR 训得动)
     if args.no_xpos:
-        # 关掉 SNNAttention 跨位置混合: M_all 不做 cumsum (每位置独立), 不携带 M_state.
         from neuronspark.modeling_neuronspark import SNNAttentionDecoderLayer
         _orig = SNNAttentionDecoderLayer.forward_parallel
         def _no_xpos_fwd(self, h):
-            # 临时 monkeypatch torch.cumsum 让它在本次调用里变成恒等 (只影响 M_all = cumsum(kv_gated))
             real_cumsum = torch.cumsum
-            torch.cumsum = lambda x, dim=0: x  # noqa
+            torch.cumsum = lambda x, dim=0: x  # noqa  (只影响本次 forward 里 M_all = cumsum(kv_gated))
             try:
-                # 也把 M_state 续传关掉: 临时设成 0.
-                saved = self.M_state; self.M_state = 0.
+                self.M_state = 0.
                 out = _orig(self, h)
             finally:
                 torch.cumsum = real_cumsum
@@ -94,6 +163,7 @@ def build_v4():
         log("[v4] SNNAttention cross-position mixing DISABLED (no_xpos ablation)")
     return m
 
+
 class RoPEAttn(nn.Module):
     def __init__(self, d, h):
         super().__init__(); self.h = h; self.dh = d // h
@@ -102,8 +172,8 @@ class RoPEAttn(nn.Module):
         self.register_buffer("inv", inv, persistent=False)
     def rope(self, x):  # x: (B,H,T,dh)
         T = x.shape[-2]
-        pos = torch.arange(T, device=x.device).float()
-        ang = torch.outer(pos, self.inv)  # (T, dh/2)
+        pos = torch.arange(T, device=x.device, dtype=torch.float32)
+        ang = torch.outer(pos, self.inv)
         cos = ang.cos().repeat_interleave(2, -1)[None, None]; sin = ang.sin().repeat_interleave(2, -1)[None, None]
         x1 = x[..., ::2]; x2 = x[..., 1::2]
         rot = torch.stack([-x2, x1], -1).flatten(-2)
@@ -115,6 +185,7 @@ class RoPEAttn(nn.Module):
         q = self.rope(q); k = self.rope(k)
         o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         return self.o(o.transpose(1, 2).reshape(B, T, d))
+
 
 class TinyGPT(nn.Module):
     def __init__(self, vocab, d, layers, heads):
@@ -132,6 +203,7 @@ class TinyGPT(nn.Module):
             x = x + b["attn"](b["n1"](x)); x = x + b["mlp"](b["n2"](x))
         return self.head(self.nf(x))
 
+
 def fwd_logits(model, ids):
     if args.model == "v4":
         from neuronspark.modeling_neuronspark import functional
@@ -139,49 +211,69 @@ def fwd_logits(model, ids):
         with torch.amp.autocast(DEV, dtype=torch.bfloat16):
             out = model(input_ids=ids)
         return out.logits.float()
-    else:
-        return model(ids).float()
+    return model(ids).float()
 
 
 # ---------------- train ----------------
-torch.manual_seed(0)
-model = build_v4() if args.model == "v4" else TinyGPT(args.vocab, args.t_d, args.t_layers, args.t_heads).to(DEV)
+torch.manual_seed(args.seed)
+model = build_v4() if args.model == "v4" else TinyGPT(EMB_SIZE, args.t_d, args.t_layers, args.t_heads).to(DEV)
 n_p = sum(p.numel() for p in model.parameters()) / 1e6
-log(f"=== model={args.model} params={n_p:.2f}M train_len={args.train_len} steps={args.steps} vocab={args.vocab} ===")
+log(f"=== model={args.model} params={n_p:.3f}M | train_len={args.train_len} il={args.induction_len} nt={args.num_triggers} "
+    f"| steps={args.steps} batch={args.batch} vocab={args.vocab}(+1) | seed={args.seed} ===")
+
 if args.model == "v4":
-    # canonical 配置: MAL (Muon matrices + Adam embed/norm + Lion 逐通道神经元参数 .w/.v_th/.ahp, bf16+SR)
     from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
-    pg = build_muon_adam_lion_param_groups(model, muon_lr=0.005, adam_base_lr=2e-4, adam_embed_lr=2e-4,
-                                           lion_lr=1e-4, neuron_lr_mult=1.0, weight_decay_muon=0.01)
+    pg = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, adam_base_lr=args.adam_lr, adam_embed_lr=args.adam_lr,
+                                           lion_lr=args.lion_lr, neuron_lr_mult=1.0, weight_decay_muon=0.01)
     opt = SingleDeviceMoonshotMuonAdamLion(pg)
-    log("[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon_lr=0.005 adam=2e-4 lion=1e-4)")
+    log(f"[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon={args.muon_lr} adam={args.adam_lr} lion={args.lion_lr})")
 else:
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-gen = torch.Generator(device=DEV).manual_seed(123)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    log(f"[transformer] optimizer = AdamW (lr={args.lr} wd={args.wd})")
+
+base_lrs = [g["lr"] for g in opt.param_groups]
+warmup = max(1, int(args.steps * args.warmup_frac))
+def lr_scale(step):  # linear warmup → cosine decay to lr_min_frac×
+    if step < warmup:
+        return step / warmup
+    prog = (step - warmup) / max(1, args.steps - warmup)
+    f = args.lr_min_frac
+    return f + (1 - f) * 0.5 * (1 + math.cos(math.pi * prog))
+
+np_rng = np.random.default_rng(123); _torch_gen.manual_seed(123)
 model.train()
 for step in range(args.steps):
-    ids, X = make_batch(args.batch, args.train_len, gen)
+    sc = lr_scale(step)
+    for g, blr in zip(opt.param_groups, base_lrs):
+        g["lr"] = blr * sc
+    ids, labels, T = make_batch(args.batch, args.train_len, np_rng)
     logits = fwd_logits(model, ids)
-    loss = F.cross_entropy(logits[:, -1, :], X)   # 只在答案位置 (末位的 next-token) 上训
+    loss = lm_loss(logits, labels)
     opt.zero_grad(); loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
-    if step % 200 == 0 or step == args.steps - 1:
+    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip); opt.step()
+    if step % args.log_every == 0 or step == args.steps - 1:
         with torch.no_grad():
-            acc = (logits[:, -1, :].argmax(-1) == X).float().mean().item()
-        log(f"  step {step:5d}: loss={loss.item():.4f}  train_acc={acc:.3f}")
+            aacc = answer_acc(logits, ids, T)
+        log(f"  step {step:6d}: lr×{sc:.3f} loss={loss.item():.4f}  answer_acc={aacc:.3f}")
 
-# ---------------- eval extrapolation ----------------
+# ---------------- eval: length extrapolation ----------------
 model.eval()
-geval = torch.Generator(device=DEV).manual_seed(999)
-log("=== extrapolation: answer accuracy vs eval seq_len (train_len={}) ===".format(args.train_len))
+np_eval = np.random.default_rng(999); _torch_gen.manual_seed(999)
+log(f"=== extrapolation: answer token accuracy vs eval input_seq_len (train_len={args.train_len}) ===")
 for L in [int(x) for x in args.eval_lens.split(",")]:
-    B = args.eval_batch if L <= 4096 else max(4, args.eval_batch // 4)
-    n_correct = n_total = 0
-    n_iter = max(1, 256 // B)
+    if L < args.induction_len + 2:
+        continue
+    B = args.batch if L <= 2048 else max(2, args.batch // 8)
+    n_corr = n_tot = 0
+    n_iter = max(1, args.eval_examples // B)
     with torch.no_grad():
         for _ in range(n_iter):
-            ids, X = make_batch(B, L, geval)
+            ids, labels, T = make_batch(B, L, np_eval)
             logits = fwd_logits(model, ids)
-            n_correct += (logits[:, -1, :].argmax(-1) == X).sum().item(); n_total += B
-    log(f"  seq_len={L:6d}: acc={n_correct/n_total:.3f}  ({n_correct}/{n_total})  [{'IN-DIST' if L<=args.train_len else 'EXTRAPOL'}]")
+            il = args.induction_len
+            pred = logits[:, T - il - 1: T - 1, :].argmax(-1)
+            tgt = ids[:, T - il:]
+            n_corr += (pred == tgt).all(dim=1).sum().item(); n_tot += B
+    tag = "IN-DIST" if L <= args.train_len else "EXTRAPOL"
+    log(f"  input_seq_len={L:7d}: exact-answer acc={n_corr/n_tot:.3f}  ({n_corr}/{n_tot})  [{tag}]")
 log("=== DONE ===")

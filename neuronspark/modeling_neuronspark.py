@@ -1567,9 +1567,15 @@ class PLIFNode(MemoryModule):
         # 为让初始发放率贴近 40-50% 的健康区 (不是 dead-ReLU 区), v_th 初始范围
         # 从旧 [0.5x, 1.5x] 缩小到 [0.05x, 0.3x]×v_threshold (均值约 0.18×).
         # 每维保持多样性 (不同神经元有不同时间尺度 + 不同阈值).
-        self.v_th = nn.Parameter(torch.empty(dim).uniform_(
-            v_threshold * 0.05, v_threshold * 0.3,
-        ))
+        if NEURON_SPIKE_MODE == "quantal":
+            # quantal: spike 输出 = v_th·s —— v_th 直接是输出幅度. supra 那套小阈值 (高发放率)
+            # 在 quantal 下 = 微小输出 → 下游 W (e.g. SNNBlock.W_in) 必须暴涨补偿 → SNNBlock 膜
+            # 稳态 ~u/(1-β) 跟着暴涨 → backward grad 溢出 → NaN. 故 init 到 O(0.1) 的"正常激活"量级.
+            self.v_th = nn.Parameter(torch.empty(dim).uniform_(0.15, 0.40))
+        else:  # supra (bio-ReLU): output = relu(V_pre - v_th), 小阈值 → 发放率贴近健康区 30-50%
+            self.v_th = nn.Parameter(torch.empty(dim).uniform_(
+                v_threshold * 0.05, v_threshold * 0.3,
+            ))
         # init 快照 (不持久化): v_th_reg_weight>0 时把 v_th 拉回 init, 防止它漂到 clamp floor
         # (quantal 下 v_th→0 ⇒ spike 输出 v_th·s→0 ⇒ 下游 W 必须暴涨补偿 ⇒ SNNBlock 膜 runaway ⇒ NaN)
         self.register_buffer('v_th_init', self.v_th.data.clone(), persistent=False)
@@ -2087,16 +2093,18 @@ class SNNBlock(MemoryModule):
         # ====== 参数初始化 ======
         self._initialize_parameters()
 
-    # SNNBlock 输入 v_in (input 神经元脉冲输出) 的典型 DC 估计 (v_th_in·fire_rate at init).
-    # 用于把 β/α/v_th 的 per-channel init 目标换算成 W_*_x 的行偏移. 偏保守 (实际可能略大或略小):
-    # 估高 → β init 偏低 (短时间常数, 安全, 远离膜 runaway); 估低 → β init 偏高. 靠 LSUV/训练修.
-    _V_IN_DC_EST = 0.02
-
     def _initialize_parameters(self):
         """功能引导初始化 (无 bias —— β/α/v_th 的 per-channel init 多样性 fold 进 W_*_x 行偏移)。"""
         D, N = self.D, self.N
         DN = D * N
         K_ref = 16
+
+        # SNNBlock 输入 v_in (input 神经元脉冲输出) 的典型 DC 估计 (≈ v_th_in·fire_rate at init).
+        # quantal: input 神经元 v_th_in init~0.15-0.4 (PLIFNode), fire~0.3 → v̄_in≈0.08.
+        # supra:   output=relu(V_pre-v_th), V_pre~N(0,σ), v̄_in≈σ·0.4≈0.15.
+        # 用于把 β/α/v_th 的 per-channel init 目标换算成 W_*_x 行偏移; 估计粗 (实际可能偏 ~2x →
+        # β init 范围偏一些), 靠 LSUV/训练修. 估高 → β init 偏低 (安全, 远离膜 runaway).
+        dc_est = 0.08 if NEURON_SPIKE_MODE == "quantal" else 0.15
 
         # 目标 β 分布：多时间尺度 [0.80, 0.99]
         beta_values = torch.linspace(0.80, 0.99, N)
@@ -2124,9 +2132,9 @@ class SNNBlock(MemoryModule):
         raw_th_target_per_n = torch.clamp(target_V_th - self.v_th_min, min=0.05)  # |W_th_x(x)| 的目标
 
         # ====== 4. 把 β/α/v_th 的 init 目标 fold 进 W_*_x 的行偏移 ======
-        # v_in 非负, 典型 DC ≈ _V_IN_DC_EST → W_*_x(v_in)[i] ≈ (行偏移_i)·Σ_j v_in_j ≈ 行偏移_i·D·DC.
-        # 令其 = 目标_i → 行偏移_i = 目标_i / (D·DC). 加 per-channel 抖动打破 D 通道对称.
-        S = D * self._V_IN_DC_EST
+        # v_in 非负, 典型 DC ≈ dc_est → W_*_x(v_in)[i] ≈ (行偏移_i)·Σ_j v_in_j ≈ 行偏移_i·D·dc_est.
+        # 令其 = 目标_i → 行偏移_i = 目标_i / (D·dc_est). 加 per-channel 抖动打破 D 通道对称.
+        S = D * dc_est
         with torch.no_grad():
             raw_beta_target = torch.log(beta_values / (1.0 - beta_values)).repeat(D)
             raw_beta_target = raw_beta_target + torch.empty(DN).normal_(0, 0.1)

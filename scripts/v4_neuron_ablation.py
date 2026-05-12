@@ -40,6 +40,8 @@ ap.add_argument("--adam_base_lr", type=float, default=2e-4)
 ap.add_argument("--lion_lr", type=float, default=5e-4)
 ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
 ap.add_argument("--save_to", default=None, help="跑完保存 {state_dict, config, ...} 到此路径 (用于后续分析)")
+ap.add_argument("--lsuv", action="store_true", help="训练前跑 LSUV v2 初始化 (校准 v_th + scale W_in 让 hidden 发放 ~lsuv_target_p)")
+ap.add_argument("--lsuv_target_p", type=float, default=0.3)
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -114,6 +116,10 @@ def run_one(name, overrides):
     for _, b in model.named_buffers():
         if b.is_floating_point():
             b.data = b.data.to(torch.bfloat16)
+    if args.lsuv:
+        from utils.lsuv_snn_init import lsuv_snn_init
+        lsuv_snn_init(model, data_t[:2, :min(SEQ, 128)], target_p_fire=args.lsuv_target_p, n_passes=3, verbose=False)
+        log(f"  [{name}] LSUV v2 init applied (target p_fire={args.lsuv_target_p})")
     model.train()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     n_ahp = sum(1 for nm, _ in model.named_parameters() if nm.endswith('.ahp'))

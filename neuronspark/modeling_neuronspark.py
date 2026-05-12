@@ -1590,8 +1590,8 @@ class PLIFNode(MemoryModule):
 
     @property
     def beta(self):
-        """D 维衰减率 β = sigmoid(w)，值域 (0, 1)。"""
-        return torch.sigmoid(self.w)
+        """逐通道衰减率 β = sigmoid(w)，卡在 ≤0.99 (见 _BETA_LOGIT_MAX): β=1.0 (bf16 round) → 膜成无界积分器 → NaN。"""
+        return torch.sigmoid(torch.clamp(self.w, max=_BETA_LOGIT_MAX))
 
     def forward(self, x):
         """单步 PLIF 前向 (V_pre = β·V_{t-1} + (1-β)·x → fire → reset)。spike_mode/ahp 见 _spike_step。"""
@@ -2016,11 +2016,17 @@ class SNNFFN(MemoryModule):
 # 7-8 separate element-wise kernels → 1 fused kernel, ~4x speedup on DN-sized tensors.
 # First call triggers JIT compilation (~seconds); cached for subsequent calls.
 
+# β 的硬上界 = sigmoid(_BETA_LOGIT_MAX) ≈ 0.99 (= 设计文档声明的最大基准记忆时间常数 τ≤~100 K-step).
+# 必须 < 1: 否则 bf16 把 sigmoid(>~0.998) round 成 exactly 1.0 → 膜递归 V_pre=1.0·V_prev+u 成无界积分器
+# → 膜随 u (Muon 推大 W_in/W_alpha) 无界涨 → backward grad_β∝V 溢出 → NaN. 卡在 0.99 后 1−β≥~0.0098 → 膜稳态 ≤~102·u, 有界.
+_BETA_LOGIT_MAX = 4.595119850134589  # = math.log(0.99 / 0.01)
+
+
 def _fused_modulation_eager(raw_beta, raw_alpha, raw_th, v_th_min, I_all):
     """Plain-Python modulation: sigmoid + softplus + abs + multiply.
     选择性方程: β/α/v_th 全由 raw = W_*_x(x) 给出 (无 bias —— per-channel init 多样性
-    已 fold 进 W_*_x 的行偏移, 见 SNNBlock._initialize_parameters)."""
-    beta = torch.sigmoid(raw_beta)
+    已 fold 进 W_*_x 的行偏移, 见 SNNBlock._initialize_parameters). β 卡在 ≤0.99 (见 _BETA_LOGIT_MAX)."""
+    beta = torch.sigmoid(torch.clamp(raw_beta, max=_BETA_LOGIT_MAX))
     alpha = F.softplus(raw_alpha)
     v_th = v_th_min + torch.abs(raw_th)
     u = alpha * I_all
@@ -2247,8 +2253,8 @@ class SNNBlock(MemoryModule):
 
         I_t = self.W_in(x)
 
-        # β/α/v_th 选择性调制仅依赖 x (无 bias —— init 多样性已 fold 进 W_*_x 行偏移)
-        beta = torch.sigmoid(self.W_beta_x(x))
+        # β/α/v_th 选择性调制仅依赖 x (无 bias —— init 多样性已 fold 进 W_*_x 行偏移); β 卡在 ≤0.99 (见 _BETA_LOGIT_MAX)
+        beta = torch.sigmoid(torch.clamp(self.W_beta_x(x), max=_BETA_LOGIT_MAX))
         alpha = F.softplus(self.W_alpha_x(x))
         v_th = self.v_th_min + torch.abs(self.W_th_x(x))
 

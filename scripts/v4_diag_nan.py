@@ -18,7 +18,24 @@ import numpy as np
 import torch
 from collections import defaultdict, deque
 from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
+import neuronspark.modeling_neuronspark as _M
 from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+
+# ---- monkeypatch segmented PLIF to capture max|V_post| per call (membrane runaway probe) ----
+_VPOST_TRACE = []  # reset each step; collects (tag, max_abs_Vpost)
+def _wrap_seg(fn, tag):
+    def wrapped(*a, **kw):
+        out = fn(*a, **kw)
+        try:
+            vp = out[1]  # (output, V_post, v_carry)
+            if isinstance(vp, torch.Tensor) and vp.numel():
+                _VPOST_TRACE.append((tag, float(vp.detach().abs().max())))
+        except Exception:
+            pass
+        return out
+    return wrapped
+_M.segmented_plif_selective = _wrap_seg(_M.segmented_plif_selective, "sel")
+_M.segmented_plif_rowparam = _wrap_seg(_M.segmented_plif_rowparam, "row")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--spike_mode", default="quantal", choices=("supra", "quantal"))
@@ -33,6 +50,8 @@ ap.add_argument("--batch", type=int, default=4)
 ap.add_argument("--n_docs", type=int, default=400)
 ap.add_argument("--anomaly", action="store_true", help="torch.autograd.set_detect_anomaly(True) — 精确定位 backward NaN 源 op")
 ap.add_argument("--anomaly_after", type=int, default=0, help="第几步起开启 anomaly mode（早期慢步跳过）")
+ap.add_argument("--freeze_vth", action="store_true", help="冻结所有 *.v_th 参数（每步 opt.step 后还原）")
+ap.add_argument("--freeze_beta", action="store_true", help="冻结所有 *.b_beta 参数")
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -77,6 +96,15 @@ for nm, p in model.named_parameters():
     else:
         p.data = p.data.to(torch.bfloat16)
 model.train()
+
+# ----- freeze probe: snapshot params we'll restore after every opt.step() -----
+_frozen = {}
+for nm, p in model.named_parameters():
+    if (args.freeze_vth and nm.endswith('.v_th')) or (args.freeze_beta and nm.endswith('.b_beta')):
+        _frozen[nm] = p.data.clone()
+if _frozen:
+    print(f"[freeze] {len(_frozen)} param tensors frozen (will restore after each opt.step): "
+          f"vth={args.freeze_vth} beta={args.freeze_beta}", flush=True)
 
 # ----- optimizer -----
 groups = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, adam_base_lr=2e-4,
@@ -183,11 +211,15 @@ for step in range(args.max_steps):
     ids = data_t[idx]
     opt.zero_grad()
     first_nan["where"] = None
+    _VPOST_TRACE.clear()
     with torch.amp.autocast(DEV, dtype=torch.bfloat16):
         out = model(input_ids=ids, labels=ids)
     loss = out.loss
     rec = {"step": step, "loss": float(loss) if torch.isfinite(loss) else float('nan')}
-    # 取一个代表的中间激活: model.snn 的 embed_tokens 输出 max (proxy for residual scale)
+    # membrane runaway probe: max|V_post| over all segmented-PLIF calls this fwd
+    if _VPOST_TRACE:
+        rec["vpost_max"] = max(v for _, v in _VPOST_TRACE)
+        rec["res_max"] = rec["vpost_max"]
     fr_h_list = []
     for layer in model.snn.layers:
         nb = getattr(layer, 'snn_block', None)
@@ -218,6 +250,11 @@ for step in range(args.max_steps):
 
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opt.step()
+    # restore frozen params (freeze probe)
+    if _frozen:
+        for nm, p in model.named_parameters():
+            if nm in _frozen:
+                p.data.copy_(_frozen[nm])
     # check params after step
     any_nan_param = False
     nan_param_name = None
@@ -239,9 +276,18 @@ for step in range(args.max_steps):
         ahp_str = f"ahp[{min(a.min().item() for a in ahp_vals):.4f}, {max(a.max().item() for a in ahp_vals):.4f}]" if ahp_vals else "ahp=N/A"
         win_max = max(p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_in' in nm)
         wout_max = max(p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_out' in nm)
+        bb = [p.data.float() for nm,p in model.named_parameters() if nm.endswith('.b_beta')]
+        if bb:
+            bb_max = max(b.max().item() for b in bb); bb_min = min(b.min().item() for b in bb)
+            import math as _m
+            beta_max = 1.0/(1.0+_m.exp(-bb_max)); beta_min = 1.0/(1.0+_m.exp(-bb_min))
+            bb_str = f"b_beta[{bb_min:.2f},{bb_max:.2f}]→β[{beta_min:.4f},{beta_max:.5f}]"
+        else:
+            bb_str = "b_beta=N/A"
         gnorm = sum((p.grad.float().norm()**2).item() for p in model.parameters() if p.grad is not None) ** 0.5
         fr_h = rec.get("fr_h", float('nan'))
-        print(f"step {step:4d}: loss={float(loss):.4f}  fr_h={fr_h:.4f}  gnorm={gnorm:.2e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {ahp_str}  W_in_max={win_max:.3e}  W_out_max={wout_max:.3e}", flush=True)
+        vpm = rec.get("vpost_max", float('nan'))
+        print(f"step {step:4d}: loss={float(loss):.4f}  fr_h={fr_h:.4f}  gnorm={gnorm:.2e}  Vpost_max={vpm:.3e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {bb_str}  {ahp_str}  W_in_max={win_max:.3e}  W_out_max={wout_max:.3e}", flush=True)
 
 print("\n=== DIAG END ===", flush=True)
 for h in handles: h.remove()

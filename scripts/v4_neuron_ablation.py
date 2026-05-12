@@ -51,6 +51,8 @@ ap.add_argument("--D_ff", type=int, default=1024)
 ap.add_argument("--memory_layer_interval", type=int, default=4)
 ap.add_argument("--grad_clip", type=float, default=1.0)
 ap.add_argument("--muon_wd", type=float, default=0.0, help="weight decay on the Muon (matrix) group — bounds matrix growth, helps quantal stability")
+ap.add_argument("--vth_reg", type=float, default=0.0, help="PLIFNode.v_th 朝-init 二次正则权重 (实验 A; 实测无用/有害, 默认 0=关)")
+ap.add_argument("--ahp_init", type=float, default=None, help="覆写 AHP 初值 (仅 use_ahp 配置生效; None=用 CONFIGS 默认 0.02)")
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -114,11 +116,16 @@ def log(s):
 
 def run_one(name, overrides):
     torch.manual_seed(42)
+    cfg_kwargs = dict(overrides)
+    if args.vth_reg:
+        cfg_kwargs["v_th_reg_weight"] = args.vth_reg
+    if args.ahp_init is not None and cfg_kwargs.get("use_ahp"):
+        cfg_kwargs["ahp_init"] = args.ahp_init
     cfg = NeuronSparkConfig(vocab_size=VOCAB, D=args.D, N=args.N, K=args.K_max, num_layers=args.num_layers,
-                            D_ff=args.D_ff, memory_layer_interval=args.memory_layer_interval, **overrides)
+                            D_ff=args.D_ff, memory_layer_interval=args.memory_layer_interval, **cfg_kwargs)
     model = NeuronSparkForCausalLM(cfg).to(DEV)
     for nm, p in model.named_parameters():
-        if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):
+        if nm.endswith(('.w', '.v_th', '.ahp')):  # b_beta/b_alpha/b_th 已删 (bias 重构)
             p.data = p.data.float()
         else:
             p.data = p.data.to(torch.bfloat16)

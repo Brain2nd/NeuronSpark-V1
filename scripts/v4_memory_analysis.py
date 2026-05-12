@@ -48,13 +48,17 @@ args = ap.parse_args()
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+_CKPT_STEP = None  # 实际 ckpt 的训练步数 (用于注释; None = fresh-init)
+
 def load_model():
+    global _CKPT_STEP
     if args.ckpt and os.path.exists(args.ckpt):
         ck = torch.load(args.ckpt, map_location="cpu")
         cfg = NeuronSparkConfig(**ck["config"])
         m = NeuronSparkForCausalLM(cfg)
         m.load_state_dict(ck["state_dict"])
-        print(f"loaded ckpt {args.ckpt}: name={ck.get('name')}, final_loss={ck.get('final_loss')}, step={ck.get('step')}")
+        _CKPT_STEP = ck.get('step')
+        print(f"loaded ckpt {args.ckpt}: name={ck.get('name')}, final_loss={ck.get('final_loss')}, step={_CKPT_STEP}")
     else:
         torch.manual_seed(42)
         cfg = NeuronSparkConfig(vocab_size=128387, D=512, N=16, K=12, num_layers=12, D_ff=1024,
@@ -62,10 +66,7 @@ def load_model():
         m = NeuronSparkForCausalLM(cfg)
         print("no ckpt → fresh-init model (design-level analysis only)")
     for nm, p in m.named_parameters():
-        if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):
-            p.data = p.data.float()
-        else:
-            p.data = p.data.to(torch.bfloat16)
+        p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含神经元参数 —— 训练默认就是全 bf16, 见 §3.10)
     return m.to(DEV).eval(), cfg
 
 
@@ -233,7 +234,7 @@ def e2_state_autocorr(model, ids):
             tau_emp = ds[0]  # decays within 1 step
         rho_str = "  ".join(f"Δ{d}={prof[d]:+.3f}" for d in deltas)
         print(f"  layer{li:2d}.snn_block  τ_emp(1/e)≈{tau_emp if tau_emp!=float('inf') else '>'+str(deltas[-1])}  {rho_str}")
-    print("  注: 训练步数少 (1500) 时模型基本没学到长程结构，ρ 主要反映 β 设计 (见 E1)；长训练后再测会更有意义。")
+    print(f"  注: ckpt 训练步数 = {_CKPT_STEP}; 步数/数据量小时模型基本没学到长程结构，ρ 主要反映 β 设计 (见 E1)；大规模训练后再测才能看清学到的分工。")
 
 
 # ============================================================

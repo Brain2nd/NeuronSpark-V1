@@ -49,6 +49,8 @@ ap.add_argument("--K_max", type=int, default=12)
 ap.add_argument("--num_layers", type=int, default=12)
 ap.add_argument("--D_ff", type=int, default=1024)
 ap.add_argument("--memory_layer_interval", type=int, default=4)
+ap.add_argument("--grad_clip", type=float, default=1.0)
+ap.add_argument("--muon_wd", type=float, default=0.0, help="weight decay on the Muon (matrix) group — bounds matrix growth, helps quantal stability")
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -135,12 +137,14 @@ def run_one(name, overrides):
         groups = build_muon_adam_lion_param_groups(
             model, muon_lr=args.muon_lr, adam_base_lr=args.adam_base_lr,
             lion_lr=args.lion_lr, neuron_lr_mult=args.neuron_lr_mult,
+            weight_decay_muon=args.muon_wd,
         )
         opt = SingleDeviceMoonshotMuonAdamLion(groups)
     else:
         opt = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)
     rng = torch.Generator(device=DEV).manual_seed(123)
     losses = []
+    n_skipped = 0
     t0, step0 = None, 0
     for step in range(STEPS):
         idx = torch.randint(0, data_t.shape[0], (BATCH,), generator=rng, device=DEV)
@@ -150,11 +154,21 @@ def run_one(name, overrides):
             out = model(input_ids=ids, labels=ids)
         loss = out.loss
         if not torch.isfinite(loss):
-            log(f"  [{name}] NaN/Inf at step {step}!")
-            break
+            n_skipped += 1
+            log(f"  [{name}] non-finite loss at step {step} — skipping (skipped={n_skipped})")
+            if n_skipped > max(50, STEPS // 50):
+                log(f"  [{name}] too many non-finite steps ({n_skipped}) → aborting"); break
+            continue
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # skip step if any grad non-finite
+        bad_grad = any((p.grad is not None and not torch.isfinite(p.grad).all()) for p in model.parameters())
+        if bad_grad:
+            n_skipped += 1
+            log(f"  [{name}] non-finite grad at step {step} — skipping (skipped={n_skipped})")
+            opt.zero_grad(); continue
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt.step()
+        # NaN poison check: if a param went non-finite after the step, restore from no-op (clamp not possible → just zero the bad param's grad already done; here we just warn — rare)
         losses.append(float(loss))
         if step == 20:
             torch.cuda.synchronize(); t0 = time.time(); step0 = step

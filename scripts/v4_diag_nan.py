@@ -37,6 +37,22 @@ def _wrap_seg(fn, tag):
 _M.segmented_plif_selective = _wrap_seg(_M.segmented_plif_selective, "sel")
 _M.segmented_plif_rowparam = _wrap_seg(_M.segmented_plif_rowparam, "row")
 
+# ---- monkeypatch _fused_modulation to capture per-layer β.max / u.abs.max / v_th_hidden.min ----
+# (SNNBlock.forward_parallel 调它得到 selective 神经元的 β/u/v_th; 用于看 β 是否漂到 ~1 + 输入电流是否爆)
+_MOD_TRACE = []  # reset each step; collects (beta_max, u_abs_max, vth_min) per SNNBlock layer call
+def _wrap_fused(fn):
+    def wrapped(*a, **kw):
+        out = fn(*a, **kw)
+        try:
+            beta, u, v_th = out  # _fused_modulation 返回 (beta, u, v_th)
+            _MOD_TRACE.append((float(beta.detach().max()), float(u.detach().abs().max()), float(v_th.detach().min())))
+        except Exception:
+            pass
+        return out
+    return wrapped
+if hasattr(_M, "_fused_modulation"):
+    _M._fused_modulation = _wrap_fused(_M._fused_modulation)
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--spike_mode", default="quantal", choices=("supra", "quantal"))
 ap.add_argument("--use_ahp", action="store_true", default=True)
@@ -192,14 +208,22 @@ def dump_state(step):
         g_fr = getattr(getattr(layer, 'snn_ffn', None), 'gate_neuron', None)
         g_fr = getattr(g_fr, '_last_firing_rate', None) if g_fr else None
         print(f"  layer{i:2d} ({type(layer).__name__:25s}): hidden={h_fr}  ffn_gate={g_fr}", flush=True)
+    # per-call snapshot from THIS (failing) forward
+    print(f"\n[this-forward per-SNNBlock-layer (β.max, u.abs.max, v_th_hidden.min) — order = layer order]")
+    for i, (bm, um, vm) in enumerate(_MOD_TRACE):
+        print(f"  snnblock-call#{i}: β_max={bm:.6f}  u_abs_max={um:.4e}  v_th_hidden_min={vm:.4e}", flush=True)
+    print(f"[this-forward per segmented-PLIF call (tag, max|V_post|)]")
+    for tag, vp in _VPOST_TRACE:
+        print(f"  {tag}: max|V_post|={vp:.4e}", flush=True)
     # recent activation max trajectory
-    print(f"\n[recent activation max trajectory (per-layer hidden_neuron.v + V_pre proxies, last {len(fwd_history)} steps)]")
+    print(f"\n[recent trajectory (last {len(fwd_history)} steps): loss / Vpost_max / β_max / u_max / vthH_min / hidden_fr_μ]")
     for s in fwd_history:
         line = f"  step {s['step']:4d}: loss={s['loss']:.4f}"
-        if 'res_max' in s:
-            line += f"  res_max={s['res_max']:.3e}"
-        if 'fr_h' in s:
-            line += f"  hidden_fr_μ={s['fr_h']:.4f}"
+        if 'res_max' in s: line += f"  Vpost_max={s['res_max']:.3e}"
+        if 'beta_max' in s: line += f"  β_max={s['beta_max']:.6f}"
+        if 'u_max' in s: line += f"  u_max={s['u_max']:.3e}"
+        if 'vthH_min' in s: line += f"  vthH_min={s['vthH_min']:.3e}"
+        if 'fr_h' in s: line += f"  hidden_fr_μ={s['fr_h']:.4f}"
         print(line, flush=True)
 
 
@@ -215,7 +239,7 @@ for step in range(args.max_steps):
     ids = data_t[idx]
     opt.zero_grad()
     first_nan["where"] = None
-    _VPOST_TRACE.clear()
+    _VPOST_TRACE.clear(); _MOD_TRACE.clear()
     with torch.amp.autocast(DEV, dtype=torch.bfloat16):
         out = model(input_ids=ids, labels=ids)
     loss = out.loss
@@ -224,6 +248,11 @@ for step in range(args.max_steps):
     if _VPOST_TRACE:
         rec["vpost_max"] = max(v for _, v in _VPOST_TRACE)
         rec["res_max"] = rec["vpost_max"]
+    # selective β / u / v_th_hidden probe (per SNNBlock layer, from _fused_modulation)
+    if _MOD_TRACE:
+        rec["beta_max"] = max(b for b, _, _ in _MOD_TRACE)
+        rec["u_max"] = max(u for _, u, _ in _MOD_TRACE)
+        rec["vthH_min"] = min(v for _, _, v in _MOD_TRACE)
     fr_h_list = []
     for layer in model.snn.layers:
         nb = getattr(layer, 'snn_block', None)
@@ -291,7 +320,10 @@ for step in range(args.max_steps):
         gnorm = sum((p.grad.float().norm()**2).item() for p in model.parameters() if p.grad is not None) ** 0.5
         fr_h = rec.get("fr_h", float('nan'))
         vpm = rec.get("vpost_max", float('nan'))
-        print(f"step {step:4d}: loss={float(loss):.4f}  fr_h={fr_h:.4f}  gnorm={gnorm:.2e}  Vpost_max={vpm:.3e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {bb_str}  {ahp_str}  W_in_max={win_max:.3e}  W_out_max={wout_max:.3e}", flush=True)
+        bmx = rec.get("beta_max", float('nan')); umx = rec.get("u_max", float('nan')); vhmn = rec.get("vthH_min", float('nan'))
+        # W_beta_x norm: bias 重构后 β=sigmoid(W_beta_x(x)), W_beta_x 涨→β→1
+        wbx_max = max((p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_beta_x' in nm), default=float('nan'))
+        print(f"step {step:4d}: loss={float(loss):.4f}  gnorm={gnorm:.2e}  Vpost_max={vpm:.3e}  β_max={bmx:.6f}  u_max={umx:.3e}  vthH_min={vhmn:.3e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {bb_str}  {ahp_str}  W_in_max={win_max:.3e}  W_beta_x_max={wbx_max:.3e}  W_out_max={wout_max:.3e}  fr_h={fr_h:.4f}", flush=True)
 
 print("\n=== DIAG END ===", flush=True)
 for h in handles: h.remove()

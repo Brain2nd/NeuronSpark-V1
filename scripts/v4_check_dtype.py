@@ -28,10 +28,7 @@ m = NeuronSparkForCausalLM(cfg).to(dev)
 
 # apply mixed precision: 同 utils/param_groups.promote_neuron_params_fp32 + 矩阵 bf16
 for n, p in m.named_parameters():
-    if n.endswith(('.w', '.v_th', '.ahp')):
-        p.data = p.data.float()
-    else:
-        p.data = p.data.to(torch.bfloat16)
+    p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含神经元参数 .w/.v_th/.ahp —— MAL stochastic rounding); k_predictor EMA buffer 仍 fp32
 
 byd = {}
 for n, p in m.named_parameters():
@@ -51,7 +48,7 @@ print("=== spot-check dtypes ===")
 pd = dict(m.named_parameters())
 for n in ['snn.embed_tokens.weight', 'snn.layers.0.snn_block.W_in.weight', 'snn.layers.0.snn_block.W_beta_x.weight',
           'snn.layers.0.input_neuron1.w', 'snn.layers.0.input_neuron1.v_th', 'snn.norm.gain', 'snn.decode_proj.weight']:
-    if n in pd: print(f"  {n:55s} {pd[n].dtype}  (expect: matrices→bf16, .w/.v_th→fp32)")
+    if n in pd: print(f"  {n:55s} {pd[n].dtype}  (expect: 全 bf16, 含 .w/.v_th)")
 print("b_* params (expect []):", [n for n, _ in m.named_parameters() if n.endswith((".b_beta", ".b_alpha", ".b_th"))])
 print("Linear bias=True (expect [] aside from k_predictor buffers):",
       [n for n, _ in m.named_parameters() if n.endswith(".bias") and "k_predictor" not in n])

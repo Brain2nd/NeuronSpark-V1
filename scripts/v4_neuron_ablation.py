@@ -125,13 +125,11 @@ def run_one(name, overrides):
     cfg = NeuronSparkConfig(vocab_size=VOCAB, D=args.D, N=args.N, K=args.K_max, num_layers=args.num_layers,
                             D_ff=args.D_ff, memory_layer_interval=args.memory_layer_interval, **cfg_kwargs)
     model = NeuronSparkForCausalLM(cfg).to(DEV)
+    # 全模型 bf16 (含神经元参数 .w/.v_th/.ahp —— MAL 的 stochastic rounding 保证小更新累积); k_predictor EMA buffer 保 fp32
     for nm, p in model.named_parameters():
-        if nm.endswith(('.w', '.v_th', '.ahp')):  # b_beta/b_alpha/b_th 已删 (bias 重构)
-            p.data = p.data.float()
-        else:
-            p.data = p.data.to(torch.bfloat16)
-    for _, b in model.named_buffers():
-        if b.is_floating_point():
+        p.data = p.data.to(torch.bfloat16)
+    for nm, b in model.named_buffers():
+        if b.is_floating_point() and 'k_predictor' not in nm:
             b.data = b.data.to(torch.bfloat16)
     if args.lsuv:
         from utils.lsuv_snn_init import lsuv_snn_init

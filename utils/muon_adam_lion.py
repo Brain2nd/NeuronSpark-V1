@@ -37,6 +37,31 @@ from .muon_moonshot import (
 
 
 # ============================================================
+# Stochastic rounding (用于 bf16 参数: round-to-nearest 会把 < bf16 精度的更新吃掉,
+# stochastic rounding 按残差比例随机进位 → 期望无偏 → 小更新能正确累积. 这是 bf16/fp8 低精度训练标配.)
+# ============================================================
+
+_INT32_MASK_LOW16 = -65536  # = 0xFFFF0000 in int32 two's complement
+
+def _stochastic_round_to_bf16(x_fp32: torch.Tensor) -> torch.Tensor:
+    """fp32 → bf16, 随机舍入. bf16 = fp32 高 16 bit; 把低 16 bit 加一个 [0, 2^16) 的随机数再截断:
+    → 残差 r 的尾数以概率 r/2^16 进位 (对正负数都是"以 r/2^16 概率舍离 0") → E[结果] = x (无偏)."""
+    xi = x_fp32.contiguous().view(torch.int32)
+    rnd = torch.randint(0, 1 << 16, x_fp32.shape, dtype=torch.int32, device=x_fp32.device)
+    sr = (xi + rnd) & torch.tensor(_INT32_MASK_LOW16, dtype=torch.int32, device=x_fp32.device)
+    return sr.view(torch.float32).to(torch.bfloat16)
+
+
+def _apply_step(p, update, lr: float):
+    """p -= lr·update; p 是 bf16 时在 fp32 里算更新再 stochastic-round 回 bf16
+    (否则 < bf16 精度的更新被 round-to-nearest 吃掉, 见上). 后续的 p.clamp_(min=cmin) (Lion 防漂负) 由 caller 照常做."""
+    if p.dtype == torch.bfloat16:
+        p.data.copy_(_stochastic_round_to_bf16(p.data.float().sub_(update.float(), alpha=lr)))
+    else:
+        p.add_(update, alpha=-lr)
+
+
+# ============================================================
 # Lion update (Chen et al. 2023)
 # ============================================================
 
@@ -51,7 +76,7 @@ def lion_update(grad, momentum, beta1: float = 0.9, beta2: float = 0.99):
     `momentum` in-place 更新。
     """
     update = (momentum * beta1 + grad * (1 - beta1)).sign_()
-    momentum.lerp_(grad, 1 - beta2)
+    momentum.lerp_(grad.to(momentum.dtype), 1 - beta2)   # grad 可能 bf16, momentum fp32 → lerp_ 要求同 dtype
     return update
 
 
@@ -144,7 +169,7 @@ class MoonshotMuonAdamLion(torch.optim.Optimizer):
                             p.grad, state["momentum_buffer"], beta=group["momentum"]
                         )
                         p.mul_(1 - group["lr"] * group["weight_decay"])
-                        p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                        _apply_step(p, update.reshape(p.shape), group["lr"])
                     if world_size > 1:
                         dist.all_gather(
                             params_pad[base_i:base_i + world_size],
@@ -168,15 +193,15 @@ class MoonshotMuonAdamLion(torch.optim.Optimizer):
                         state["step"], group["betas"], group["eps"],
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    _apply_step(p, update, group["lr"])
                 elif kind == "lion":
                     if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
+                        state["momentum"] = torch.zeros_like(p, dtype=torch.float32)  # fp32: Lion momentum EMA 累积小梯度, bf16 会丢
                     b1, b2 = group["betas"]
                     update = lion_update(p.grad, state["momentum"], beta1=b1, beta2=b2)
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    _apply_step(p, update, group["lr"])
                     # 可选: 钳到 [clamp_min, ...) 防止 v_th/ahp 漂到负数引发动力学翻转 → NaN
                     cmin = group.get("clamp_min", None)
                     if cmin is not None:
@@ -216,7 +241,7 @@ class SingleDeviceMoonshotMuonAdamLion(torch.optim.Optimizer):
                         p.grad, state["momentum_buffer"], beta=group["momentum"]
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+                    _apply_step(p, update.reshape(p.shape), group["lr"])
                 continue
             kind = _aux_kind(group)
             for p in group["params"]:
@@ -234,15 +259,15 @@ class SingleDeviceMoonshotMuonAdamLion(torch.optim.Optimizer):
                         state["step"], group["betas"], group["eps"],
                     )
                     p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    _apply_step(p, update, group["lr"])
                 elif kind == "lion":
                     if len(state) == 0:
-                        state["momentum"] = torch.zeros_like(p)
+                        state["momentum"] = torch.zeros_like(p, dtype=torch.float32)  # fp32: Lion momentum EMA 累积小梯度, bf16 会丢
                     b1, b2 = group["betas"]
                     update = lion_update(p.grad, state["momentum"], beta1=b1, beta2=b2)
                     if group["weight_decay"] > 0:
                         p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    _apply_step(p, update, group["lr"])
                     cmin = group.get("clamp_min", None)
                     if cmin is not None:
                         p.clamp_(min=cmin)

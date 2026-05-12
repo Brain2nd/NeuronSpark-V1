@@ -3636,15 +3636,10 @@ class NeuronSparkForCausalLM(PreTrainedModel):
                 dtype = layer_mod.rope_cos.dtype
                 layer_mod.rope_cos.data = cos.to(device=device, dtype=dtype)
                 layer_mod.rope_sin.data = sin.to(device=device, dtype=dtype)
-        # Per-tensor 恢复混合精度: 矩阵→bf16, 神经元/PonderNet buffer→保持 fp32
-        # 对齐训练 utils/param_groups.promote_neuron_params_fp32:
-        #   params: 仅 .w/.v_th 后缀 (逐通道神经元参数, 1D tensor) + .ahp → fp32; (b_beta/b_alpha/b_th 已删除)
-        #   buffers: k_predictor 下的 .bias 和 ._usage_ema → fp32
+        # Per-tensor 恢复混合精度: 所有参数 → bf16 (含神经元参数 .w/.v_th/.ahp —— 训练时由 MAL 的
+        # stochastic rounding 保证小更新正确累积, 见 utils/muon_adam_lion); 只有 k_predictor 的 EMA buffer 保 fp32.
         if apply_mixed:
-            _NEURON_PARAM_SUFFIXES = ('.w', '.v_th', '.ahp')
             for name, p in model.named_parameters():
-                if name.endswith(_NEURON_PARAM_SUFFIXES):
-                    continue  # 神经元参数保 fp32
                 p.data = p.data.to(_torch.bfloat16)
             for name, b in model.named_buffers():
                 if 'k_predictor' in name and (name.endswith('.bias') or name.endswith('._usage_ema')):

@@ -136,10 +136,7 @@ cfg = NeuronSparkConfig(vocab_size=VOCAB, D=512, N=16, K=12, num_layers=12, D_ff
                         v_th_reg_weight=args.vth_reg)
 model = NeuronSparkForCausalLM(cfg).to(DEV)
 for nm, p in model.named_parameters():
-    if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):
-        p.data = p.data.float()
-    else:
-        p.data = p.data.to(torch.bfloat16)
+    p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含神经元参数, MAL stochastic rounding 保证小更新累积)
 model.train()
 
 # ----- freeze probe: snapshot params we'll restore after every opt.step() -----

@@ -28,24 +28,14 @@ def _get_inner_snn(model: nn.Module):
 
 
 def promote_neuron_params_fp32(model: nn.Module) -> int:
-    """Cast neuron-specific parameters + PonderNet bias buffers to fp32.
-
-    Neuron parameters (LIF β/α/threshold, gain `w`, `v_th`) need fp32 precision
-    because sigmoid/softplus saturate in bf16 and tiny updates get quantized
-    away. PonderNet `bias` / `_usage_ema` buffers need fp32 because
-    EMA-accumulation of small fractions in bf16 loses signal entirely.
-
-    Matrix weights stay bf16 via autocast in model forward.
+    """Cast PonderNet KPredictor EMA buffers to fp32. (历史名保留 —— 名字带 "neuron params" 但
+    神经元参数 .w/.v_th/.ahp 现在保持 bf16, 由 MAL 优化器的 stochastic rounding 保证小更新正确累积,
+    见 utils/muon_adam_lion._stochastic_round_to_bf16. 只有 k_predictor 的 bias / _usage_ema 还需 fp32,
+    因为它们是 gradient-free EMA 累积小分数, 不经过优化器的 SR.)
 
     Returns number of tensors promoted.
     """
     count = 0
-    for name, p in model.named_parameters():
-        if name.endswith((".w", ".v_th", ".ahp")):  # b_beta/b_alpha/b_th 已删 (bias 重构)
-            if p.dtype != torch.float32:
-                p.data = p.data.float()
-                count += 1
-    # PonderNet KPredictor buffers: bias + _usage_ema
     for name, buf in model.named_buffers():
         if name.endswith((".bias", "._usage_ema")) and "k_predictor" in name:
             if buf.dtype != torch.float32:

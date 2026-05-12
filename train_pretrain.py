@@ -291,6 +291,10 @@ def main():
                          "moonshot = Moonshot RMS-match 0.2*max(m,n)^0.5 (paper 2025-02, scalable).")
     ap.add_argument("--lion_lr", type=float, default=1e-4,
                     help="Lion LR for neuron scalar params (only used when --optimizer muon_adam_lion).")
+    ap.add_argument("--lsuv", action="store_true",
+                    help="LSUV v2 init before training: calibrate PLIFNode v_th to (1-p) quantile + scale "
+                         "SNNBlock W_in so hidden_neuron fires ~lsuv_target_p (critical for quantal — else hidden collapses).")
+    ap.add_argument("--lsuv_target_p", type=float, default=0.3, help="LSUV target initial firing rate.")
     ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
     ap.add_argument("--warmup_iters", type=int, default=500)
     ap.add_argument("--grad_clip", type=float, default=1.0)
@@ -329,6 +333,17 @@ def main():
 
     # Model + tokenizer
     model, tokenizer, device = load_model(args)
+
+    # LSUV v2 init (BEFORE deepspeed.initialize — modifying .data after that desyncs fp32 master copies).
+    # A fresh model's firing rate is ~insensitive to input-token distribution, so a fixed-seed synthetic
+    # calibration batch is fine (and must be identical across ranks → seeded generator).
+    if args.lsuv:
+        from utils.lsuv_snn_init import lsuv_snn_init
+        rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+        _g = torch.Generator(device=device).manual_seed(12345)
+        calib_ids = torch.randint(0, model.config.vocab_size, (2, min(128, args.max_length)), generator=_g, device=device)
+        lsuv_snn_init(model, calib_ids, target_p_fire=args.lsuv_target_p, n_passes=3, verbose=(rank == 0))
+        log(f"  LSUV v2 init applied (target p_fire={args.lsuv_target_p}, synthetic calib batch)")
 
     # Training state
     start_step, tokens_seen = 0, 0

@@ -182,6 +182,9 @@ def main():
     ap.add_argument("--muon_lr", type=float, default=0.005)
     ap.add_argument("--muon_momentum", type=float, default=0.95)
     ap.add_argument("--lion_lr", type=float, default=1e-4)
+    ap.add_argument("--lsuv", action="store_true",
+                    help="LSUV v2 init before training (v_th (1-p) quantile + scale SNNBlock W_in so hidden fires ~lsuv_target_p).")
+    ap.add_argument("--lsuv_target_p", type=float, default=0.3)
     ap.add_argument("--warmup_iters", type=int, default=100)
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--ponder_weight", type=float, default=0.0)
@@ -240,6 +243,14 @@ def main():
     model = model.to(device=device, dtype=torch.bfloat16)
     n_fp32 = promote_neuron_params_fp32(model)
     log(f"  Promoted {n_fp32} neuron params to fp32")
+
+    # LSUV v2 init (before deepspeed.initialize; fixed-seed synthetic calib batch, identical across ranks)
+    if getattr(args, "lsuv", False):
+        from utils.lsuv_snn_init import lsuv_snn_init
+        _g = torch.Generator(device=device).manual_seed(12345)
+        calib_ids = torch.randint(0, model.config.vocab_size, (2, min(128, args.max_length)), generator=_g, device=device)
+        lsuv_snn_init(model, calib_ids, target_p_fire=args.lsuv_target_p, n_passes=3, verbose=(local_rank == 0))
+        log(f"  LSUV v2 init applied (target p_fire={args.lsuv_target_p}, synthetic calib batch)")
 
     # Optimizer
     if args.optimizer == "muon":

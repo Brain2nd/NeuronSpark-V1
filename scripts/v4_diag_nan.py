@@ -31,6 +31,8 @@ ap.add_argument("--max_steps", type=int, default=300)
 ap.add_argument("--seq", type=int, default=512)
 ap.add_argument("--batch", type=int, default=4)
 ap.add_argument("--n_docs", type=int, default=400)
+ap.add_argument("--anomaly", action="store_true", help="torch.autograd.set_detect_anomaly(True) — 精确定位 backward NaN 源 op")
+ap.add_argument("--anomaly_after", type=int, default=0, help="第几步起开启 anomaly mode（早期慢步跳过）")
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -174,6 +176,9 @@ rng = torch.Generator(device=DEV).manual_seed(123)
 print(f"\nstart diag run: spike={args.spike_mode}, use_ahp={args.use_ahp}, muon_lr={args.muon_lr}, lion_lr={args.lion_lr}, max_steps={args.max_steps}", flush=True)
 
 for step in range(args.max_steps):
+    if args.anomaly and step == args.anomaly_after:
+        torch.autograd.set_detect_anomaly(True)
+        print(f"[anomaly] set_detect_anomaly(True) at step {step}", flush=True)
     idx = torch.randint(0, data_t.shape[0], (args.batch,), generator=rng, device=DEV)
     ids = data_t[idx]
     opt.zero_grad()

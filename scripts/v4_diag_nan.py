@@ -66,9 +66,10 @@ def _wrap_fused(fn):
         try:
             beta, u, v_th = out  # _fused_modulation 返回 (beta, u, v_th); v_th = v_th_min + |W_th_x(x)| 的逐 token 值
             b = beta.detach().float(); vt = v_th.detach().float()
-            # 递归 Jacobian J = β·(1 - (v_th+ahp)·g_surr), g_surr ∈ [0, α/4] → J ∈ [β·(1-v_th·α/4), β]
-            # |J|_max = β·max(1, |1 - v_th·α/4|)  (取 ahp=0 估计)
-            jmax = (b * torch.maximum(torch.ones_like(b), torch.abs(1.0 - vt * (_SURR_ALPHA / 4.0)))).max()
+            # 递归 Jacobian J = β·(1 - (v_th+ahp)·g_surr), g_surr ∈ [0, α_eff/4], α_eff = min(α_base, 4/(v_th+ahp))
+            # (ahp=0 估计) → v_th·α_eff/4 = min(v_th, 1) → |J| ∈ [β·(1-min(v_th,1)), β] → |J|_max = β·max(1,|1-min(v_th,1)|)
+            alpha_eff_est = torch.clamp(4.0 / vt, max=_SURR_ALPHA)
+            jmax = (b * torch.maximum(torch.ones_like(b), torch.abs(1.0 - vt * (alpha_eff_est / 4.0)))).max()
             _MOD_TRACE.append((float(b.max()), float(u.detach().abs().max()), float(vt.min()), float(vt.max()), float(jmax)))
         except Exception:
             pass

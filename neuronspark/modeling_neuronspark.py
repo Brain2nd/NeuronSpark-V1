@@ -521,9 +521,12 @@ if _HAS_TRITON:
                 g_out_i = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
                 g_Vpost = g_v + tl.where(k == kt_t, g_patch, 0.0)
                 if SPIKE_QUANTAL:
-                    sg = tl.sigmoid(ALPHA * (v_pre - vth))
-                    g_surr = ALPHA * sg * (1.0 - sg)
                     vth_ahp = vth + ahp
+                    # adaptive surrogate sharpness: 保证膜递归 backward Jacobian J=β·(1-(v_th+ahp)·g_surr) ∈ [0,β] contractive.
+                    # g_surr_max = α_eff/4, 要 (v_th+ahp)·α_eff/4 ≤ 1 → α_eff = min(ALPHA, 4/(v_th+ahp)).
+                    alpha_eff = tl.minimum(ALPHA, 4.0 / vth_ahp)
+                    sg = tl.sigmoid(alpha_eff * (v_pre - vth))
+                    g_surr = alpha_eff * sg * (1.0 - sg)
                     g_v_pre = g_out_i * (vth * g_surr) + g_Vpost * (1.0 - vth_ahp * g_surr)
                     acc_grad_vth += g_out_i * (s - vth * g_surr) + g_Vpost * (vth_ahp * g_surr - s)
                 else:
@@ -632,9 +635,11 @@ if _HAS_TRITON:
                 g_out_i = tl.load(GRAD_OUTPUT_ptr + off, mask=mask, other=0.0).to(tl.float32)
                 g_Vpost = g_v + tl.where(k == kt_t, g_patch, 0.0)
                 if SPIKE_QUANTAL:
-                    sg = tl.sigmoid(ALPHA * (v_pre - vth_i))
-                    g_surr = ALPHA * sg * (1.0 - sg)
                     vth_ahp = vth_i + ahp
+                    # adaptive surrogate sharpness (见 rowparam bwd): α_eff = min(ALPHA, 4/(v_th+ahp)) → J ∈ [0,β] contractive
+                    alpha_eff = tl.minimum(ALPHA, 4.0 / vth_ahp)
+                    sg = tl.sigmoid(alpha_eff * (v_pre - vth_i))
+                    g_surr = alpha_eff * sg * (1.0 - sg)
                     g_v_pre = g_out_i * (vth_i * g_surr) + g_Vpost * (1.0 - vth_ahp * g_surr)
                     grad_vth_i = g_out_i * (s - vth_i * g_surr) + g_Vpost * (vth_ahp * g_surr - s)
                 else:
@@ -1194,8 +1199,13 @@ def _spike_step(v_pre, v_th, ahp, spike_quantal, alpha):
     """
     s_hard = (v_pre > v_th).to(v_pre.dtype)
     if spike_quantal:
-        sig = torch.sigmoid(alpha * (v_pre - v_th))
-        s = sig + (s_hard - sig).detach()   # straight-through: forward 值 = s_hard, 反向梯度 = sigmoid'
+        # adaptive surrogate sharpness: 膜递归 backward Jacobian J = β·(1 - (v_th+ahp)·g_surr), g_surr_max = α/4.
+        # 要 (v_th+ahp)·α/4 ≤ 1 → ∂V_post/∂V_pre = 1-(v_th+ahp)·g_surr ∈ [0,1] → |J| ≤ β < 1 (contractive, 不论 v_th 多大).
+        # → α_eff = min(α, 4/(v_th+ahp)). v_th+ahp 小时 = α (不变); v_th 被驱动大时 α_eff 反比缩小, 涂抹更宽, 不至于把 BPTT 推到发散.
+        # .detach(): α_eff 是按 v_th 自适应设的 surrogate 超参, 不 backprop 穿过这个自适应 (对齐 Triton kernel 的 hand-written grad).
+        alpha_eff = torch.clamp(4.0 / (v_th + ahp), max=float(alpha)).detach()
+        sig = torch.sigmoid(alpha_eff * (v_pre - v_th))
+        s = sig + (s_hard - sig).detach()   # straight-through: forward 值 = s_hard, 反向梯度 = sigmoid'(α_eff·(V_pre-v_th))
         out = v_th * s
         v_post = v_pre - out - ahp * s      # output 与 AHP 项用同一个 s
     else:

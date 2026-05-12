@@ -2,10 +2,10 @@
 
 任务（标准 associative recall，Mamba/H3 论文那个）：
   分离 vocab：BOS(0), SEP(1), key tokens [2, 2+nk), value tokens [2+nk, 2+nk+nv)。
-  序列：BOS · (k_1 v_1) · (k_2 v_2) · ... · (k_N v_N) · SEP · k_q   —— k_q 是某个 k_j（每对的 key 互不相同）。
-  目标：SEP·k_q 之后的位置预测 v_j（k_q 对应的 value）。
-  → 模型必须 in-context 召回（每例 key/value 随机映射，不能背）。查询第 j 个 pair → 答案 v_j 在 pos 2j，查询 k_q 在 pos 2N+2，距离 ≈ 2N+2 - 2j。
-  训练时随机 j；评测时固定 j ∈ {N, 3N/4, N/2, N/4, 1} → 距离 ≈ {2, N/2, N, 3N/2, 2N}。
+  序列：BOS · (k_1 v_1) · ... · (k_N v_N) · SEP · k_q · v_q   —— k_q 是某个 k_j（每对 key 互不相同）；v_q = v_j 追加在末尾（关键：这样它在 causal-LM CE 的训练目标里 → 查询位置的 logits 才有梯度）。
+  长度 T = 2N+4 (pos: 0=BOS, 1..2N=pairs, 2N+1=SEP, 2N+2=k_q, 2N+3=v_q)。答案位置 = T-2 (= k_q 的 pos)，预测下一 token = v_q。
+  → 模型必须 in-context 召回（每例 key/value 随机映射，不能背）。查询第 j 个 pair → 答案 v_j 在 pos 2j-1 → 距离 = (T-1) - (2j-1) = 2(N-j)+4 ≈ 2(N-j)。
+  训练时随机 j；评测时固定 j ∈ {N, 3N/4, N/2, N/4, 1} → 距离 ≈ {4, N/2, N, 3N/2, 2N}。
 
 跑：train 一个小模型学召回（V4.1 quantal / supra / 或 --baseline transformer），eval recall-acc vs 距离 for
 {full / no-SNNAttention(cumsum→identity)（仅 V4.1）}。论文图：哪个 component 负责哪段距离 + V4.1 vs transformer 的召回能力。
@@ -50,11 +50,12 @@ BOS, SEP = 0, 1
 KEY_LO = 2
 VAL_LO = 2 + args.n_keys
 VOCAB = 2 + args.n_keys + args.n_vals
-T = 2 * args.n_pairs + 3  # BOS + 2N + SEP + k_q  (答案在 k_q 之后那个位置 → 总长 = 1 + 2N + 1 + 1 = 2N+3)
+T = 2 * args.n_pairs + 4  # BOS + 2N + SEP + k_q + v_q  (答案 v_q 是末尾 token → 它的预测在训练目标里)
+ANS_POS = T - 2           # = k_q 的位置 (pos 2N+2)，logits[ANS_POS] 预测下一 token = v_q (pos T-1)
 
 
 def make_batch(B, query_j=None, gen=None):
-    """返回 (ids (B,T), ans_pos (B,) = T-1, ans_tok (B,)). query_j: 1-indexed 查第几对; None → 随机."""
+    """返回 (ids (B,T), ans_pos (B,) = T-2, ans_tok (B,)). query_j: 1-indexed 查第几对; None → 随机."""
     gen = gen or rng
     ids = np.zeros((B, T), dtype=np.int64)
     ans = np.empty(B, dtype=np.int64)
@@ -67,10 +68,10 @@ def make_batch(B, query_j=None, gen=None):
             ids[b, 2 + 2 * j] = vals[j]
         ids[b, 1 + 2 * args.n_pairs] = SEP   # pos 2N+1
         qj = (query_j - 1) if query_j is not None else int(gen.randint(0, args.n_pairs))
-        ids[b, 2 + 2 * args.n_pairs] = keys[qj]  # pos 2N+2 = T-1; 答案预测在它之后 → 但序列就到这里 → 我们用 logits[T-1] 预测「下一个」
+        ids[b, 2 + 2 * args.n_pairs] = keys[qj]  # pos 2N+2 = k_q (= ANS_POS); logits 在这里预测下一 token
+        ids[b, 2 * args.n_pairs + 3] = vals[qj]  # pos T-1 = v_q (末尾 → 进训练目标)
         ans[b] = vals[qj]
-    # 答案是「k_q 之后应出现的 token」= v_j —— 用 logits at pos T-1 (= k_q 的位置) 预测下一 token
-    return torch.from_numpy(ids).to(DEV), torch.full((B,), T - 1, device=DEV), torch.from_numpy(ans).to(DEV)
+    return torch.from_numpy(ids).to(DEV), torch.full((B,), ANS_POS, device=DEV), torch.from_numpy(ans).to(DEV)
 
 
 # ---- minimal causal transformer baseline ----
@@ -180,7 +181,7 @@ def eval_recall(model, label, no_attn=False):
     try:
         accs = {}
         for qj in js:
-            dist = 2 * (args.n_pairs - qj)  # 答案距查询的 token 数
+            dist = 2 * (args.n_pairs - qj) + 2  # 相关信息 v_j(@pos 2qj) 距查询位置(@pos 2N+2) 的 token 数
             correct = total = 0
             while total < args.eval_samples:
                 bs = min(args.batch, args.eval_samples - total)

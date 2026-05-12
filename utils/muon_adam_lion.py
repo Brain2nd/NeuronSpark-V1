@@ -1,8 +1,7 @@
-"""Moonshot-Muon (matrices) + Adam (embed/norm) + Lion (neuron scalars) hybrid optimizer.
+"""Moonshot-Muon (matrices) + Adam (embed/norm) + Lion (逐通道神经元参数 .w/.v_th/.ahp, 1D tensor) hybrid optimizer.
 
 扩展 `utils/muon_moonshot.py:MoonshotMuonWithAuxAdam`，增加 Lion (Chen et al. 2023, "Symbolic
-Discovery of Optimization Algorithms") aux path 给「神经元标量/向量参数」（per-channel β/v_th/ahp/
-b_beta/b_alpha/b_th）—— 这些参数在 V4.1 quantal 模式下梯度通过 `∂out/∂V_pre = v_th·surrogate'`
+Discovery of Optimization Algorithms") aux path 给「逐通道神经元参数」（per-channel β/v_th/ahp，1D tensor；b_beta/b_alpha/b_th 已在 bias 重构中删除）—— 这些参数在 V4.1 quantal 模式下梯度通过 `∂out/∂V_pre = v_th·surrogate'`
 只有 ~0.02 量级（比 supra 的 ~1 弱 50x），又稀疏（发放率低→大多数 batch 无 spike→零梯度，rare
 spike → 小但有信息的梯度），属于"稀疏+小幅+带噪"的最不利情景。
 
@@ -95,7 +94,7 @@ def _validate_group(group):
 # ============================================================
 
 class MoonshotMuonAdamLion(torch.optim.Optimizer):
-    """Muon (matrices) + Adam (embed/norm) + Lion (neuron scalars), distributed.
+    """Muon (matrices) + Adam (embed/norm) + Lion (逐通道神经元参数, 1D tensor), distributed.
 
     用法：
         groups = [

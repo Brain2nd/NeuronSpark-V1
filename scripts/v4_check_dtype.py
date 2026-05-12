@@ -1,4 +1,4 @@
-"""检查 NeuronSpark V4 模型的混合精度 (矩阵 bf16 / 神经元标量 .w/.v_th/.ahp fp32) +
+"""检查 NeuronSpark V4 模型的混合精度 (矩阵 bf16 / 逐通道神经元参数 .w/.v_th/.ahp (1D tensor) fp32) +
 量一下推理常驻 state 大小 (与上下文长度无关). FPGA sizing 用.
 
 用法: CUDA_VISIBLE_DEVICES=N python scripts/v4_check_dtype.py [--D 1024 --N 8 --K 12 --num_layers 24 --D_ff 3072 --vocab 128387]

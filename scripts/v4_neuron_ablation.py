@@ -34,7 +34,7 @@ ap.add_argument("--vocab", type=int, default=None, help="binned 数据时手动�
 ap.add_argument("--out", default=None, help="日志文件 (默认 stdout)")
 ap.add_argument("--optimizer", default="adam", choices=("adam", "muon_adam_lion"),
                 help="adam (baseline, lr_mult=10 for neurons) | "
-                     "muon_adam_lion (Muon for matrices + Adam for embed/norm + Lion for neuron scalars; DeepSpeed-ZeRO0 兼容)")
+                     "muon_adam_lion (Muon for matrices + Adam for embed/norm + Lion for 逐通道神经元参数 .w/.v_th/.ahp (1D tensor); DeepSpeed-ZeRO0 兼容)")
 ap.add_argument("--muon_lr", type=float, default=0.02)
 ap.add_argument("--adam_base_lr", type=float, default=2e-4)
 ap.add_argument("--lion_lr", type=float, default=5e-4)

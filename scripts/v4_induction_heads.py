@@ -71,8 +71,7 @@ def build_v4():
                             D_key=args.D_key, D_value=args.D_value, spike_mode="quantal", use_ahp=False)
     m = NeuronSparkForCausalLM(cfg).to(DEV)
     for n, p in m.named_parameters():
-        if n.endswith(('.w', '.v_th', '.ahp')): p.data = p.data.float()
-        else: p.data = p.data.to(torch.bfloat16)
+        p.data = p.data.to(torch.bfloat16)  # 全 bf16 (含神经元参数 —— canonical 配置, MAL+SR 训得动)
     if args.no_xpos:
         # 关掉 SNNAttention 跨位置混合: M_all 不做 cumsum (每位置独立), 不携带 M_state.
         from neuronspark.modeling_neuronspark import SNNAttentionDecoderLayer
@@ -149,7 +148,15 @@ torch.manual_seed(0)
 model = build_v4() if args.model == "v4" else TinyGPT(args.vocab, args.t_d, args.t_layers, args.t_heads).to(DEV)
 n_p = sum(p.numel() for p in model.parameters()) / 1e6
 log(f"=== model={args.model} params={n_p:.2f}M train_len={args.train_len} steps={args.steps} vocab={args.vocab} ===")
-opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+if args.model == "v4":
+    # canonical 配置: MAL (Muon matrices + Adam embed/norm + Lion 逐通道神经元参数 .w/.v_th/.ahp, bf16+SR)
+    from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+    pg = build_muon_adam_lion_param_groups(model, muon_lr=0.005, adam_base_lr=2e-4, adam_embed_lr=2e-4,
+                                           lion_lr=1e-4, neuron_lr_mult=1.0, weight_decay_muon=0.01)
+    opt = SingleDeviceMoonshotMuonAdamLion(pg)
+    log("[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon_lr=0.005 adam=2e-4 lion=1e-4)")
+else:
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
 gen = torch.Generator(device=DEV).manual_seed(123)
 model.train()
 for step in range(args.steps):

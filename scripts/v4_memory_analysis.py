@@ -110,11 +110,18 @@ def e1_beta_spectrum(model, cfg):
             bf = buckets / buckets.sum()
             print(f"  {name:50s} n={len(beta):5d}  τ[1/25/50/75/99%]={q[1]:.1f}/{q[25]:.1f}/{q[50]:.1f}/{q[75]:.1f}/{q[99]:.1f}  "
                   f"buckets[<3,3-10,10-30,30-100,>100]={['%.0f%%'%(100*b) for b in bf]}")
-    # SelectivePLIF hidden_neuron: β_base = sigmoid(b_beta)
-    print("\n[SNNBlock hidden_neuron (selective) β_base=sigmoid(b_beta), per-layer]")
+    # SelectivePLIF hidden_neuron: β = sigmoid(W_beta_x(x)) —— bias 重构后无静态 b_beta;
+    # 用 W_beta_x 的行偏移 (mean over input dim) × 估计输入 DC 作 β_base 代理
+    print("\n[SNNBlock hidden_neuron (selective) β_base≈sigmoid(W_beta_x rowmean·D·DC), per-layer]")
+    _DC = 0.02  # SNNBlock._V_IN_DC_EST 同值
     for li, layer in enumerate(snn.layers):
         if isinstance(layer, SNNDecoderLayer):
-            bb = layer.snn_block.b_beta.detach().float().cpu().numpy()
+            blk = layer.snn_block
+            if hasattr(blk, "b_beta"):
+                bb = blk.b_beta.detach().float().cpu().numpy()
+            else:
+                W = blk.W_beta_x.weight.detach().float().cpu().numpy()  # (DN, D)
+                bb = W.sum(axis=1) * _DC  # ≈ W_beta_x(v_in) at typical DC
             beta_base = 1 / (1 + np.exp(-bb))
             tau = tau_of_beta(beta_base)
             q = pct(tau)

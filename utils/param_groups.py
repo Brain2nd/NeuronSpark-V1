@@ -12,9 +12,6 @@ import torch.nn as nn
 
 NEURON_GROUP_KEYS = (
     "input_neurons",
-    "b_beta",
-    "b_alpha",
-    "b_th",
     "block_output_neuron",
     "ffn_neurons",
     "output_neuron",
@@ -44,7 +41,7 @@ def promote_neuron_params_fp32(model: nn.Module) -> int:
     """
     count = 0
     for name, p in model.named_parameters():
-        if name.endswith((".w", ".v_th", ".b_beta", ".b_alpha", ".b_th")):
+        if name.endswith((".w", ".v_th", ".ahp")):  # b_beta/b_alpha/b_th 已删 (bias 重构)
             if p.dtype != torch.float32:
                 p.data = p.data.float()
                 count += 1

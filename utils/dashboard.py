@@ -144,13 +144,7 @@ class SNNDashboard:
             ffn = layer.snn_ffn
             semantics.append((f"{prefix}/input1_beta", layer.input_neuron1.w, torch.sigmoid, "beta"))
             semantics.append((f"{prefix}/input2_beta", layer.input_neuron2.w, torch.sigmoid, "beta"))
-            semantics.append((f"{prefix}/block_beta_t", block.b_beta, torch.sigmoid, "beta(t)"))
-            semantics.append((f"{prefix}/block_alpha_t", block.b_alpha, F.softplus, "alpha(t)"))
-            v_th_min = block.v_th_min
-            semantics.append(
-                (f"{prefix}/block_vth_t", block.b_th,
-                 lambda x, m=v_th_min: m + torch.abs(x), "V_th(t)")
-            )
+            # b_beta/b_alpha/b_th 已删 (bias 重构) —— 选择性 β/α/v_th 全 input-dependent, 无静态基准量可监控
             semantics.append((f"{prefix}/ffn_gate_beta", ffn.gate_neuron.w, torch.sigmoid, "beta"))
             semantics.append((f"{prefix}/ffn_up_beta", ffn.up_neuron.w, torch.sigmoid, "beta"))
 
@@ -235,8 +229,8 @@ class SNNDashboard:
         w = self._writer
         all_betas = []
         for i, layer in enumerate(snn.layers):
-            if not hasattr(layer, "snn_block"):
-                continue
+            if not hasattr(layer, "snn_block") or not hasattr(layer.snn_block, "b_beta"):
+                continue  # bias 重构后无静态 b_beta；β 全 input-dependent
             with torch.no_grad():
                 b_raw = layer.snn_block.b_beta.data
                 beta = torch.sigmoid(b_raw)
@@ -662,10 +656,10 @@ class SNNDashboard:
         else:
             grad_gini = 0.0
 
-        # β convergence
+        # β convergence  (bias 重构后无静态 b_beta → 跳过这些静态监控)
         beta_stds = []
         for i, layer in enumerate(snn.layers):
-            if not hasattr(layer, "snn_block"):
+            if not hasattr(layer, "snn_block") or not hasattr(layer.snn_block, "b_beta"):
                 continue
             with torch.no_grad():
                 beta = torch.sigmoid(layer.snn_block.b_beta.data)
@@ -680,7 +674,7 @@ class SNNDashboard:
         # Dead/seizure neurons (inferred from β, V_th)
         dead_count = epileptic_count = total_neurons = 0
         for layer in snn.layers:
-            if not hasattr(layer, "snn_block"):
+            if not hasattr(layer, "snn_block") or not hasattr(layer.snn_block, "b_beta"):
                 continue
             block = layer.snn_block
             with torch.no_grad():
@@ -737,14 +731,5 @@ class SNNDashboard:
     # ====== 9. compensation factors ======
 
     def _log_compensation_factors(self, step, snn):
-        w = self._writer
-        for i, layer in enumerate(snn.layers):
-            if not hasattr(layer, "snn_block"):
-                continue
-            block = layer.snn_block
-            with torch.no_grad():
-                beta = torch.sigmoid(block.b_beta.data)
-                sigmoid_deriv = (beta * (1.0 - beta)).mean().item()
-                w.add_scalar(f"compensation/layer_{i:02d}/sigmoid_deriv_mean", sigmoid_deriv, step)
-                softplus_deriv = torch.sigmoid(block.b_alpha.data).mean().item()
-                w.add_scalar(f"compensation/layer_{i:02d}/softplus_deriv_mean", softplus_deriv, step)
+        # bias 重构后无 b_beta/b_alpha → compensate_modulation_gradients 已是 no-op, 此监控不再适用
+        return

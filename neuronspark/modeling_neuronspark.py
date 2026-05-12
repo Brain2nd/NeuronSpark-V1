@@ -2010,12 +2010,13 @@ class SNNFFN(MemoryModule):
 # 7-8 separate element-wise kernels → 1 fused kernel, ~4x speedup on DN-sized tensors.
 # First call triggers JIT compilation (~seconds); cached for subsequent calls.
 
-def _fused_modulation_eager(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th, v_th_min, I_all):
+def _fused_modulation_eager(raw_beta, raw_alpha, raw_th, v_th_min, I_all):
     """Plain-Python modulation: sigmoid + softplus + abs + multiply.
-    Used directly for A/B test against compiled version."""
-    beta = torch.sigmoid(raw_beta + b_beta)
-    alpha = F.softplus(raw_alpha + b_alpha)
-    v_th = v_th_min + torch.abs(raw_th + b_th)
+    选择性方程: β/α/v_th 全由 raw = W_*_x(x) 给出 (无 bias —— per-channel init 多样性
+    已 fold 进 W_*_x 的行偏移, 见 SNNBlock._initialize_parameters)."""
+    beta = torch.sigmoid(raw_beta)
+    alpha = F.softplus(raw_alpha)
+    v_th = v_th_min + torch.abs(raw_th)
     u = alpha * I_all
     return beta, u, v_th
 
@@ -2068,12 +2069,10 @@ class SNNBlock(MemoryModule):
         self.W_gate = layer.Linear(D, D, bias=False, step_mode='s')
         self.W_skip = layer.Linear(D, D, bias=False, step_mode='s')
 
-        # ====== β/α/V_th 仅依赖 x（无 W^(V)·V 项） ======
-
-        # ====== 调制偏置（结构化初始化） ======
-        self.b_beta = nn.Parameter(torch.empty(DN))
-        self.b_alpha = nn.Parameter(torch.empty(DN))
-        self.b_th = nn.Parameter(torch.empty(DN))
+        # ====== β/α/V_th 仅依赖 x（无 W^(V)·V 项，且无 bias —— Llama 式无偏置；
+        # per-channel timescale/threshold 的 init 多样性 fold 进 W_beta_x/W_alpha_x/W_th_x
+        # 的行偏移，见 _initialize_parameters。SNNBlock 输入 v_in (input 神经元脉冲输出)
+        # 非负且有正 DC，故行偏移在 init 时起 bias 作用；训练中随机选择性分量长起来后洗掉。
 
         # ====== 输出投影：D*N → D（SNN 突触） ======
         self.W_out = layer.Linear(DN, D, bias=False, step_mode='s')
@@ -2088,63 +2087,62 @@ class SNNBlock(MemoryModule):
         # ====== 参数初始化 ======
         self._initialize_parameters()
 
+    # SNNBlock 输入 v_in (input 神经元脉冲输出) 的典型 DC 估计 (v_th_in·fire_rate at init).
+    # 用于把 β/α/v_th 的 per-channel init 目标换算成 W_*_x 的行偏移. 偏保守 (实际可能略大或略小):
+    # 估高 → β init 偏低 (短时间常数, 安全, 远离膜 runaway); 估低 → β init 偏高. 靠 LSUV/训练修.
+    _V_IN_DC_EST = 0.02
+
     def _initialize_parameters(self):
-        """功能引导初始化。"""
+        """功能引导初始化 (无 bias —— β/α/v_th 的 per-channel init 多样性 fold 进 W_*_x 行偏移)。"""
         D, N = self.D, self.N
+        DN = D * N
         K_ref = 16
 
         # 目标 β 分布：多时间尺度 [0.80, 0.99]
         beta_values = torch.linspace(0.80, 0.99, N)
 
-        # ====== 1. β 偏置：logit-spaced + 维度间随机扰动 ======
-        b_beta_per_n = torch.log(beta_values / (1.0 - beta_values))
-        # 以 per_n 值为均值，加 N(0, 0.1) 扰动打破 D 个通道的对称性
-        self.b_beta.data.copy_(b_beta_per_n.repeat(D))
-        self.b_beta.data.add_(torch.empty_like(self.b_beta).normal_(0, 0.1))
-
-        # ====== 2. α 偏置：softplus(0.5413) ≈ 1.0 + 维度间随机扰动 ======
-        # 以 0.5413 为均值，N(0, 0.1) 扰动 → α ∈ ~[0.7, 1.3]
-        self.b_alpha.data.normal_(0.5413, 0.1)
-
-        # ====== 3. W^(x) 权重 ======
+        # ====== 1. W^(x) 权重 (调制三投影额外 ×0.1 → 随机选择性分量小, init 时由行偏移主导) ======
         for lin in [self.W_in, self.W_gate, self.W_skip, self.W_out]:
             nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
         for lin in [self.W_beta_x, self.W_alpha_x, self.W_th_x]:
             nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
             lin.weight.data.mul_(0.1)
 
-        # ====== 4. W_in 时间尺度缩放 ======
+        # ====== 2. W_in 时间尺度缩放 ======
         scale_per_n = torch.sqrt(1.0 - beta_values ** 2)  # (N,)
-        scale_DN = scale_per_n.repeat(D)  # (D*N,)
         with torch.no_grad():
-            self.W_in.weight.mul_(scale_DN.unsqueeze(1))
+            self.W_in.weight.mul_(scale_per_n.repeat(D).unsqueeze(1))
 
-        # ====== 5. b_th：σ_V 校准 ======
-        # σ_V = sqrt(p/3) * sqrt(1 - β^{2K})
-        # 其中 p 是输入 firing rate。旧版假设 p=0.5（σ_I=0.408），
-        # 但实际 input_neuron firing rate 约 0.07~0.45，深层更低。
-        # 用 p=0.15 保守估计，避免 v_th 过高导致死神经元。
+        # ====== 3. v_th 目标的 σ_V 校准 (per-N) ——— 原 b_th 的逻辑, 现作为 |W_th_x(x)| 的目标 ======
+        # σ_V = sqrt(p/3) * sqrt(1 - β^{2K}); p=输入 firing rate, 保守取 0.15.
         p_assumed = 0.15
         sigma_I_base = math.sqrt(p_assumed / 3.0)
-        sigma_V_per_n = sigma_I_base * torch.sqrt(
-            1.0 - beta_values ** (2 * K_ref)
-        )
+        sigma_V_per_n = sigma_I_base * torch.sqrt(1.0 - beta_values ** (2 * K_ref))
         target_p_fire = torch.linspace(0.25, 0.08, N)
-        z_scores = math.sqrt(2.0) * torch.erfinv(
-            2.0 * (1.0 - target_p_fire) - 1.0
-        )
+        z_scores = math.sqrt(2.0) * torch.erfinv(2.0 * (1.0 - target_p_fire) - 1.0)
         target_V_th = sigma_V_per_n * z_scores
-        b_th_per_n = torch.clamp(target_V_th - self.v_th_min, min=0.05)
-        # 以 per_n 值为均值，加 N(0, 0.02) 扰动打破 D 个通道的对称性
-        self.b_th.data.copy_(b_th_per_n.repeat(D))
-        self.b_th.data.add_(torch.empty_like(self.b_th).normal_(0, 0.02))
+        raw_th_target_per_n = torch.clamp(target_V_th - self.v_th_min, min=0.05)  # |W_th_x(x)| 的目标
 
-        # ====== 6. W_out 发放率均衡缩放 ======
+        # ====== 4. 把 β/α/v_th 的 init 目标 fold 进 W_*_x 的行偏移 ======
+        # v_in 非负, 典型 DC ≈ _V_IN_DC_EST → W_*_x(v_in)[i] ≈ (行偏移_i)·Σ_j v_in_j ≈ 行偏移_i·D·DC.
+        # 令其 = 目标_i → 行偏移_i = 目标_i / (D·DC). 加 per-channel 抖动打破 D 通道对称.
+        S = D * self._V_IN_DC_EST
+        with torch.no_grad():
+            raw_beta_target = torch.log(beta_values / (1.0 - beta_values)).repeat(D)
+            raw_beta_target = raw_beta_target + torch.empty(DN).normal_(0, 0.1)
+            self.W_beta_x.weight.add_((raw_beta_target / S).unsqueeze(1))
+
+            raw_alpha_target = torch.empty(DN).normal_(0.5413, 0.1)  # softplus(0.5413)≈1.0, α∈~[0.7,1.3]
+            self.W_alpha_x.weight.add_((raw_alpha_target / S).unsqueeze(1))
+
+            raw_th_target = raw_th_target_per_n.repeat(D) + torch.empty(DN).normal_(0, 0.02)
+            self.W_th_x.weight.add_((raw_th_target / S).unsqueeze(1))
+
+        # ====== 5. W_out 发放率均衡缩放 ======
         out_scale_per_n = 1.0 / torch.sqrt(target_p_fire)
         out_scale_per_n = out_scale_per_n / out_scale_per_n.mean()
-        out_scale_DN = out_scale_per_n.repeat(D)
         with torch.no_grad():
-            self.W_out.weight.mul_(out_scale_DN.unsqueeze(0))
+            self.W_out.weight.mul_(out_scale_per_n.repeat(D).unsqueeze(0))
 
     def forward_parallel(self, h_seq: torch.Tensor, k_t: torch.Tensor, K: int, training: bool) -> torch.Tensor:
         """
@@ -2184,18 +2182,12 @@ class SNNBlock(MemoryModule):
         if _FUSED_MODULATION_CHECKPOINT and self.training and I_all.requires_grad:
             beta_all, u_hidden, v_th_all = checkpoint(
                 _fused_modulation,
-                raw_beta, self.b_beta.to(compute_dtype),
-                raw_alpha, self.b_alpha.to(compute_dtype),
-                raw_th, self.b_th.to(compute_dtype),
-                self.v_th_min, I_all,
+                raw_beta, raw_alpha, raw_th, self.v_th_min, I_all,
                 use_reentrant=False,
             )
         else:
             beta_all, u_hidden, v_th_all = _fused_modulation(
-                raw_beta, self.b_beta.to(compute_dtype),
-                raw_alpha, self.b_alpha.to(compute_dtype),
-                raw_th, self.b_th.to(compute_dtype),
-                self.v_th_min, I_all,
+                raw_beta, raw_alpha, raw_th, self.v_th_min, I_all,
             )
 
         # 获取隐神经元初始状态
@@ -2247,10 +2239,10 @@ class SNNBlock(MemoryModule):
 
         I_t = self.W_in(x)
 
-        # β 调制仅依赖 x
-        beta = torch.sigmoid(self.W_beta_x(x) + self.b_beta)
-        alpha = F.softplus(self.W_alpha_x(x) + self.b_alpha)
-        v_th = self.v_th_min + torch.abs(self.W_th_x(x) + self.b_th)
+        # β/α/v_th 选择性调制仅依赖 x (无 bias —— init 多样性已 fold 进 W_*_x 行偏移)
+        beta = torch.sigmoid(self.W_beta_x(x))
+        alpha = F.softplus(self.W_alpha_x(x))
+        v_th = self.v_th_min + torch.abs(self.W_th_x(x))
 
         gate = torch.sigmoid(self.W_gate(x))
         I_skip = self.W_skip(x)
@@ -3401,71 +3393,15 @@ class SNNLanguageModel(nn.Module):
         return SNNModelOutput(logits=logits, ponder_cost=ponder_cost)
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
+        """No-op (历史接口保留, 训练脚本仍调用).
+
+        原作用: 给 b_beta/b_alpha/b_th 做 sigmoid/softplus 饱和补偿 + 层间梯度均衡。
+        bias 重构后这三个参数已删除 (β/α/v_th 全由 W_*_x(x) 给出, 无 bias)。饱和问题
+        现落在 W_beta_x/W_alpha_x.weight 上, 但这些矩阵走 Muon —— Muon 对梯度做正交化,
+        更新幅度不依赖梯度幅度, 故 "梯度被压扁" 的问题对它们基本不成立, 无需补偿。
+        TODO: 若后续观察到 W_beta_x grad 仍 saturate, 再考虑 per-row 补偿。
         """
-        Natural Gradient 补偿（两阶段）。
-
-        Phase 1: Sigmoid/softplus 饱和补偿
-          β = sigmoid(b_beta), sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）梯度衰减 100x。
-          补偿: grad /= activation'(b)，等价于在 β/α 空间做梯度下降。
-
-        Phase 2: 层间梯度均衡
-          残差链反向传播每层放大 ~1.17×，num_layers 层累积显著梯度比。
-          深层选择性参数（b_beta/b_alpha/b_th）梯度被压制，无法有效学习。
-          修复: 将每层调制参数梯度 norm 归一化到所有层的几何均值。
-
-        调用时机: scaler.unscale_(optimizer) 之后、clip_grad_norm_ 之前。
-
-        Args:
-            max_comp: 补偿因子上限（防止极端值导致不稳定）
-        """
-        # ====== Phase 1: Sigmoid/softplus 饱和补偿 ======
-        for layer_module in self.layers:
-            if not hasattr(layer_module, 'snn_block'):
-                continue  # 联想记忆层无调制参数
-            block = layer_module.snn_block
-
-            # b_beta: sigmoid 饱和补偿
-            # sigmoid'(z) = sigmoid(z) · (1 - sigmoid(z)) = β · (1-β)
-            if block.b_beta.grad is not None:
-                with torch.no_grad():
-                    beta = torch.sigmoid(block.b_beta.data)
-                    sigmoid_deriv = (beta * (1.0 - beta)).clamp(min=1.0 / max_comp)
-                    block.b_beta.grad.div_(sigmoid_deriv)
-
-            # b_alpha: softplus 补偿（较温和，softplus'(z) = sigmoid(z)）
-            if block.b_alpha.grad is not None:
-                with torch.no_grad():
-                    softplus_deriv = torch.sigmoid(block.b_alpha.data).clamp(min=0.1)
-                    block.b_alpha.grad.div_(softplus_deriv)
-
-            # b_th: |·| 导数为 ±1，无衰减，不需要补偿
-
-        # ====== Phase 2: 层间梯度均衡 ======
-        # 残差链 h = h + sublayer(h) 的反向路径 ∂h_{l+1}/∂h_l = I + ∂sublayer/∂h_l
-        # 每层放大 ~1.17×, 深层累积显著梯度比 → L0 梯度远大于 L_{num_layers-1}
-        # 用几何均值归一化每层调制参数梯度 norm，消除残差放大效应
-        with torch.no_grad():
-            for param_name in ['b_beta', 'b_alpha', 'b_th']:
-                norms = []
-                params_list = []
-                for layer_module in self.layers:
-                    if not hasattr(layer_module, 'snn_block'):
-                        continue
-                    p = getattr(layer_module.snn_block, param_name)
-                    if p.grad is not None:
-                        n = p.grad.norm().item()
-                        if n > 1e-12:
-                            norms.append(n)
-                            params_list.append(p)
-
-                if len(norms) >= 2:
-                    # 几何均值: exp(mean(log(norms))) — 对数尺度均衡，不受极端值影响
-                    log_mean = sum(math.log(n) for n in norms) / len(norms)
-                    geo_mean = math.exp(log_mean)
-                    for p, n in zip(params_list, norms):
-                        scale = geo_mean / n
-                        scale = max(min(scale, max_comp), 1.0 / max_comp)
-                        p.grad.mul_(scale)
+        return
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
@@ -3492,9 +3428,6 @@ class SNNLanguageModel(nn.Module):
             'W_gate': [],
             'W_skip': [],
             'W_out': [],
-            'b_beta': [],
-            'b_alpha': [],
-            'b_th': [],
             'block_output_neuron': [],
             # SNNFFN 参数
             'ffn_gate_proj': [],
@@ -3565,9 +3498,6 @@ class SNNLanguageModel(nn.Module):
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
-            groups['b_beta'].append(block.b_beta)
-            groups['b_alpha'].append(block.b_alpha)
-            groups['b_th'].append(block.b_th)
 
             # SNNFFN 参数
             groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
@@ -3684,10 +3614,10 @@ class NeuronSparkForCausalLM(PreTrainedModel):
                 layer_mod.rope_sin.data = sin.to(device=device, dtype=dtype)
         # Per-tensor 恢复混合精度: 矩阵→bf16, 神经元/PonderNet buffer→保持 fp32
         # 对齐训练 utils/param_groups.promote_neuron_params_fp32:
-        #   params: 仅 .w/.v_th/.b_beta/.b_alpha/.b_th 后缀 → fp32
+        #   params: 仅 .w/.v_th 后缀 (神经元标量) + .ahp → fp32; (b_beta/b_alpha/b_th 已删除)
         #   buffers: k_predictor 下的 .bias 和 ._usage_ema → fp32
         if apply_mixed:
-            _NEURON_PARAM_SUFFIXES = ('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th')
+            _NEURON_PARAM_SUFFIXES = ('.w', '.v_th', '.ahp')
             for name, p in model.named_parameters():
                 if name.endswith(_NEURON_PARAM_SUFFIXES):
                     continue  # 神经元参数保 fp32

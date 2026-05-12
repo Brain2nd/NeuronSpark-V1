@@ -233,32 +233,35 @@ def e2_state_autocorr(model, ids):
 # E3: 因果扰动影响
 # ============================================================
 @torch.no_grad()
-def _influence_curve(model, ids, deltas, label):
-    """influence(Δ) = ‖logits_T(扰动 pos T-1-Δ) - logits_T(原)‖ / ‖ε‖. 返回 dict Δ→influence."""
+def _influence_curve(model, ids, deltas, label, n_eps=16, eps_scale=0.05):
+    """influence(Δ) = mean over n_eps 随机方向 ε of ‖logits_T(扰动 pos T-1-Δ) - logits_T(原)‖ / ‖ε‖.
+    多 ε 平均消掉「单个 ε 碰巧对齐敏感方向」的噪声。返回 dict Δ→influence。"""
     snn = model.snn
     T = ids.shape[1]
     embed = snn.embed_tokens
     base_logits_T = _fwd(model, ids).logits[:, -1, :].float()
     orig_fwd = embed.forward
-    eps_scale = 0.1
-    torch.manual_seed(0)
     out = {}
     for d in deltas:
         pos = T - 1 - d
         if pos < 0:
             out[d] = float("nan"); continue
-        noise = torch.randn(snn.D, device=DEV, dtype=torch.float32) * eps_scale
-        eps_norm = noise.norm().item()
-        def patched(input_ids, _orig=orig_fwd, _pos=pos, _noise=noise):
-            e = _orig(input_ids).clone()
-            e[:, _pos, :] = e[:, _pos, :] + _noise.to(e.dtype)
-            return e
-        embed.forward = patched
-        try:
-            dl = (_fwd(model, ids).logits[:, -1, :].float() - base_logits_T).norm(dim=-1).mean().item()
-        finally:
-            embed.forward = orig_fwd
-        out[d] = dl / eps_norm
+        g = torch.Generator(device=DEV).manual_seed(1000 + d)
+        accum = 0.0
+        for _ in range(n_eps):
+            noise = torch.randn(snn.D, device=DEV, dtype=torch.float32, generator=g) * eps_scale
+            eps_norm = noise.norm().item()
+            def patched(input_ids, _orig=orig_fwd, _pos=pos, _noise=noise):
+                e = _orig(input_ids).clone()
+                e[:, _pos, :] = e[:, _pos, :] + _noise.to(e.dtype)
+                return e
+            embed.forward = patched
+            try:
+                dl = (_fwd(model, ids).logits[:, -1, :].float() - base_logits_T).norm(dim=-1).mean().item()
+            finally:
+                embed.forward = orig_fwd
+            accum += dl / eps_norm
+        out[d] = accum / n_eps
     return out
 
 

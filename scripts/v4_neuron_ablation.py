@@ -42,6 +42,13 @@ ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
 ap.add_argument("--save_to", default=None, help="跑完保存 {state_dict, config, ...} 到此路径 (用于后续分析)")
 ap.add_argument("--lsuv", action="store_true", help="训练前跑 LSUV v2 初始化 (校准 v_th + scale W_in 让 hidden 发放 ~lsuv_target_p)")
 ap.add_argument("--lsuv_target_p", type=float, default=0.3)
+# 模型尺寸（默认 = 之前 ablation 的 ~290M; 调大跑更大规模 derisk）
+ap.add_argument("--D", type=int, default=512)
+ap.add_argument("--N", type=int, default=16)
+ap.add_argument("--K_max", type=int, default=12)
+ap.add_argument("--num_layers", type=int, default=12)
+ap.add_argument("--D_ff", type=int, default=1024)
+ap.add_argument("--memory_layer_interval", type=int, default=4)
 args = ap.parse_args()
 
 DEV = "cuda"
@@ -105,8 +112,8 @@ def log(s):
 
 def run_one(name, overrides):
     torch.manual_seed(42)
-    cfg = NeuronSparkConfig(vocab_size=VOCAB, D=512, N=16, K=12, num_layers=12, D_ff=1024,
-                            memory_layer_interval=4, **overrides)
+    cfg = NeuronSparkConfig(vocab_size=VOCAB, D=args.D, N=args.N, K=args.K_max, num_layers=args.num_layers,
+                            D_ff=args.D_ff, memory_layer_interval=args.memory_layer_interval, **overrides)
     model = NeuronSparkForCausalLM(cfg).to(DEV)
     for nm, p in model.named_parameters():
         if nm.endswith(('.w', '.v_th', '.b_beta', '.b_alpha', '.b_th', '.ahp')):

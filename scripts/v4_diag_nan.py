@@ -21,15 +21,34 @@ from neuronspark import NeuronSparkConfig, NeuronSparkForCausalLM
 import neuronspark.modeling_neuronspark as _M
 from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
 
-# ---- monkeypatch segmented PLIF to capture max|V_post| per call (membrane runaway probe) ----
+# ---- monkeypatch segmented PLIF to capture max|V_post| per call + backward grad magnitudes (selective only) ----
 _VPOST_TRACE = []  # reset each step; collects (tag, max_abs_Vpost)
+_BWD_TRACE = []    # reset each step; collects per selective-call: dict {'gout': (max,finite), 'gbeta':..., 'gu':..., 'gvth':...}
+def _hook(rec, key):
+    def h(g):
+        try:
+            rec[key] = (float(g.detach().abs().max()), bool(torch.isfinite(g).all()))
+        except Exception:
+            rec[key] = ("err", False)
+    return h
 def _wrap_seg(fn, tag):
     def wrapped(*a, **kw):
         out = fn(*a, **kw)
         try:
-            vp = out[1]  # (output, V_post, v_carry)
+            vp = out[1]
             if isinstance(vp, torch.Tensor) and vp.numel():
                 _VPOST_TRACE.append((tag, float(vp.detach().abs().max())))
+            if tag == "sel":
+                rec = {}; _BWD_TRACE.append(rec)
+                # 输入: a[0]=beta_all, a[1]=u_hidden, a[2]=v_th_all  →  grad = grad_beta / grad_u / grad_vth
+                for i, key in ((0, 'gbeta'), (1, 'gu'), (2, 'gvth')):
+                    t = a[i] if i < len(a) else None
+                    if isinstance(t, torch.Tensor) and t.requires_grad:
+                        t.register_hook(_hook(rec, key))
+                # 输出: out[0]=output_hidden  →  grad = g_out (从下游 W_out 等传回 SNNBlock 的)
+                o0 = out[0]
+                if isinstance(o0, torch.Tensor) and o0.requires_grad:
+                    o0.register_hook(_hook(rec, 'gout'))
         except Exception:
             pass
         return out
@@ -215,6 +234,16 @@ def dump_state(step):
     print(f"[this-forward per segmented-PLIF call (tag, max|V_post|)]")
     for tag, vp in _VPOST_TRACE:
         print(f"  {tag}: max|V_post|={vp:.4e}", flush=True)
+    print(f"[backward grad magnitudes per selective(SNNBlock-hidden) call — gout=∂L/∂out 从下游传回, gbeta/gu/gvth=∂L/∂(β,u,v_th)]")
+    for i, rec_ in enumerate(_BWD_TRACE):
+        parts = []
+        for k in ('gout', 'gbeta', 'gu', 'gvth'):
+            if k in rec_:
+                mx, fin = rec_[k]
+                parts.append(f"{k}={mx if isinstance(mx,str) else f'{mx:.3e}'}{'' if fin else '(INF!)'}")
+            else:
+                parts.append(f"{k}=?")
+        print(f"  sel-call#{i}: " + "  ".join(parts), flush=True)
     # recent activation max trajectory
     print(f"\n[recent trajectory (last {len(fwd_history)} steps): loss / Vpost_max / β_max / u_max / vthH_min / hidden_fr_μ]")
     for s in fwd_history:
@@ -239,7 +268,7 @@ for step in range(args.max_steps):
     ids = data_t[idx]
     opt.zero_grad()
     first_nan["where"] = None
-    _VPOST_TRACE.clear(); _MOD_TRACE.clear()
+    _VPOST_TRACE.clear(); _MOD_TRACE.clear(); _BWD_TRACE.clear()
     with torch.amp.autocast(DEV, dtype=torch.bfloat16):
         out = model(input_ids=ids, labels=ids)
     loss = out.loss

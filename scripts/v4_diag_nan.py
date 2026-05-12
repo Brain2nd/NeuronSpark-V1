@@ -56,15 +56,20 @@ def _wrap_seg(fn, tag):
 _M.segmented_plif_selective = _wrap_seg(_M.segmented_plif_selective, "sel")
 _M.segmented_plif_rowparam = _wrap_seg(_M.segmented_plif_rowparam, "row")
 
-# ---- monkeypatch _fused_modulation to capture per-layer β.max / u.abs.max / v_th_hidden.min ----
-# (SNNBlock.forward_parallel 调它得到 selective 神经元的 β/u/v_th; 用于看 β 是否漂到 ~1 + 输入电流是否爆)
-_MOD_TRACE = []  # reset each step; collects (beta_max, u_abs_max, vth_min) per SNNBlock layer call
+# ---- monkeypatch _fused_modulation to capture per-layer β / u / v_th_hidden + 递归 Jacobian 估计 ----
+# (SNNBlock.forward_parallel 调它得到 selective 神经元的 β/u/v_th; 用于看 β、电流、v_th_hidden 量级 + |J|)
+_SURR_ALPHA = 4.0  # = config.surrogate_alpha 默认; 用于估 |J| = β·max(1, |1 - v_th·α/4|)
+_MOD_TRACE = []  # reset each step; collects (beta_max, u_abs_max, vth_min, vth_max, Jmax_est) per SNNBlock call
 def _wrap_fused(fn):
     def wrapped(*a, **kw):
         out = fn(*a, **kw)
         try:
-            beta, u, v_th = out  # _fused_modulation 返回 (beta, u, v_th)
-            _MOD_TRACE.append((float(beta.detach().max()), float(u.detach().abs().max()), float(v_th.detach().min())))
+            beta, u, v_th = out  # _fused_modulation 返回 (beta, u, v_th); v_th = v_th_min + |W_th_x(x)| 的逐 token 值
+            b = beta.detach().float(); vt = v_th.detach().float()
+            # 递归 Jacobian J = β·(1 - (v_th+ahp)·g_surr), g_surr ∈ [0, α/4] → J ∈ [β·(1-v_th·α/4), β]
+            # |J|_max = β·max(1, |1 - v_th·α/4|)  (取 ahp=0 估计)
+            jmax = (b * torch.maximum(torch.ones_like(b), torch.abs(1.0 - vt * (_SURR_ALPHA / 4.0)))).max()
+            _MOD_TRACE.append((float(b.max()), float(u.detach().abs().max()), float(vt.min()), float(vt.max()), float(jmax)))
         except Exception:
             pass
         return out
@@ -228,9 +233,10 @@ def dump_state(step):
         g_fr = getattr(g_fr, '_last_firing_rate', None) if g_fr else None
         print(f"  layer{i:2d} ({type(layer).__name__:25s}): hidden={h_fr}  ffn_gate={g_fr}", flush=True)
     # per-call snapshot from THIS (failing) forward
-    print(f"\n[this-forward per-SNNBlock-layer (β.max, u.abs.max, v_th_hidden.min) — order = layer order]")
-    for i, (bm, um, vm) in enumerate(_MOD_TRACE):
-        print(f"  snnblock-call#{i}: β_max={bm:.6f}  u_abs_max={um:.4e}  v_th_hidden_min={vm:.4e}", flush=True)
+    print(f"\n[this-forward per-SNNBlock-layer (β.max, u.abs.max, v_th_hidden [min,max], |J|_max≈β·max(1,|1−v_th·α/4|)) — order = layer order]")
+    for i, t in enumerate(_MOD_TRACE):
+        bm, um, vmn, vmx, jm = t
+        print(f"  snnblock-call#{i}: β_max={bm:.6f}  u_abs_max={um:.4e}  v_th_hidden=[{vmn:.4e},{vmx:.4e}]  |J|_max={jm:.4e}", flush=True)
     print(f"[this-forward per segmented-PLIF call (tag, max|V_post|)]")
     for tag, vp in _VPOST_TRACE:
         print(f"  {tag}: max|V_post|={vp:.4e}", flush=True)
@@ -277,11 +283,13 @@ for step in range(args.max_steps):
     if _VPOST_TRACE:
         rec["vpost_max"] = max(v for _, v in _VPOST_TRACE)
         rec["res_max"] = rec["vpost_max"]
-    # selective β / u / v_th_hidden probe (per SNNBlock layer, from _fused_modulation)
+    # selective β / u / v_th_hidden / |J| probe (per SNNBlock layer, from _fused_modulation)
     if _MOD_TRACE:
-        rec["beta_max"] = max(b for b, _, _ in _MOD_TRACE)
-        rec["u_max"] = max(u for _, u, _ in _MOD_TRACE)
-        rec["vthH_min"] = min(v for _, _, v in _MOD_TRACE)
+        rec["beta_max"] = max(t[0] for t in _MOD_TRACE)
+        rec["u_max"] = max(t[1] for t in _MOD_TRACE)
+        rec["vthH_min"] = min(t[2] for t in _MOD_TRACE)
+        rec["vthH_max"] = max(t[3] for t in _MOD_TRACE)
+        rec["Jmax"] = max(t[4] for t in _MOD_TRACE)
     fr_h_list = []
     for layer in model.snn.layers:
         nb = getattr(layer, 'snn_block', None)
@@ -350,9 +358,10 @@ for step in range(args.max_steps):
         fr_h = rec.get("fr_h", float('nan'))
         vpm = rec.get("vpost_max", float('nan'))
         bmx = rec.get("beta_max", float('nan')); umx = rec.get("u_max", float('nan')); vhmn = rec.get("vthH_min", float('nan'))
+        vhmx = rec.get("vthH_max", float('nan')); jmx = rec.get("Jmax", float('nan'))
         # W_beta_x norm: bias 重构后 β=sigmoid(W_beta_x(x)), W_beta_x 涨→β→1
         wbx_max = max((p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_beta_x' in nm), default=float('nan'))
-        print(f"step {step:4d}: loss={float(loss):.4f}  gnorm={gnorm:.2e}  Vpost_max={vpm:.3e}  β_max={bmx:.6f}  u_max={umx:.3e}  vthH_min={vhmn:.3e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  {bb_str}  {ahp_str}  W_in_max={win_max:.3e}  W_beta_x_max={wbx_max:.3e}  W_out_max={wout_max:.3e}  fr_h={fr_h:.4f}", flush=True)
+        print(f"step {step:4d}: loss={float(loss):.4f}  gnorm={gnorm:.2e}  Vpost_max={vpm:.3e}  β_max={bmx:.6f}  u_max={umx:.3e}  vthH=[{vhmn:.3e},{vhmx:.3e}]  |J|_max={jmx:.3e}  v_th[{v_th_min:.4f},{v_th_max:.4f}]  W_th_x_max={max((p.data.float().abs().max().item() for nm,p in model.named_parameters() if 'W_th_x' in nm), default=float('nan')):.3e}  W_in_max={win_max:.3e}  W_beta_x_max={wbx_max:.3e}  fr_h={fr_h:.4f}", flush=True)
 
 print("\n=== DIAG END ===", flush=True)
 for h in handles: h.remove()

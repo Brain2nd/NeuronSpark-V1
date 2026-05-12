@@ -39,7 +39,8 @@ ap.add_argument("--muon_lr", type=float, default=0.02)
 ap.add_argument("--adam_base_lr", type=float, default=2e-4)
 ap.add_argument("--lion_lr", type=float, default=5e-4)
 ap.add_argument("--neuron_lr_mult", type=float, default=10.0)
-ap.add_argument("--save_to", default=None, help="跑完保存 {state_dict, config, ...} 到此路径 (用于后续分析)")
+ap.add_argument("--save_to", default=None, help="保存 {state_dict, config, ...} 到此路径 (用于后续分析)")
+ap.add_argument("--save_every", type=int, default=500, help="每 N 步存一次 ckpt (覆盖 --save_to); 0=只在结束时存. 防 run 被杀后全丢.")
 ap.add_argument("--lsuv", action="store_true", help="训练前跑 LSUV v2 初始化 (校准 v_th + scale W_in 让 hidden 发放 ~lsuv_target_p)")
 ap.add_argument("--lsuv_target_p", type=float, default=0.3)
 # 模型尺寸（默认 = 之前 ablation 的 ~290M; 调大跑更大规模 derisk）
@@ -153,6 +154,16 @@ def run_one(name, overrides):
     losses = []
     n_skipped = 0
     t0, step0 = None, 0
+    ckpt_path = (args.save_to if args.only else f"{args.save_to}.{name}") if args.save_to else None
+
+    def _save(step_, tag):
+        if not ckpt_path:
+            return
+        cur = sum(losses[-100:]) / len(losses[-100:]) if len(losses) >= 100 else (sum(losses) / max(1, len(losses)) if losses else float('nan'))
+        torch.save({"state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
+                    "config": cfg.to_dict(), "name": name, "final_loss": cur, "step": step_}, ckpt_path)
+        log(f"  [{name}] {tag} ckpt → {ckpt_path} (step {step_}, loss(last100)={cur:.4f})")
+
     for step in range(STEPS):
         idx = torch.randint(0, data_t.shape[0], (BATCH,), generator=rng, device=DEV)
         ids = data_t[idx]
@@ -188,16 +199,14 @@ def run_one(name, overrides):
             fr_gate = getattr(model.snn.layers[0].snn_ffn.gate_neuron, '_last_firing_rate', float('nan'))
             ek = getattr(model.snn, '_output_ek', float('nan'))
             log(f"  [{name}] step {step:4d}: loss={float(loss):.4f}  E[K]_out={ek:.2f}  fire(hidden)={hsum} fire(gate0)={fr_gate:.3f}")
+        if args.save_every and step > 0 and step % args.save_every == 0:
+            _save(step, "periodic")
     torch.cuda.synchronize()
     spm = (time.time() - t0) / max(1, (len(losses) - 1 - step0)) * 1000 if t0 else 0
     final = sum(losses[-100:]) / len(losses[-100:]) if len(losses) >= 100 else (sum(losses) / max(1, len(losses)))
     log(f"RESULT {name}: params={n_params:.1f}M n_ahp={n_ahp} init_loss={losses[0]:.4f} "
         f"final_loss(last100)={final:.4f} ms_step={spm:.0f}")
-    if args.save_to:
-        path = args.save_to if args.only else f"{args.save_to}.{name}"
-        torch.save({"state_dict": {k: v.cpu() for k, v in model.state_dict().items()},
-                    "config": cfg.to_dict(), "name": name, "final_loss": final, "step": len(losses)}, path)
-        log(f"  saved trained model → {path}")
+    _save(len(losses), "final")
     del model, opt
     gc.collect(); torch.cuda.empty_cache()
     return final

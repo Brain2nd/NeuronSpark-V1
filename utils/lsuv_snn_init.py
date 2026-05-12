@@ -48,6 +48,17 @@ except Exception:
         return float(torch.erfinv(torch.tensor(2 * q - 1)) * _m.sqrt(2))
 
 
+# 校准的 v_th 每通道上界 = C·median(across channels): 防个别 V_pre 离群通道被设巨大 v_th 而永远不发放
+# (旧 bug: 1.24B 上 merged-gate v_th μ→0.89, 那层 FFN gate 死). C=4 留足正常通道间差异, 只截真离群.
+_VTH_OUTLIER_CAP_C = 4.0
+
+
+def _calib_vth(v_flat, p):
+    """v_th = (1-p) per-channel 经验分位数, clamp 下界 1e-4, 上界 cap 在 C·median(across channels)."""
+    vth = v_flat.quantile(1.0 - p, dim=0).clamp(min=1e-4)
+    return torch.minimum(vth, _VTH_OUTLIER_CAP_C * vth.median())
+
+
 @torch.no_grad()
 def lsuv_snn_init(
     model: nn.Module,
@@ -74,6 +85,10 @@ def lsuv_snn_init(
     import neuronspark.modeling_neuronspark as nm
     orig_row = nm.segmented_plif_rowparam
     orig_sel = nm.segmented_plif_selective
+    # LSUV 校准 forward 期间走 eager modulation (不走 torch.compile) —— 防 torch.compile 在
+    # no_grad+checkpoint+DeepSpeed 组合下产 CPU 张量喂进 Triton kernel 而 crash (旧 bug).
+    orig_fused = getattr(nm, "_fused_modulation", None)
+    eager_fused = getattr(nm, "_fused_modulation_eager", None)
 
     # 每次 forward 抓所有 segmented PLIF call 的 V_pre (reconstruct from output+V_post+ahp·s)
     calls = []  # list of (V_pre flat (N, H) on CPU, ahp_row or None)
@@ -120,6 +135,8 @@ def lsuv_snn_init(
     model.eval()
     nm.segmented_plif_rowparam = mk_wrap(orig_row)
     nm.segmented_plif_selective = mk_wrap(orig_sel)
+    if eager_fused is not None:
+        nm._fused_modulation = eager_fused
     try:
         for p_idx in range(n_passes):
             calls.clear()
@@ -135,7 +152,7 @@ def lsuv_snn_init(
                 if kind == "plif":
                     neuron = ref
                     fr0 = _fire_rate(v_flat, neuron.v_th.detach().float().cpu())
-                    new_vth = v_flat.quantile(1.0 - target_p_fire, dim=0).clamp(min=1e-4)
+                    new_vth = _calib_vth(v_flat, target_p_fire)
                     neuron.v_th.data.copy_(new_vth.to(neuron.v_th.device, dtype=neuron.v_th.dtype))
                     if verbose:
                         fr1 = _fire_rate(v_flat, neuron.v_th.detach().float().cpu())
@@ -145,7 +162,7 @@ def lsuv_snn_init(
                     H = v_flat.shape[1] // 2
                     for sub, vf in ((gate, v_flat[:, :H]), (up, v_flat[:, H:])):
                         fr0 = _fire_rate(vf, sub.v_th.detach().float().cpu())
-                        new_vth = vf.quantile(1.0 - target_p_fire, dim=0).clamp(min=1e-4)
+                        new_vth = _calib_vth(vf, target_p_fire)
                         sub.v_th.data.copy_(new_vth.to(sub.v_th.device, dtype=sub.v_th.dtype))
                         if verbose:
                             fr1 = _fire_rate(vf, sub.v_th.detach().float().cpu())
@@ -189,6 +206,8 @@ def lsuv_snn_init(
     finally:
         nm.segmented_plif_rowparam = orig_row
         nm.segmented_plif_selective = orig_sel
+        if orig_fused is not None:
+            nm._fused_modulation = orig_fused
         functional.reset_net(snn)
         if was_training:
             model.train()

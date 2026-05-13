@@ -1,4 +1,7 @@
-"""Track B / B1 — Induction Heads (Mamba §4.1.2 招牌合成任务 + 长度外推).
+"""Track B / B1 — Induction Heads (Mamba §4.1.2 招牌合成任务 + 长度泛化).
+
+术语: 本脚本里的「长度泛化」= 训短序列(train_len)·zero-shot 测远长序列·不改模型, 是一个现象;
+与之区分的「外推 / context-length extension」(NoPE/ALiBi/PI/YaRN 那类手段) 本脚本不涉及.
 
 任务 (严格照 HazyResearch/safari `src/dataloaders/synthetics.py::generate_induction_head`):
   序列 = [input_seq_len 个随机 token, COPY_PREFIX] —— 然后在前面随机 num_triggers 个位置插入
@@ -7,11 +10,12 @@
   位置上算 next-token CE loss (前面随机段 mask 掉 -100, 学不了也不该学). "答案" = 序列尾部那
   induction_len 个 to_copy token (跟在最后一个 COPY_PREFIX 后面, 模型必须靠 induction head 召回).
 
-长度外推: 训短序列 (train_len ~64-256) → eval 时把 input_seq_len 拉到远超训练长度, 报答案
-  token 准确率 vs eval seq_len. Mamba / SSM / 线性注意力外推不掉点; softmax-attention 掉点.
+长度泛化: 训短序列 (train_len ~64-256) → eval 时把 input_seq_len 拉到远超训练长度, 报答案
+  token 准确率 vs eval seq_len. Mamba / SSM / 线性注意力 zero-shot 长度泛化不掉点; softmax-attention 掉点.
 
-模型: v4 (NeuronSpark, 含 SNNAttention) / v4 --no_xpos (关 SNNAttention 跨位置混合, 消融) /
-      transformer (RoPE baseline, 用来 sanity-check 配方 —— 它在 in-dist 上必须学到 ~100%).
+模型: v4 (NeuronSpark, 含 SNNAttention) / v4 --no_xpos (关 SNNAttention 跨位置混合 = 纯 SNNBlock SSM, 消融) /
+      transformer (RoPE baseline, 原生 RoPE attention 长度泛化会塌) / mamba (selective SSM baseline, 任务原产地模型).
+      四个 in-dist 都该到 ~100%; 看点在长度泛化曲线 (transformer 塌 / mamba / v4 / v4-noxpos).
 
 参考超参 (safari induction_head config): vocab~16-20, 小模型 (d~32-64, 2-4 层), AdamW lr=5e-4
   wd=0.1 + cosine warmup, batch 32, 训到收敛 (~40k+ 步, 见 Mamba issue #62). v4 用自己的 MAL.
@@ -56,11 +60,11 @@ ap.add_argument("--no_xpos", action="store_true", help="(v4) 关掉 SNNAttention
 ap.add_argument("--muon_lr", type=float, default=0.005)
 ap.add_argument("--adam_lr", type=float, default=2e-4)
 ap.add_argument("--lion_lr", type=float, default=1e-4)
-# transformer baseline config (小, 同 safari 量级但用 RoPE 以支持外推对照)
+# transformer baseline config (小, 同 safari 量级但用 RoPE; 原生 RoPE attention 长度泛化会塌, 作对照)
 ap.add_argument("--t_d", type=int, default=64)
 ap.add_argument("--t_layers", type=int, default=2)
 ap.add_argument("--t_heads", type=int, default=2)
-# mamba baseline config (selective SSM, induction-heads 任务的"原产地"模型 —— 外推应不掉点)
+# mamba baseline config (selective SSM, induction-heads 任务的"原产地"模型 —— 长度泛化应不掉点)
 ap.add_argument("--m_d", type=int, default=128)
 ap.add_argument("--m_layers", type=int, default=4)
 ap.add_argument("--eval_lens", default="64,128,256,512,1024,2048,4096,8192,16384")
@@ -282,10 +286,10 @@ for step in range(args.steps):
             aacc = answer_acc(logits, ids, T)
         log(f"  step {step:6d}: lr×{sc:.3f} loss={loss.item():.4f}  answer_acc={aacc:.3f}")
 
-# ---------------- eval: length extrapolation ----------------
+# ---------------- eval: length generalization (zero-shot, 训短测长, 不改模型) ----------------
 model.eval()
 np_eval = np.random.default_rng(999); _torch_gen.manual_seed(999)
-log(f"=== extrapolation: answer token accuracy vs eval input_seq_len (train_len={args.train_len}) ===")
+log(f"=== length-generalization: answer token accuracy vs eval input_seq_len (train_len={args.train_len}) ===")
 for L in [int(x) for x in args.eval_lens.split(",")]:
     if L < args.induction_len + 2:
         continue
@@ -300,6 +304,6 @@ for L in [int(x) for x in args.eval_lens.split(",")]:
             pred = logits[:, T - il - 1: T - 1, :].argmax(-1)
             tgt = ids[:, T - il:]
             n_corr += (pred == tgt).all(dim=1).sum().item(); n_tot += B
-    tag = "IN-DIST" if L <= args.train_len else "EXTRAPOL"
+    tag = "IN-DIST" if L <= args.train_len else "LEN-GEN"
     log(f"  input_seq_len={L:7d}: exact-answer acc={n_corr/n_tot:.3f}  ({n_corr}/{n_tot})  [{tag}]")
 log("=== DONE ===")

@@ -73,6 +73,9 @@ ap.add_argument("--rope_eval", default="none", help="逗号分隔, 对训好的 
 ap.add_argument("--yarn_beta_fast", type=float, default=32.0)
 ap.add_argument("--yarn_beta_slow", type=float, default=1.0)
 ap.add_argument("--rope_base", type=float, default=10000.0, help="RoPE 基频 (transformer + v4 SNNAttention 都用); 训练就用这个值")
+ap.add_argument("--save_ckpt", default=None, help="训完落盘 model + args 到该路径 (后续 --eval_only --load_ckpt 复用, 不用每次重训)")
+ap.add_argument("--load_ckpt", default=None, help="从该路径加载训好的 model 权重+架构 args (会覆盖命令行里的架构 args)")
+ap.add_argument("--eval_only", action="store_true", help="跳过训练只跑 eval (需要 --load_ckpt). 用来在同一个训好的 ckpt 上扫不同 rope_eval / eval_lens")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 
@@ -305,6 +308,22 @@ def fwd_logits(model, ids):
     return model(ids).float()
 
 
+# ---------------- ckpt: 加载已训模型 (--load_ckpt) → 用其架构 args 覆盖 ----------------
+_loaded_state_dict = None
+if args.load_ckpt:
+    _ck = torch.load(args.load_ckpt, map_location="cpu", weights_only=False)
+    _arch_keys = ('model', 'D', 'N', 'K', 'num_layers', 'D_ff', 'memory_layer_interval', 'D_key', 'D_value',
+                  't_d', 't_layers', 't_heads', 'm_d', 'm_layers', 'vocab', 'induction_len', 'no_xpos', 'rope_base',
+                  'train_len')   # train_len 影响 train_total_len → rope_eval 动态 scale 基准
+    saved_args = _ck.get('args', {})
+    for k in _arch_keys:
+        if k in saved_args:
+            setattr(args, k, saved_args[k])
+    COPY_PREFIX = args.vocab; EMB_SIZE = args.vocab + 1
+    _ACTIVE_ROPE["rope_base"] = float(args.rope_base)
+    _loaded_state_dict = _ck['state_dict']
+    log(f"[load_ckpt] loaded {args.load_ckpt}: model={args.model} train_len={args.train_len} vocab={args.vocab}")
+
 # ---------------- train ----------------
 torch.manual_seed(args.seed)
 if args.model == "v4":
@@ -313,44 +332,52 @@ elif args.model == "mamba":
     model = build_mamba()
 else:
     model = TinyGPT(EMB_SIZE, args.t_d, args.t_layers, args.t_heads).to(DEV)
+if _loaded_state_dict is not None:
+    model.load_state_dict(_loaded_state_dict, strict=True)
+    log(f"[load_ckpt] state_dict loaded ({sum(p.numel() for p in model.parameters())/1e6:.3f}M params)")
 n_p = sum(p.numel() for p in model.parameters()) / 1e6
 log(f"=== model={args.model} params={n_p:.3f}M | train_len={args.train_len} il={args.induction_len} nt={args.num_triggers} "
-    f"| steps={args.steps} batch={args.batch} vocab={args.vocab}(+1) | seed={args.seed} ===")
+    f"| steps={args.steps} batch={args.batch} vocab={args.vocab}(+1) | seed={args.seed} | eval_only={args.eval_only} ===")
 
-if args.model == "v4":
-    from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
-    pg = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, adam_base_lr=args.adam_lr, adam_embed_lr=args.adam_lr,
-                                           lion_lr=args.lion_lr, neuron_lr_mult=1.0, weight_decay_muon=0.01)
-    opt = SingleDeviceMoonshotMuonAdamLion(pg)
-    log(f"[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon={args.muon_lr} adam={args.adam_lr} lion={args.lion_lr})")
-else:
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    log(f"[{args.model}] optimizer = AdamW (lr={args.lr} wd={args.wd})")
+if not args.eval_only:
+    if args.model == "v4":
+        from utils.muon_adam_lion import SingleDeviceMoonshotMuonAdamLion, build_muon_adam_lion_param_groups
+        pg = build_muon_adam_lion_param_groups(model, muon_lr=args.muon_lr, adam_base_lr=args.adam_lr, adam_embed_lr=args.adam_lr,
+                                               lion_lr=args.lion_lr, neuron_lr_mult=1.0, weight_decay_muon=0.01)
+        opt = SingleDeviceMoonshotMuonAdamLion(pg)
+        log(f"[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon={args.muon_lr} adam={args.adam_lr} lion={args.lion_lr})")
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+        log(f"[{args.model}] optimizer = AdamW (lr={args.lr} wd={args.wd})")
 
-base_lrs = [g["lr"] for g in opt.param_groups]
-warmup = max(1, int(args.steps * args.warmup_frac))
-def lr_scale(step):  # linear warmup → cosine decay to lr_min_frac×
-    if step < warmup:
-        return step / warmup
-    prog = (step - warmup) / max(1, args.steps - warmup)
-    f = args.lr_min_frac
-    return f + (1 - f) * 0.5 * (1 + math.cos(math.pi * prog))
+    base_lrs = [g["lr"] for g in opt.param_groups]
+    warmup = max(1, int(args.steps * args.warmup_frac))
+    def lr_scale(step):  # linear warmup → cosine decay to lr_min_frac×
+        if step < warmup:
+            return step / warmup
+        prog = (step - warmup) / max(1, args.steps - warmup)
+        f = args.lr_min_frac
+        return f + (1 - f) * 0.5 * (1 + math.cos(math.pi * prog))
 
-np_rng = np.random.default_rng(123); _torch_gen.manual_seed(123)
-model.train()
-for step in range(args.steps):
-    sc = lr_scale(step)
-    for g, blr in zip(opt.param_groups, base_lrs):
-        g["lr"] = blr * sc
-    ids, labels, T = make_batch(args.batch, args.train_len, np_rng)
-    logits = fwd_logits(model, ids)
-    loss = lm_loss(logits, labels)
-    opt.zero_grad(); loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip); opt.step()
-    if step % args.log_every == 0 or step == args.steps - 1:
-        with torch.no_grad():
-            aacc = answer_acc(logits, ids, T)
-        log(f"  step {step:6d}: lr×{sc:.3f} loss={loss.item():.4f}  answer_acc={aacc:.3f}")
+    np_rng = np.random.default_rng(123); _torch_gen.manual_seed(123)
+    model.train()
+    for step in range(args.steps):
+        sc = lr_scale(step)
+        for g, blr in zip(opt.param_groups, base_lrs):
+            g["lr"] = blr * sc
+        ids, labels, T = make_batch(args.batch, args.train_len, np_rng)
+        logits = fwd_logits(model, ids)
+        loss = lm_loss(logits, labels)
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip); opt.step()
+        if step % args.log_every == 0 or step == args.steps - 1:
+            with torch.no_grad():
+                aacc = answer_acc(logits, ids, T)
+            log(f"  step {step:6d}: lr×{sc:.3f} loss={loss.item():.4f}  answer_acc={aacc:.3f}")
+
+    if args.save_ckpt:
+        torch.save({'state_dict': model.state_dict(), 'args': vars(args)}, args.save_ckpt)
+        log(f"[save_ckpt] saved model + args to {args.save_ckpt} ({sum(p.numel()*p.element_size() for p in model.parameters())/1e6:.1f} MB)")
 
 # ---------------- eval: length generalization (zero-shot, 训短测长, 不改模型) ----------------
 # 若 --rope_eval 指定了多个方法 (none/pi/ntk/yarn), 对训好的 RoPE 模型在 eval 时叠加上下文增程,

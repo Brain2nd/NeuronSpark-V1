@@ -33,7 +33,9 @@ ap.add_argument("--steps", type=int, default=40000)
 ap.add_argument("--batch", type=int, default=32)
 ap.add_argument("--vocab", type=int, default=16, help="普通 token 数; COPY_PREFIX = vocab (embedding 大小 = vocab+1)")
 ap.add_argument("--induction_len", type=int, default=1, help="每个 trigger 后要复制的 token 数 (=尾部答案长度)")
-ap.add_argument("--num_triggers", type=int, default=1, help="序列中插入 COPY_PREFIX 的次数 (0.5 概率强制为 1, 同 safari)")
+ap.add_argument("--num_triggers", type=int, default=5, help="序列中插入 COPY_PREFIX 的次数 (越多→可学的 completion 越多, 信号越密)")
+ap.add_argument("--loss_on", default="completions", choices=("completions", "all"),
+                help="completions=只在紧跟 COPY_PREFIX 的位置算 loss (信号密度与序列长度脱钩, 推荐); all=safari 风格整序列 next-token LM (长序列时可学信号被随机段淹没)")
 ap.add_argument("--lr", type=float, default=5e-4)
 ap.add_argument("--wd", type=float, default=0.1)
 ap.add_argument("--warmup_frac", type=float, default=0.05)
@@ -73,53 +75,58 @@ def log(s):
     if LOGF: LOGF.write(s + "\n"); LOGF.flush()
 
 
-# ---------------- data: induction-heads (port of safari generate_induction_head) ----------------
+# ---------------- data: induction-heads (基于 safari generate_induction_head; 多 trigger + completion-only loss) ----------------
 _torch_gen = torch.Generator(device=DEV)
 
-def _make_labels(ids_t, first_cp, T):
+def _build_labels(ids_t, first_cp, comp_cols_list, T):
+    """labels = ids 的副本, 但:
+       loss_on=='all'         → 把首个 COPY_PREFIX 之前(含)的位置设 IGN (safari 风格);
+       loss_on=='completions' → 只保留 "紧跟 COPY_PREFIX 的 induction_len 个位置 + 尾部 to_copy" 的 label, 其余全 IGN."""
     labels = ids_t.clone()
-    pos = torch.arange(T, device=DEV)[None, :]
-    labels[pos <= first_cp[:, None]] = IGN
+    if args.loss_on == "all":
+        pos = torch.arange(T, device=DEV)[None, :]
+        labels[pos <= first_cp[:, None]] = IGN
+        return labels
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    for b, cols in enumerate(comp_cols_list):
+        mask[b, cols] = True
+    labels[~mask] = IGN
     return labels
 
 def make_batch(B, input_seq_len, np_rng):
-    """返回 (ids[B,T], labels[B,T], T) ; T = input_seq_len + 1 + induction_len.
-    labels = next-token target, 第一个 COPY_PREFIX 之前(含)的位置设 IGN. 尾部 induction_len 个 = 答案.
-    nt==1 走全向量化 (快); nt>1 走 per-example python 循环 (照 safari spacing filter)."""
+    """返回 (ids[B,T], labels[B,T], T); T = input_seq_len + 1 + induction_len.
+    序列 = [input_seq_len 随机 token, COPY_PREFIX] → 在前面 num_triggers 个(spacing 过滤后)位置插入
+    COPY_PREFIX+to_copy → 再把 to_copy 拼到尾部. completion 位置 = 每个插入 trigger 后的 il 个 token
+    + 尾部 to_copy 的 il 个 token (= 序列最后 il 列). 答案 = 尾部 to_copy."""
     il = args.induction_len
     T = input_seq_len + 1 + il
-    if args.num_triggers == 1:
-        seq = torch.randint(0, args.vocab, (B, input_seq_len), generator=_torch_gen, device=DEV)
-        cp_col = torch.full((B, 1), COPY_PREFIX, device=DEV, dtype=seq.dtype)
-        seq = torch.cat([seq, cp_col], dim=1)                                   # (B, input_seq_len+1), pos input_seq_len = COPY_PREFIX
-        p = torch.randint(0, input_seq_len - (1 + il), (B,), generator=_torch_gen, device=DEV)  # trigger 位置
-        ar = torch.arange(B, device=DEV)
-        copy_idx = p[:, None] + 1 + torch.arange(il, device=DEV)[None, :]        # (B, il)
-        to_copy = torch.gather(seq, 1, copy_idx)                                 # (B, il) = trigger 后的 il 个原始 token
-        seq[ar, p] = COPY_PREFIX                                                 # 插入 trigger (后面的 il 个 token 本就是 to_copy, 无需改)
-        ids_t = torch.cat([seq, to_copy], dim=1)                                 # (B, T)
-        return ids_t, _make_labels(ids_t, p, T), T
-    # nt > 1: per-example
+    tail_cols = list(range(T - il, T))
     ids = np.empty((B, T), dtype=np.int64)
     first_cp = np.empty(B, dtype=np.int64)
+    comp_cols_list = []
     for b in range(B):
         s = np_rng.integers(0, args.vocab, size=input_seq_len).tolist()
-        s.append(COPY_PREFIX)
-        nt = 1 if np_rng.uniform() < 0.5 else args.num_triggers
-        raw = np.sort(np_rng.integers(input_seq_len - (1 + il), size=max(nt, 1)))
+        s.append(COPY_PREFIX)                                          # pos input_seq_len = COPY_PREFIX (start_seq)
+        raw = np.sort(np_rng.integers(input_seq_len - (1 + il), size=max(args.num_triggers, 1)))
         pf = []
         for i, q in enumerate(raw):
-            if i == 0 or q - pf[-1] > il:
+            if i == 0 or q - pf[-1] > il:                              # spacing 过滤, 同 safari
                 pf.append(int(q))
-        tc = [s[pf[0] + 1 + i] for i in range(il)]
+        tc = [s[pf[0] + 1 + i] for i in range(il)]                     # to_copy = 第一个 trigger 后的 il 个原始 token
         for q in pf:
             s[q] = COPY_PREFIX
             for i in range(il):
                 s[q + 1 + i] = tc[i]
         ids[b] = s + tc
         first_cp[b] = pf[0]
+        cc = []
+        for q in pf:
+            cc += list(range(q + 1, q + 1 + il))
+        cc += tail_cols
+        comp_cols_list.append(cc)
     ids_t = torch.from_numpy(ids).to(DEV)
-    return ids_t, _make_labels(ids_t, torch.from_numpy(first_cp).to(DEV), T), T
+    labels = _build_labels(ids_t, torch.from_numpy(first_cp).to(DEV), comp_cols_list, T)
+    return ids_t, labels, T
 
 
 def lm_loss(logits, labels):

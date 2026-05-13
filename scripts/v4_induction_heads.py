@@ -77,6 +77,7 @@ ap.add_argument("--save_ckpt", default=None, help="训完落盘 model + args 到
 ap.add_argument("--load_ckpt", default=None, help="从该路径加载训好的 model 权重+架构 args (会覆盖命令行里的架构 args)")
 ap.add_argument("--eval_only", action="store_true", help="跳过训练只跑 eval (需要 --load_ckpt). 用来在同一个训好的 ckpt 上扫不同 rope_eval / eval_lens")
 ap.add_argument("--eval_multi_gpu", action="store_true", help="把 v4 各层切到 (visible CUDA 数) 张卡上做管线并行 eval, peak 显存/卡 ≈ 单卡/N. 仅 v4 路径生效, eval-only 用; embed/norm/decode 留 cuda:0, layers 平均分发到所有可见 GPU")
+ap.add_argument("--eval_chunk_size", type=int, default=0, help="序列分块 eval (v4 路径): 把长 L 切成 chunk_size 一块顺序 forward, 利用 v4 自带的 pos_offset/M_state/v_carry 续传机制. 单块 forward 内存 = O(chunk_size) 而非 O(L), 用来跑 1M+ 长度避免 OOM. 0 = 关闭, 整 L 一次 forward")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 

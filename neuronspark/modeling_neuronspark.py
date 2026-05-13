@@ -428,10 +428,13 @@ if _HAS_TRITON:
 
         U/OUTPUT/VPOST: (TK, num_cols) 行主序; KT_COLS: (T, num_cols) int (= k_t expanded per col).
         BETA_ROW/VTH_ROW/AHP_ROW/INIT/VCARRY: (num_cols,).
+        long-context (T·K·num_cols > 2³¹) 必须 int64 offset 否则越界 (cudaErrorIllegalAddress).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
+        cols = cols.to(tl.int64)
+        num_cols = tl.cast(num_cols, tl.int64)
 
         v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
@@ -493,6 +496,8 @@ if _HAS_TRITON:
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
+        cols = cols.to(tl.int64)
+        num_cols = tl.cast(num_cols, tl.int64)
         beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
@@ -559,10 +564,13 @@ if _HAS_TRITON:
     ):
         """V4 segmented PLIF forward (selective: β/v_th per-frame). 同 rowparam, β/vth 逐帧 load; ahp per-channel.
         BETA/VTH/U/OUTPUT/VPOST: (TK, num_cols); KT_COLS: (T, num_cols) int; AHP_ROW/INIT/VCARRY: (num_cols,).
+        long-context (T·K·num_cols > 2³¹) 必须 int64 offset 否则越界 (cudaErrorIllegalAddress).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
+        cols = cols.to(tl.int64)
+        num_cols = tl.cast(num_cols, tl.int64)
         v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         for t in range(T):
@@ -605,10 +613,13 @@ if _HAS_TRITON:
     ):
         """V4 segmented PLIF backward (selective). 同 rowparam bwd, β/vth 逐帧 load; ahp per-channel accumulate.
         梯度公式见 _segmented_plif_bwd_rowparam_kernel docstring (vth → vth_i 逐帧).
+        long-context (T·K·num_cols > 2³¹) 必须 int64 offset 否则越界 (cudaErrorIllegalAddress).
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
+        cols = cols.to(tl.int64)
+        num_cols = tl.cast(num_cols, tl.int64)
         ahp = tl.load(AHP_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         g_v = tl.zeros([BLOCK], dtype=tl.float32)
         g_patch = tl.zeros([BLOCK], dtype=tl.float32)

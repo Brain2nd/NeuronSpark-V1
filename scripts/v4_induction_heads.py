@@ -69,6 +69,10 @@ ap.add_argument("--m_d", type=int, default=128)
 ap.add_argument("--m_layers", type=int, default=4)
 ap.add_argument("--eval_lens", default="64,128,256,512,1024,2048,4096,8192,16384")
 ap.add_argument("--eval_examples", type=int, default=512)
+ap.add_argument("--rope_eval", default="none", help="逗号分隔, 对训好的 RoPE 模型在 eval 时叠加上下文增程: none/pi/ntk/yarn (动态 scale=max(1, L_eval/L_train)). mamba 无 PE, 这个参数对它无效")
+ap.add_argument("--yarn_beta_fast", type=float, default=32.0)
+ap.add_argument("--yarn_beta_slow", type=float, default=1.0)
+ap.add_argument("--rope_base", type=float, default=10000.0, help="RoPE 基频 (transformer + v4 SNNAttention 都用); 训练就用这个值")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 
@@ -178,17 +182,59 @@ def build_v4():
     return m
 
 
+# ---------------- RoPE 上下文增程 (Context-Length Extension) ----------------
+# 动态 scale: 当前 eval 总长 / 训练总长 (>1 才生效, in-dist 时 scale=1 → 透明).
+# - "none": 不动 RoPE (训练时怎么样, eval 还是怎么样).
+# - "pi"  : Position Interpolation (Chen et al.) — 全频段除以 scale (等价于 θ_i_eff = θ_i/s).
+# - "ntk" : NTK-aware (bloc97) — base 升到 base·s^(d/(d-2)) 把低频拉长、高频几乎不动.
+# - "yarn": NTK-by-parts + attention temperature (Peng et al. 2023, YaRN) — 按 wavelength 在
+#           PI 和无变化之间线性 ramp, 短波长(高频, 训练 ctx 内多旋转 >β_fast)保持外推, 长波长
+#           (低频, <β_slow 圈)做 PI; transformer 上额外把 cos/sin 乘 mscale=0.1·ln(s)+1 (锐化 softmax).
+_ACTIVE_ROPE = {"method": "none", "train_total_len": 0, "rope_base": float(args.rope_base)}
+
+def _ntk_base_adjust(base, dim, scale):
+    return base * (scale ** (dim / max(1, (dim - 2))))
+
+def _yarn_inv_freq(dim, base, scale, train_total_len, beta_fast, beta_slow, device, dtype):
+    inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    inv_interp = inv / scale
+    # 训练 ctx 内的旋转圈数 r_i = train_total_len · θ_i / (2π)
+    r = train_total_len * inv / (2 * math.pi)
+    # gamma: 1 = 保持原 θ (高频, r>β_fast, 短波长); 0 = 全 PI (低频, r<β_slow, 长波长)
+    gamma = ((r - beta_slow) / max(1e-6, (beta_fast - beta_slow))).clamp(0.0, 1.0)
+    return inv * gamma + inv_interp * (1 - gamma)
+
+def _effective_inv_freq(dim, base, method, scale, train_total_len, device, dtype):
+    if method == "none" or scale <= 1.0:
+        return 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "pi":
+        return (1.0 / scale) * 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "ntk":
+        base_eff = _ntk_base_adjust(base, dim, scale)
+        return 1.0 / (base_eff ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "yarn":
+        return _yarn_inv_freq(dim, base, scale, train_total_len, args.yarn_beta_fast, args.yarn_beta_slow, device, dtype)
+    raise ValueError(f"unknown rope_eval method: {method}")
+
+def _yarn_mscale(scale):
+    return 0.1 * math.log(scale) + 1.0 if scale > 1.0 else 1.0
+
+
 class RoPEAttn(nn.Module):
-    def __init__(self, d, h):
-        super().__init__(); self.h = h; self.dh = d // h
+    def __init__(self, d, h, base=10000.0):
+        super().__init__(); self.h = h; self.dh = d // h; self.base = float(base)
         self.qkv = nn.Linear(d, 3 * d, bias=False); self.o = nn.Linear(d, d, bias=False)
-        inv = 1.0 / (10000.0 ** (torch.arange(0, self.dh, 2).float() / self.dh))
-        self.register_buffer("inv", inv, persistent=False)
     def rope(self, x):  # x: (B,H,T,dh)
         T = x.shape[-2]
+        method = _ACTIVE_ROPE["method"]; train_total_len = _ACTIVE_ROPE["train_total_len"]
+        scale = max(1.0, T / float(train_total_len)) if train_total_len > 0 else 1.0
+        inv = _effective_inv_freq(self.dh, self.base, method, scale, train_total_len, x.device, torch.float32)
         pos = torch.arange(T, device=x.device, dtype=torch.float32)
-        ang = torch.outer(pos, self.inv)
-        cos = ang.cos().repeat_interleave(2, -1)[None, None]; sin = ang.sin().repeat_interleave(2, -1)[None, None]
+        ang = torch.outer(pos, inv)
+        cos = ang.cos().repeat_interleave(2, -1); sin = ang.sin().repeat_interleave(2, -1)
+        if method == "yarn":
+            m = _yarn_mscale(scale); cos = cos * m; sin = sin * m
+        cos = cos[None, None].to(x.dtype); sin = sin[None, None].to(x.dtype)
         x1 = x[..., ::2]; x2 = x[..., 1::2]
         rot = torch.stack([-x2, x1], -1).flatten(-2)
         return x * cos + rot * sin
@@ -201,6 +247,26 @@ class RoPEAttn(nn.Module):
         return self.o(o.transpose(1, 2).reshape(B, T, d))
 
 
+def _rebuild_v4_rope_for_eval(model, method, eval_total_len, train_total_len):
+    """重建 v4 每个 SNNAttention 层的 rope_cos/rope_sin —— 把指定的 context-length extension 方法
+    (PI/NTK/YaRN, 动态 scale=max(1,L_eval/L_train)) 烧进 cos/sin 缓存. method='none' 时还原成原始 RoPE."""
+    from neuronspark.modeling_neuronspark import SNNAttentionDecoderLayer
+    scale = max(1.0, eval_total_len / float(train_total_len)) if train_total_len > 0 else 1.0
+    for layer in model.snn.layers:
+        if not isinstance(layer, SNNAttentionDecoderLayer):
+            continue
+        dim = layer.D_key
+        dev = layer.rope_cos.device; ddt = layer.rope_cos.dtype
+        inv = _effective_inv_freq(dim, _ACTIVE_ROPE["rope_base"], method, scale, train_total_len, dev, torch.float32)
+        max_len = max(int(eval_total_len) + 8, 8192)
+        t = torch.arange(max_len, device=dev, dtype=torch.float32)
+        ang = torch.outer(t, inv)
+        cos = ang.cos().to(ddt); sin = ang.sin().to(ddt)
+        # YaRN 的 attention temperature 对线性 attention (k 经过 F.normalize) 大部分被吃掉, 此处不应用 mscale; 只用 freq-ramp.
+        layer.register_buffer('rope_cos', cos, persistent=False)
+        layer.register_buffer('rope_sin', sin, persistent=False)
+
+
 class TinyGPT(nn.Module):
     def __init__(self, vocab, d, layers, heads):
         super().__init__()
@@ -208,7 +274,7 @@ class TinyGPT(nn.Module):
         self.blocks = nn.ModuleList()
         for _ in range(layers):
             self.blocks.append(nn.ModuleDict(dict(
-                n1=nn.LayerNorm(d), attn=RoPEAttn(d, heads),
+                n1=nn.LayerNorm(d), attn=RoPEAttn(d, heads, base=args.rope_base),
                 n2=nn.LayerNorm(d), mlp=nn.Sequential(nn.Linear(d, 4 * d, bias=False), nn.GELU(), nn.Linear(4 * d, d, bias=False)))))
         self.nf = nn.LayerNorm(d); self.head = nn.Linear(d, vocab, bias=False)
     def forward(self, ids):
@@ -287,23 +353,43 @@ for step in range(args.steps):
         log(f"  step {step:6d}: lr×{sc:.3f} loss={loss.item():.4f}  answer_acc={aacc:.3f}")
 
 # ---------------- eval: length generalization (zero-shot, 训短测长, 不改模型) ----------------
+# 若 --rope_eval 指定了多个方法 (none/pi/ntk/yarn), 对训好的 RoPE 模型在 eval 时叠加上下文增程,
+# 每个方法跑一遍完整长度泛化曲线. mamba 无 RoPE → 只跑 "none". v4-no_xpos 的 SNNAttention 跨位
+# 混合关了, RoPE 仍存在但只影响每位置自身, rope_eval 仍生效但效果有限.
 model.eval()
-np_eval = np.random.default_rng(999); _torch_gen.manual_seed(999)
-log(f"=== length-generalization: answer token accuracy vs eval input_seq_len (train_len={args.train_len}) ===")
-for L in [int(x) for x in args.eval_lens.split(",")]:
-    if L < args.induction_len + 2:
-        continue
-    B = args.batch if L <= 2048 else max(2, args.batch // 8)
-    n_corr = n_tot = 0
-    n_iter = max(1, args.eval_examples // B)
-    with torch.no_grad():
-        for _ in range(n_iter):
-            ids, labels, T = make_batch(B, L, np_eval)
-            logits = fwd_logits(model, ids)
-            il = args.induction_len
-            pred = logits[:, T - il - 1: T - 1, :].argmax(-1)
-            tgt = ids[:, T - il:]
-            n_corr += (pred == tgt).all(dim=1).sum().item(); n_tot += B
-    tag = "IN-DIST" if L <= args.train_len else "LEN-GEN"
-    log(f"  input_seq_len={L:7d}: exact-answer acc={n_corr/n_tot:.3f}  ({n_corr}/{n_tot})  [{tag}]")
+np_eval_seed = 999
+train_total_len = args.train_len + 1 + args.induction_len
+_ACTIVE_ROPE["train_total_len"] = train_total_len
+
+rope_methods = [m.strip() for m in args.rope_eval.split(",") if m.strip()]
+if args.model == "mamba":
+    rope_methods = ["none"]  # mamba 没 PE, 增程方法无意义
+
+def _run_lengen_eval(method_label):
+    log(f"=== length-generalization [rope_eval={method_label}]: answer token accuracy vs eval input_seq_len (train_len={args.train_len}) ===")
+    np_eval = np.random.default_rng(np_eval_seed); _torch_gen.manual_seed(np_eval_seed)
+    for L in [int(x) for x in args.eval_lens.split(",")]:
+        if L < args.induction_len + 2:
+            continue
+        L_total = L + 1 + args.induction_len
+        # 应用当前 RoPE 增程方法 to this eval length
+        _ACTIVE_ROPE["method"] = method_label    # transformer.RoPEAttn.rope 会读这个
+        if args.model == "v4":
+            _rebuild_v4_rope_for_eval(model, method_label, L_total, train_total_len)
+        B = args.batch if L <= 2048 else max(2, args.batch // 8)
+        n_corr = n_tot = 0
+        n_iter = max(1, args.eval_examples // B)
+        with torch.no_grad():
+            for _ in range(n_iter):
+                ids, labels, T = make_batch(B, L, np_eval)
+                logits = fwd_logits(model, ids)
+                il = args.induction_len
+                pred = logits[:, T - il - 1: T - 1, :].argmax(-1)
+                tgt = ids[:, T - il:]
+                n_corr += (pred == tgt).all(dim=1).sum().item(); n_tot += B
+        tag = "IN-DIST" if L <= args.train_len else "LEN-GEN"
+        log(f"  input_seq_len={L:7d}: exact-answer acc={n_corr/n_tot:.3f}  ({n_corr}/{n_tot})  [{tag}]")
+
+for m in rope_methods:
+    _run_lengen_eval(m)
 log("=== DONE ===")

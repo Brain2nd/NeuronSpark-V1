@@ -2873,6 +2873,17 @@ class SNNAttentionDecoderLayer(MemoryModule):
             input_neuron._last_firing_rate = (output > 0).float().mean().item()
         return output.to(input_dtype)
 
+    def _ensure_rope_len(self, needed_len, device=None):
+        """RoPE cos/sin 缓存按需扩展 —— 序列长度超出预算 (_precompute_rope_freqs 默认 8192) 时重算到
+        max(needed, 2×当前). 标准 RoPE 做法 (cf. HF RotaryEmbedding._set_cos_sin_cache), 支持任意长度泛化/长上下文推理."""
+        if needed_len <= self.rope_cos.shape[0]:
+            return
+        new_len = max(int(needed_len), self.rope_cos.shape[0] * 2)
+        cos, sin = _precompute_rope_freqs(self.D_key, max_seq_len=new_len)
+        dev = device if device is not None else self.rope_cos.device
+        self.register_buffer('rope_cos', cos.to(device=dev, dtype=self.rope_cos.dtype), persistent=False)
+        self.register_buffer('rope_sin', sin.to(device=dev, dtype=self.rope_sin.dtype), persistent=False)
+
     def _gate_neuron_parallel(self, h_normed):
         """PLIFNode gate 的 parallel scan, 返回标量门控 (bio-ReLU 超阈电流)。"""
         seq_len, batch, D = h_normed.shape
@@ -2942,6 +2953,7 @@ class SNNAttentionDecoderLayer(MemoryModule):
 
         # RoPE: 用 pos_offset 支持续传 (prefill: pos=0, decode: pos=已生成 token 数)
         pos = self.pos_offset
+        self._ensure_rope_len(pos + seq_len, h.device)  # 长度泛化: 序列超出预算 RoPE 缓存时按需扩展
         rope_cos = self.rope_cos[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
         rope_sin = self.rope_sin[pos:pos + seq_len].unsqueeze(1).to(q.dtype)
         q = _apply_rope(q, rope_cos, rope_sin)

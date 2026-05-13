@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model", default="v4", choices=("v4", "transformer"))
+ap.add_argument("--model", default="v4", choices=("v4", "transformer", "mamba"))
 ap.add_argument("--train_len", type=int, default=64, help="训练时 input_seq_len (随机段长度; 总序列 = +1 COPY_PREFIX +induction_len 尾巴)")
 ap.add_argument("--steps", type=int, default=40000)
 ap.add_argument("--batch", type=int, default=32)
@@ -60,6 +60,9 @@ ap.add_argument("--lion_lr", type=float, default=1e-4)
 ap.add_argument("--t_d", type=int, default=64)
 ap.add_argument("--t_layers", type=int, default=2)
 ap.add_argument("--t_heads", type=int, default=2)
+# mamba baseline config (selective SSM, induction-heads 任务的"原产地"模型 —— 外推应不掉点)
+ap.add_argument("--m_d", type=int, default=128)
+ap.add_argument("--m_layers", type=int, default=4)
 ap.add_argument("--eval_lens", default="64,128,256,512,1024,2048,4096,8192,16384")
 ap.add_argument("--eval_examples", type=int, default=512)
 ap.add_argument("--out", default=None)
@@ -211,6 +214,15 @@ class TinyGPT(nn.Module):
         return self.head(self.nf(x))
 
 
+def build_mamba():
+    from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+    from mamba_ssm.models.config_mamba import MambaConfig
+    cfg = MambaConfig(d_model=args.m_d, n_layer=args.m_layers, vocab_size=EMB_SIZE,
+                      ssm_cfg={"layer": "Mamba1"},   # 原始选择性 SSM (Mamba 论文 §4.1.2 用的那个)
+                      rms_norm=True, fused_add_norm=False, residual_in_fp32=True, pad_vocab_size_multiple=1)
+    return MambaLMHeadModel(cfg).to(DEV)
+
+
 def fwd_logits(model, ids):
     if args.model == "v4":
         from neuronspark.modeling_neuronspark import functional
@@ -218,12 +230,19 @@ def fwd_logits(model, ids):
         with torch.amp.autocast(DEV, dtype=torch.bfloat16):
             out = model(input_ids=ids)
         return out.logits.float()
+    if args.model == "mamba":
+        return model(ids).logits.float()
     return model(ids).float()
 
 
 # ---------------- train ----------------
 torch.manual_seed(args.seed)
-model = build_v4() if args.model == "v4" else TinyGPT(EMB_SIZE, args.t_d, args.t_layers, args.t_heads).to(DEV)
+if args.model == "v4":
+    model = build_v4()
+elif args.model == "mamba":
+    model = build_mamba()
+else:
+    model = TinyGPT(EMB_SIZE, args.t_d, args.t_layers, args.t_heads).to(DEV)
 n_p = sum(p.numel() for p in model.parameters()) / 1e6
 log(f"=== model={args.model} params={n_p:.3f}M | train_len={args.train_len} il={args.induction_len} nt={args.num_triggers} "
     f"| steps={args.steps} batch={args.batch} vocab={args.vocab}(+1) | seed={args.seed} ===")
@@ -236,7 +255,7 @@ if args.model == "v4":
     log(f"[v4] optimizer = SingleDeviceMoonshotMuonAdamLion (muon={args.muon_lr} adam={args.adam_lr} lion={args.lion_lr})")
 else:
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-    log(f"[transformer] optimizer = AdamW (lr={args.lr} wd={args.wd})")
+    log(f"[{args.model}] optimizer = AdamW (lr={args.lr} wd={args.wd})")
 
 base_lrs = [g["lr"] for g in opt.param_groups]
 warmup = max(1, int(args.steps * args.warmup_frac))

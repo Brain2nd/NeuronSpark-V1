@@ -313,18 +313,21 @@ def _setup_v4_multi_gpu(model):
     snn.decode_proj.to("cuda:0")
     for layer, dev in zip(layers, layer_devs):
         layer.to(dev)
-    def make_wrapped(orig_fp, target_dev, move_out_to_zero):
+    def make_wrapped(orig_fp, target_dev, move_h_to_zero):
         target_dev_obj = _t.device(target_dev)
+        zero = _t.device("cuda:0")
         def wrapped(h, *a, **kw):
             h = h.to(target_dev_obj, non_blocking=True) if h.device != target_dev_obj else h
             with _t.cuda.device(target_dev_obj):   # Triton kernel 用 current-device context 启动, 跨卡时必须显式切
                 out = orig_fp(h, *a, **kw)
-            if move_out_to_zero:
-                zero = _t.device("cuda:0")
-                if isinstance(out, tuple):
-                    out = tuple(x.to(zero, non_blocking=True) if isinstance(x, _t.Tensor) and x.device != zero else x for x in out)
-                elif isinstance(out, _t.Tensor) and out.device != zero:
-                    out = out.to(zero, non_blocking=True)
+            # out 通常是 (h, ponder_cost); ponder_cost 在外层会被聚合 sum → 永远搬到 cuda:0
+            if isinstance(out, tuple) and len(out) >= 2:
+                h_o, pc = out[0], out[1]
+                if move_h_to_zero and isinstance(h_o, _t.Tensor) and h_o.device != zero:
+                    h_o = h_o.to(zero, non_blocking=True)
+                if isinstance(pc, _t.Tensor) and pc.device != zero:
+                    pc = pc.to(zero, non_blocking=True)
+                return (h_o, pc) + tuple(out[2:])
             return out
         return wrapped
     for i, (layer, dev) in enumerate(zip(layers, layer_devs)):

@@ -76,6 +76,7 @@ ap.add_argument("--rope_base", type=float, default=10000.0, help="RoPE 基频 (t
 ap.add_argument("--save_ckpt", default=None, help="训完落盘 model + args 到该路径 (后续 --eval_only --load_ckpt 复用, 不用每次重训)")
 ap.add_argument("--load_ckpt", default=None, help="从该路径加载训好的 model 权重+架构 args (会覆盖命令行里的架构 args)")
 ap.add_argument("--eval_only", action="store_true", help="跳过训练只跑 eval (需要 --load_ckpt). 用来在同一个训好的 ckpt 上扫不同 rope_eval / eval_lens")
+ap.add_argument("--eval_multi_gpu", action="store_true", help="把 v4 各层切到 (visible CUDA 数) 张卡上做管线并行 eval, peak 显存/卡 ≈ 单卡/N. 仅 v4 路径生效, eval-only 用; embed/norm/decode 留 cuda:0, layers 平均分发到所有可见 GPU")
 ap.add_argument("--out", default=None)
 args = ap.parse_args()
 
@@ -296,13 +297,51 @@ def build_mamba():
     return MambaLMHeadModel(cfg).to(DEV)
 
 
+def _setup_v4_multi_gpu(model):
+    """把 v4 的 snn.layers 平均分发到所有 visible CUDA, monkeypatch forward_parallel 在层间迁移 residual stream.
+    embed_tokens / decode_proj / norm 全留 cuda:0 (embed.weight 末尾 F.linear 还要用 + norm/decode 在 cuda:0).
+    rope_cos/rope_sin 等 buffer 随 layer.to() 自动迁移. snn_forward 调用 forward_parallel 是直接调 .forward_parallel(...)
+    (绕过 __call__), 所以必须 patch forward_parallel 本身, 不能用 forward_pre_hook."""
+    import torch as _t
+    n_gpus = _t.cuda.device_count()
+    snn = model.snn
+    layers = snn.layers
+    n_layers = len(layers)
+    layer_devs = [f"cuda:{i * n_gpus // n_layers}" for i in range(n_layers)]
+    snn.embed_tokens.to("cuda:0")
+    snn.norm.to("cuda:0")
+    snn.decode_proj.to("cuda:0")
+    for layer, dev in zip(layers, layer_devs):
+        layer.to(dev)
+    def make_wrapped(orig_fp, target_dev, move_out_to_zero):
+        def wrapped(h, *a, **kw):
+            h = h.to(target_dev, non_blocking=True) if h.device != _t.device(target_dev) else h
+            out = orig_fp(h, *a, **kw)
+            if move_out_to_zero:
+                if isinstance(out, tuple):
+                    out = tuple(x.to("cuda:0", non_blocking=True) if isinstance(x, _t.Tensor) and x.device != _t.device("cuda:0") else x for x in out)
+                elif isinstance(out, _t.Tensor):
+                    out = out.to("cuda:0", non_blocking=True) if out.device != _t.device("cuda:0") else out
+            return out
+        return wrapped
+    for i, (layer, dev) in enumerate(zip(layers, layer_devs)):
+        orig_fp = layer.forward_parallel
+        layer.forward_parallel = make_wrapped(orig_fp, dev, move_out_to_zero=(i == n_layers - 1))
+    log(f"[v4 multi-gpu] {n_layers} layers → {n_gpus} GPUs: {layer_devs}; embed/norm/decode on cuda:0; forward_parallel monkeypatched")
+
+
 def fwd_logits(model, ids):
     if args.model == "v4":
         from neuronspark.modeling_neuronspark import functional
         functional.reset_net(model.snn)
+        if args.eval_multi_gpu:
+            ids = ids.to("cuda:0")
         with torch.amp.autocast(DEV, dtype=torch.bfloat16):
             out = model(input_ids=ids)
-        return out.logits.float()
+        logits = out.logits.float()
+        if args.eval_multi_gpu and logits.device != torch.device("cuda:0"):
+            logits = logits.to("cuda:0")
+        return logits
     if args.model == "mamba":
         return model(ids).logits.float()
     return model(ids).float()
@@ -335,6 +374,8 @@ else:
 if _loaded_state_dict is not None:
     model.load_state_dict(_loaded_state_dict, strict=True)
     log(f"[load_ckpt] state_dict loaded ({sum(p.numel() for p in model.parameters())/1e6:.3f}M params)")
+if args.eval_multi_gpu and args.model == "v4" and torch.cuda.device_count() > 1:
+    _setup_v4_multi_gpu(model)
 n_p = sum(p.numel() for p in model.parameters()) / 1e6
 log(f"=== model={args.model} params={n_p:.3f}M | train_len={args.train_len} il={args.induction_len} nt={args.num_triggers} "
     f"| steps={args.steps} batch={args.batch} vocab={args.vocab}(+1) | seed={args.seed} | eval_only={args.eval_only} ===")

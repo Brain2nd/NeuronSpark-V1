@@ -314,14 +314,17 @@ def _setup_v4_multi_gpu(model):
     for layer, dev in zip(layers, layer_devs):
         layer.to(dev)
     def make_wrapped(orig_fp, target_dev, move_out_to_zero):
+        target_dev_obj = _t.device(target_dev)
         def wrapped(h, *a, **kw):
-            h = h.to(target_dev, non_blocking=True) if h.device != _t.device(target_dev) else h
-            out = orig_fp(h, *a, **kw)
+            h = h.to(target_dev_obj, non_blocking=True) if h.device != target_dev_obj else h
+            with _t.cuda.device(target_dev_obj):   # Triton kernel 用 current-device context 启动, 跨卡时必须显式切
+                out = orig_fp(h, *a, **kw)
             if move_out_to_zero:
+                zero = _t.device("cuda:0")
                 if isinstance(out, tuple):
-                    out = tuple(x.to("cuda:0", non_blocking=True) if isinstance(x, _t.Tensor) and x.device != _t.device("cuda:0") else x for x in out)
-                elif isinstance(out, _t.Tensor):
-                    out = out.to("cuda:0", non_blocking=True) if out.device != _t.device("cuda:0") else out
+                    out = tuple(x.to(zero, non_blocking=True) if isinstance(x, _t.Tensor) and x.device != zero else x for x in out)
+                elif isinstance(out, _t.Tensor) and out.device != zero:
+                    out = out.to(zero, non_blocking=True)
             return out
         return wrapped
     for i, (layer, dev) in enumerate(zip(layers, layer_devs)):

@@ -332,7 +332,7 @@ def _setup_v4_multi_gpu(model):
         return wrapped
     for i, (layer, dev) in enumerate(zip(layers, layer_devs)):
         orig_fp = layer.forward_parallel
-        layer.forward_parallel = make_wrapped(orig_fp, dev, move_out_to_zero=(i == n_layers - 1))
+        layer.forward_parallel = make_wrapped(orig_fp, dev, move_h_to_zero=(i == n_layers - 1))
     log(f"[v4 multi-gpu] {n_layers} layers → {n_gpus} GPUs: {layer_devs}; embed/norm/decode on cuda:0; forward_parallel monkeypatched")
 
 

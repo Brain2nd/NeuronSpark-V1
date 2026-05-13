@@ -403,7 +403,9 @@ def _run_lengen_eval(method_label):
         _ACTIVE_ROPE["method"] = method_label    # transformer.RoPEAttn.rope 会读这个
         if args.model == "v4":
             _rebuild_v4_rope_for_eval(model, method_label, L_total, train_total_len)
-        B = args.batch if L <= 2048 else max(2, args.batch // 8)
+        if L <= 2048: B = args.batch
+        elif L <= 65536: B = max(2, args.batch // 8)
+        else: B = max(1, args.batch // 32)  # L > 65536: 极长上下文, batch 降到 1 防 OOM
         n_corr = n_tot = 0
         n_iter = max(1, args.eval_examples // B)
         with torch.no_grad():

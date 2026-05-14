@@ -452,8 +452,8 @@ def _run_lengen_eval(method_label):
         if args.model == "v4":
             _rebuild_v4_rope_for_eval(model, method_label, L_total, train_total_len)
         if L <= 2048: B = args.batch
-        elif L <= 65536: B = max(2, args.batch // 8)
-        else: B = max(1, args.batch // 32)  # L > 65536: 极长上下文, batch 降到 1 防 OOM
+        elif L <= 4096: B = max(2, args.batch // 8)
+        else: B = max(1, args.batch // 32)  # L > 4096 直接 batch=1 (d 较大 transformer 在 8k+ SDPA 显存就吃不下了)
         n_corr = n_tot = 0
         n_iter = max(1, args.eval_examples // B)
         with torch.no_grad():

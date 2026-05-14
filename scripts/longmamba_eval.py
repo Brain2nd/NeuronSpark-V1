@@ -166,8 +166,15 @@ cfg = MambaConfig(d_model=m_d, n_layer=m_layers, vocab_size=EMB_SIZE,
 model = MambaLMHeadModel(cfg).to(DEV)
 model.load_state_dict(ck["state_dict"], strict=True)
 model.eval()
+# 强制走 slow path 让 selective_scan_fn 被直接调用 (fast path 走 fused mamba_inner_fn 跳过 ssf patch)
+_fastpath_disabled = 0
+for blk in model.backbone.layers:
+    mx = getattr(blk, "mixer", None)
+    if mx is not None and hasattr(mx, "use_fast_path"):
+        mx.use_fast_path = False; _fastpath_disabled += 1
 LM_STATE["n_layers"] = m_layers
-log(f"loaded {sum(p.numel() for p in model.parameters())/1e6:.3f}M params; n_layers={m_layers}")
+log(f"loaded {sum(p.numel() for p in model.parameters())/1e6:.3f}M params; n_layers={m_layers}; "
+    f"disabled use_fast_path on {_fastpath_disabled} Mamba block(s)")
 
 
 # ============================================================

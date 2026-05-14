@@ -38,6 +38,11 @@ ap.add_argument("--eval_examples", type=int, default=64)
 ap.add_argument("--calib_examples", type=int, default=32)
 ap.add_argument("--theta_quantile", type=float, default=0.75,
                 help="cum_decay 取此分位作 global cut (越高 → 越少 channel 标 global)")
+ap.add_argument("--rope_eval", default="none", choices=("none", "pi", "ntk", "yarn"),
+                help="同 v4_induction_heads.py 的 rope_eval: 对 SNNAttention RoPE 叠加 context-length extension. 与 --mode=longmamba 正交, 可组合: vanilla+yarn / longmamba+none / longmamba+yarn")
+ap.add_argument("--yarn_beta_fast", type=float, default=32.0)
+ap.add_argument("--yarn_beta_slow", type=float, default=1.0)
+ap.add_argument("--rope_base", type=float, default=10000.0)
 ap.add_argument("--seed_eval", type=int, default=999)
 ap.add_argument("--seed_calib", type=int, default=42)
 ap.add_argument("--out", default=None)
@@ -100,6 +105,48 @@ def _patched_segplif(beta, u, v_th, v_init, k_t, K, training=True, ahp_row=None,
     return _orig_segplif(beta, u, v_th, v_init, k_t, K, training, ahp_row=ahp_row, alpha=alpha, spike_mode=spike_mode)
 
 nm.segmented_plif_selective = _patched_segplif
+
+
+# =========================================================
+# 1.5 SNNAttention RoPE 增程 (与 v4_induction_heads.py 同源)
+# =========================================================
+def _ntk_base_adjust(base, dim, scale):
+    return base * (scale ** (dim / max(1, dim - 2)))
+
+def _yarn_inv_freq(dim, base, scale, train_total_len, beta_fast, beta_slow, device, dtype):
+    inv = 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    inv_interp = inv / scale
+    r = train_total_len * inv / (2 * math.pi)
+    gamma = ((r - beta_slow) / max(1e-6, (beta_fast - beta_slow))).clamp(0.0, 1.0)
+    return inv * gamma + inv_interp * (1 - gamma)
+
+def _effective_inv_freq(dim, base, method, scale, train_total_len, device, dtype):
+    if method == "none" or scale <= 1.0:
+        return 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "pi":
+        return (1.0 / scale) * 1.0 / (base ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "ntk":
+        base_eff = _ntk_base_adjust(base, dim, scale)
+        return 1.0 / (base_eff ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
+    if method == "yarn":
+        return _yarn_inv_freq(dim, base, scale, train_total_len, args.yarn_beta_fast, args.yarn_beta_slow, device, dtype)
+    raise ValueError(f"unknown rope_eval method: {method}")
+
+def _rebuild_v4_rope_for_eval(model, method, eval_total_len, train_total_len, rope_base):
+    from neuronspark.modeling_neuronspark import SNNAttentionDecoderLayer
+    scale = max(1.0, eval_total_len / float(train_total_len)) if train_total_len > 0 else 1.0
+    for layer in model.snn.layers:
+        if not isinstance(layer, SNNAttentionDecoderLayer):
+            continue
+        dim = layer.D_key
+        dev = layer.rope_cos.device; ddt = layer.rope_cos.dtype
+        inv = _effective_inv_freq(dim, rope_base, method, scale, train_total_len, dev, torch.float32)
+        max_len = max(int(eval_total_len) + 8, 8192)
+        t = torch.arange(max_len, device=dev, dtype=torch.float32)
+        ang = torch.outer(t, inv)
+        cos = ang.cos().to(ddt); sin = ang.sin().to(ddt)
+        layer.register_buffer('rope_cos', cos, persistent=False)
+        layer.register_buffer('rope_sin', sin, persistent=False)
 
 
 # =========================================================
@@ -234,7 +281,8 @@ def answer_acc(logits, ids, T, il):
     tgt = ids[:, T - il:]
     return (pred == tgt).all(dim=1).sum().item(), tgt.shape[0]
 
-log(f"\n=== Length-generalization eval (mode={args.mode}, eval_examples={args.eval_examples}) ===")
+train_total_len = train_len + 1 + induction_len
+log(f"\n=== Length-generalization eval (mode={args.mode}, rope_eval={args.rope_eval}, eval_examples={args.eval_examples}) ===")
 np_eval = np.random.default_rng(args.seed_eval)
 for L in [int(x) for x in args.eval_lens.split(",")]:
     if args.mode == "longmamba":
@@ -242,6 +290,10 @@ for L in [int(x) for x in args.eval_lens.split(",")]:
         LM_STATE["g_beta"] = g_lookup[L]
     else:
         LM_STATE["mode"] = "vanilla"
+    # SNNAttention RoPE 增程: 每 (rope_eval method, L) 重建 cos/sin
+    if args.rope_eval != "none":
+        L_total = L + 1 + induction_len
+        _rebuild_v4_rope_for_eval(model, args.rope_eval, L_total, train_total_len, args.rope_base)
 
     # 长 L 用 batch=1
     B = 1 if L > 65536 else max(2, 32 // max(1, L // 2048))
@@ -252,7 +304,8 @@ for L in [int(x) for x in args.eval_lens.split(",")]:
         logits = fwd(ids)
         c, t = answer_acc(logits, ids, T, induction_len)
         n_corr += c; n_tot += t
-    tag = "VANILLA" if args.mode == "vanilla" else f"LONGMAMBA g_β={LM_STATE['g_beta']:.3e}"
-    log(f"  input_seq_len={L:8d}: acc={n_corr/n_tot:.4f}  ({n_corr}/{n_tot})  [{tag}]")
+    base_tag = "VANILLA" if args.mode == "vanilla" else f"LM g_β={LM_STATE['g_beta']:.2e}"
+    rope_tag = "" if args.rope_eval == "none" else f" +{args.rope_eval.upper()}"
+    log(f"  input_seq_len={L:8d}: acc={n_corr/n_tot:.4f}  ({n_corr}/{n_tot})  [{base_tag}{rope_tag}]")
 
 log("=== DONE ===")

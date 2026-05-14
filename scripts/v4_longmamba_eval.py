@@ -37,7 +37,11 @@ ap.add_argument("--eval_lens", default="131072,262144,524288,1048576")
 ap.add_argument("--eval_examples", type=int, default=64)
 ap.add_argument("--calib_examples", type=int, default=32)
 ap.add_argument("--theta_quantile", type=float, default=0.75,
-                help="cum_decay 取此分位作 global cut (越高 → 越少 channel 标 global)")
+                help="cum_decay 取此分位作 global cut (越高 → 越少 channel 标 global). 0.0 = 全 channel 都 global")
+ap.add_argument("--g_beta_override", type=float, default=None,
+                help="直接指定 filter 阈值 g_β (β>g_β 的 token 被 filter), 覆盖 calibration 的 quantile 公式; 用来 sweep 调参")
+ap.add_argument("--print_filter_stats", action="store_true",
+                help="每个 eval cell 打印实际 filter 触发的 token 数 (diagnostic)")
 ap.add_argument("--rope_eval", default="none", choices=("none", "pi", "ntk", "yarn"),
                 help="同 v4_induction_heads.py 的 rope_eval: 对 SNNAttention RoPE 叠加 context-length extension. 与 --mode=longmamba 正交, 可组合: vanilla+yarn / longmamba+none / longmamba+yarn")
 ap.add_argument("--yarn_beta_fast", type=float, default=32.0)
@@ -90,16 +94,22 @@ def _patched_segplif(beta, u, v_th, v_init, k_t, K, training=True, ahp_row=None,
         LM_STATE["captured"][li]["beta_per_token"].append(beta_per_token.detach().float().cpu())
 
     elif LM_STATE["mode"] == "filter":
+        # OOM 防护: 用 masked_fill_ 原地修改 + 不 expand mask (用 broadcast). 老 torch.where 版本会创建 ~50GB 临时.
         gmask = LM_STATE["global_mask"][li].to(beta.device).view(1, 1, 1, H)   # (1,1,1,H)
         g = LM_STATE["g_beta"]
-        # 取 token-level β (每 token 第一帧), 然后展开回 K 帧
-        beta_t = beta.view(T, K, b, H)[:, 0:1]   # (T, 1, b, H)
-        low_contribution = (beta_t > g)           # high β = low input contribution = candidate to filter
-        filter_mask = gmask & low_contribution    # (T, 1, b, H), boolean
-        filter_mask_full = filter_mask.expand(T, K, b, H).reshape(TK, b, H)
-        # patch: β←1, u←0 (β=1 + u=0 = state-preserving step, "skip token")
-        beta = torch.where(filter_mask_full, torch.ones_like(beta), beta)
-        u = torch.where(filter_mask_full, torch.zeros_like(u), u)
+        beta_4d = beta.view(T, K, b, H)             # view, 不复制
+        u_4d = u.view(T, K, b, H)
+        beta_t = beta_4d[:, 0:1]                    # (T, 1, b, H) view
+        low_contribution = (beta_t > g)
+        filter_mask = gmask & low_contribution      # (T, 1, b, H) bool, ~MB 量级 @ T=1M
+        if args.print_filter_stats and LM_STATE.get("_stat_print_done", 0) < n:
+            nfilt = filter_mask.sum().item()
+            ntot = T * b * H
+            LM_STATE["_stat_print_done"] = LM_STATE.get("_stat_print_done", 0) + 1
+            log(f"    [filter layer_{li}: {nfilt}/{ntot} = {100*nfilt/max(1,ntot):.2f}% (token-level, K帧广播) g_β={g:.3e}]")
+        # masked_fill_ 接 broadcastable mask, 不实例化 (T,K,b,H), 完全原地: 零临时张量
+        beta_4d.masked_fill_(filter_mask, 1.0)
+        u_4d.masked_fill_(filter_mask, 0.0)
 
     LM_STATE["layer_idx"] += 1
     return _orig_segplif(beta, u, v_th, v_init, k_t, K, training, ahp_row=ahp_row, alpha=alpha, spike_mode=spike_mode)
